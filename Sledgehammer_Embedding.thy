@@ -1,5 +1,5 @@
 theory Sledgehammer_Embedding
-  imports Main
+  imports Isabelle_RPC.Remote_Procedure_Calling
 begin
  
 declare [[ML_debugger]]
