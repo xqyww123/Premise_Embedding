@@ -1,0 +1,19 @@
+# VIM
+*.ll
+*~
+*.swp
+*.swo
+.*.marks
+*.phi-cache
+
+\#*
+.*#
+
+__pycache__
+doc/.obsidian
+
+dist
+IsaREPL.egg-info
+.idea
+.trash
+build
