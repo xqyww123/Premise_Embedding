@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Isabelle_Premise_Embedding"
+version = "0.1.0"
+description = "Isabelle RPC Host"
+readme = "README.md"
+license = "LGPL-2.1-or-later"
+authors = [
+    { name="Qiyuan Xu", email="xqyww123@gmail.com" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = ["msgpack"]
+
+[project.urls]
+"Homepage" = "https://github.com/xqyww123/Premise_Embedding"
+
+[tool.setuptools.packages.find]
+include = ["Isabelle_Premise_Embedding", "Isabelle_Premise_Embedding.*"]
+exclude = ["contrib", "contrib.*"]
