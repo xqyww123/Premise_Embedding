@@ -154,6 +154,69 @@ fun gen_eq_thm ctxt = if Config.get ctxt Sledgehammer_MaSh.duplicates
                       then Thm.eq_thm_strict
                       else Thm.eq_thm_prop
 
+fun cached_embed_premises ctxt vecs_global_var_opt vecs_var goal_opt facts =
+  let val SOT = Premise_Embedding_Context_Info.string_of_term ctxt
+      val defctxt_string_of = Premise_Embedding_Context_Info.defctxt_string_of ctxt
+      val vars_of_term = vars_of_term ctxt
+
+      val vec_store = Synchronized.value vecs_var
+      val vecs'0 = map (fn origin as ((_, (scope, _)), thm) =>
+                let val prop = Thm.prop_of thm
+                 in (origin, Termtab.lookup vec_store prop)
+                end) facts
+      val query = Par_List.map (
+              fn ((tag, thm), NONE) =>
+                  let val prop = Thm.prop_of thm
+                   in SOME ((SOT prop, vars_of_term prop), defctxt_string_of prop)
+                  end
+               | _ => NONE) vecs'0
+                       |> map_filter I
+
+      val config = config_of ctxt
+      val embedding_token_limit = Config.get ctxt embedding_token_limit
+      val (vgoal_opt, vpremises') =
+            case (goal_opt, null query) of
+              (NONE, true) => (NONE, [])
+            | (NONE, false) =>
+                (NONE, Remote_Procedure_Calling.call_command embed_premises_cmd
+                    (query, config, embedding_token_limit))
+            | (SOME (goal_enc, goal_ctxt), true) =>
+                (SOME (Remote_Procedure_Calling.call_command embed_goal_cmd
+                    (goal_enc, goal_ctxt, config, embedding_token_limit)), [])
+            | (SOME (goal_enc, goal_ctxt), false) =>
+                let val (vgoal, vps) =
+                      Remote_Procedure_Calling.call_command embed_goal_and_premises_cmd
+                          (goal_enc, goal_ctxt, query, config, embedding_token_limit)
+                 in (SOME vgoal, vps)
+                end
+
+      fun is_global ((_,(Global,_)),_) = true
+        | is_global _ = false
+      fun merge_ret ret ([],[]) = ret
+        | merge_ret _ (_,[]) = error "cached_embed_premises BUG"
+        | merge_ret (vecs', new_add, global_add) (vprem::vpremises, (tag_thm, NONE) :: vecs) =
+            let val ele = (Thm.prop_of (snd tag_thm), vprem)
+             in merge_ret ( (tag_thm, vprem)::vecs'
+                          , ele::new_add
+                          , if is_global tag_thm then ele::global_add else global_add )
+                          (vpremises, vecs)
+            end
+        | merge_ret _ ([], (_, NONE) :: _) = error "cached_embed_premises BUG"
+        | merge_ret (vecs', new_add, global_add) (vpremises, (tag_thm, SOME some) :: vecs) =
+            merge_ret ((tag_thm, some)::vecs', new_add, global_add) (vpremises, vecs)
+
+      val (vpremises, new_add, global_add) = merge_ret ([],[],[]) (vpremises', vecs'0)
+
+      val _ = if null new_add then ()
+              else Synchronized.change vecs_var (fold Termtab.update_new new_add)
+      val _ = case vecs_global_var_opt
+                of NONE => ()
+                 | SOME gvar =>
+                    if null global_add then ()
+                    else Synchronized.change gvar (fold Termtab.update_new global_add)
+  in (vgoal_opt, vpremises)
+  end
+
 fun relevant_facts ctxt (params as {verbose, fact_filter, timeout, ...}) prover
       max_facts ({add, only, ...} : fact_override) hyp_ts concl_t facts =
   let val add_ths = Attrib.eval_thms ctxt add
@@ -165,67 +228,26 @@ fun relevant_facts ctxt (params as {verbose, fact_filter, timeout, ...}) prover
                     of SOME v => v
                      | NONE => error "Sledgehammer_Embedding BUG: variable Thm_Vector is not initialized"
             val vecs_var = Thm_Vector_Local.get ctxt
-      
+
             val SOT = Premise_Embedding_Context_Info.string_of_term ctxt
             val defctxt_string_of = Premise_Embedding_Context_Info.defctxt_string_of ctxt
             val vars_of_term = vars_of_term ctxt
-      
+
             val assms = map (SOT o Thm.term_of) (Assumption.all_assms_of ctxt)
             val goal = Logic.list_implies (hyp_ts, concl_t)
             val goal_ctxt = defctxt_string_of goal
             val goal_enc = (assms, SOT goal, vars_of_term goal)
-      
-            val vec_store = Synchronized.value vecs_var
-            val vecs'0 = map (fn origin as ((_, (scope, _)), thm) =>
-                      let val prop = Thm.prop_of thm
-                       in (origin, Termtab.lookup vec_store prop)
-                      end) unique_facts
-            val query = Par_List.map (
-                    fn ((tag, thm), NONE) =>
-                        let val prop = Thm.prop_of thm
-                         in SOME ((SOT prop, vars_of_term prop), defctxt_string_of prop)
-                        end
-                     | _ => NONE) vecs'0
-                         |> map_filter I
 
-            val config = config_of ctxt
-            val embedding_token_limit = Config.get ctxt embedding_token_limit
-            val (vgoal, vpremises') =
-                  Remote_Procedure_Calling.call_command embed_goal_and_premises_cmd
-                      (goal_enc, goal_ctxt, query, config, embedding_token_limit)
-      
-            fun is_global ((_,(Global,_)),_) = true
-              | is_global _ = false
-            fun merge_ret ret ([],[]) = ret
-              | merge_ret _ (_,[]) = error "relevant_facts BUG"
-              | merge_ret (vecs', new_add, global_add) (vprem::vpremises, (tag_thm, NONE) :: vecs) =
-                  let val ele = (Thm.prop_of (snd tag_thm), vprem)
-                   in merge_ret ( (tag_thm, vprem)::vecs'
-                                , ele::new_add
-                                , if is_global tag_thm then ele::global_add else global_add )
-                                (vpremises, vecs)
-                  end
-              | merge_ret _ ([], (_, NONE) :: _) = error "relevant_facts BUG"
-              | merge_ret (vecs', new_add, global_add) (vpremises, (tag_thm, SOME some) :: vecs) =
-                  merge_ret ((tag_thm, some)::vecs', new_add, global_add) (vpremises, vecs)
-      
-            val (vpremises, new_add, global_add) = merge_ret ([],[],[]) (vpremises', vecs'0)
+            val (SOME vgoal, vpremises) =
+                  cached_embed_premises ctxt (SOME vecs_global_var) vecs_var
+                      (SOME (goal_enc, goal_ctxt)) unique_facts
+
             val vpremises : (Sledgehammer_Fact.lazy_fact * Word8Vector.vector) Array.array
                   = Array.fromList vpremises
-      
-            val _ = if null new_add then ()
-                    else Synchronized.change vecs_var (fold Termtab.update_new new_add)
-            val _ = if null global_add then ()
-                    else Synchronized.change vecs_global_var (fold Termtab.update_new global_add)
             val top_k_facts = Vector_Arith.top_k (vpremises, vgoal, max_facts)
                           |> map (apfst (apfst (apfst (fn f => f ()))))
          in (top_k_facts, [])
         end
-(*
-      val vector_facts = map (fn (tag as (_, (scope, _)), thm) =>
-          let 
-           in x
-          end) facts *)
 
       fun mepo () =
         (mepo_suggested_facts ctxt params max_facts NONE hyp_ts concl_t unique_facts
@@ -263,12 +285,21 @@ val _ = Theory.setup (Sledgehammer_MaSh.add_custom_fact_filter "embd" relevant_f
       val _ = @{print} time
 *)
 
+val update_premises_lock = Synchronized.var "update_premises_lock" ()
+
 fun update_premises thy =
+  Synchronized.change update_premises_lock (fn () =>
   let val ctxt = Proof_Context.init_global thy
       val facts = Sledgehammer_Fact.all_facts ctxt false (Thy_Header.get_keywords thy) [] []
                       (Sledgehammer_Fact.clasimpset_rule_table_of ctxt)
+                  |> drop_duplicate_facts
+      val vecs_global_var =
+            case Thm_Vector.get thy
+              of SOME v => v
+               | NONE => error "update_premises: Thm_Vector is not initialized"
+      val _ = cached_embed_premises ctxt NONE vecs_global_var NONE facts
    in ()
-  end
+  end)
 
 val _ = Theory.setup (
             Thm_Vector.put (SOME (Synchronized.var "Thm_Vector" Termtab.empty))
