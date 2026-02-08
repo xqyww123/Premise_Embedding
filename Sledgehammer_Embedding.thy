@@ -21,17 +21,17 @@ typ list
 thm finite_mono_strict_prefix_implies_finite_fixpoint
  
 sledgehammer_params [fact_filter = "embd"]
-  
+     
 lemma 
   assumes A: P
   assumes B: Q 
   shows "P \<Longrightarrow> P \<and> Q" 
   sledgehammer [fact_filter = "embd"]
 
-(*Test Vector Lib*)
+Test Vector Lib*)
 
 (*TODO: move this to Pure*)
 
-*)
+
 
 end

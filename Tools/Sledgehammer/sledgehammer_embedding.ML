@@ -155,7 +155,8 @@ fun gen_eq_thm ctxt = if Config.get ctxt Sledgehammer_MaSh.duplicates
                       else Thm.eq_thm_prop
 
 fun cached_embed_premises ctxt vecs_global_var_opt vecs_var goal_opt facts =
-  let val SOT = Premise_Embedding_Context_Info.string_of_term ctxt
+  let val _ = Remote_Procedure_Calling.load ["Isabelle_Premise_Embedding"]
+      val SOT = Premise_Embedding_Context_Info.string_of_term ctxt
       val defctxt_string_of = Premise_Embedding_Context_Info.defctxt_string_of ctxt
       val vars_of_term = vars_of_term ctxt
 
@@ -253,7 +254,13 @@ fun relevant_facts ctxt (params as {verbose, fact_filter, timeout, ...}) prover
         (mepo_suggested_facts ctxt params max_facts NONE hyp_ts concl_t unique_facts
          |> weight_facts_steeply, [])
 
-      val mess = [(mepo_weight, mepo), (embd_weight, embd)]
+      fun timed msg f () =
+        let val (t, result) = Timing.timing (fn () => f ()) ()
+            val _ = tracing (msg ^ ": " ^ Timing.message t)
+         in result
+        end
+
+      val mess = [(mepo_weight, timed "MePo" mepo), (embd_weight, timed "Embedding" embd)]
         (* the order is important for the "case" expression below *)
            |> Par_List.map (apsnd (fn f => f ()))
 
