@@ -1,127 +1,259 @@
-from Isabelle_RPC_Host import Connection, Remote_Procedures
+from typing import cast
+from Isabelle_RPC_Host import Connection, isabelle_remote_procedure
+from rocksdict import Rdict
+import rocksdict
+import platformdirs
 import numpy as np
 import os
 import requests
+import IsaREPL
+import re
 
 TEI_BASE_DEFAULT = os.getenv("TEI_BASE", None)
 API_KEY_DEFAULT = os.getenv("API_KEY", None)
 
-def embed(arg, connection : Connection):
-    (texts, base_url, MODEL_ID, api_key) = arg
+type config = tuple[
+    str | None , # base_url
+    str, # MODEL_ID
+    str | None, # api_key
+    int, # dimension
+]
+type goal = tuple[
+    list[str], # premises
+    str, # conclusion
+    list[str], # variables
+] 
+type premise = tuple[
+    str, # statement
+    list[str], # variables
+] 
+type vector = bytearray | bytes
+
+@isabelle_remote_procedure("embed")
+def embed(arg : tuple[list[bytes | str], config], connection : Connection) -> list[vector]:
+    (texts, (base_url, MODEL_ID, api_key, dimension)) = arg
     if base_url is None:
         base_url = TEI_BASE_DEFAULT
         api_key = API_KEY_DEFAULT
-    if base_url is None:
+    if base_url is None and not MODEL_ID.startswith('reasonwang'):
         raise Exception("the environment variable TEI_BASE_DEFAULT is not set. You must indicate the address of the Hugging Face TEI server.")
     if api_key == "":
         api_key = API_KEY_DEFAULT
-    url = base_url.rstrip("/") + "/v1/embeddings"
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    resp = requests.post(
-        url,
-        json={
-            "input": texts,
-            "model": MODEL_ID,
-            "encoding_format": "float",
-        },
-        headers=headers,
-        timeout=60,
-    )
-    resp.raise_for_status()
-    data = resp.json()
 
-    # OpenAI format: data = [{"embedding": [...], "index": i, ...}, ...]
-    vecs = np.asarray([item["embedding"] for item in data["data"]], dtype=np.float32)
-    vecs /= (np.linalg.norm(vecs, axis=1, keepdims=True) + 0.05) # this "+ 0.05" prevents overflow.
-    vecs_q15_bytes = (vecs * 32768).astype('<i2').tobytes()  # Convert to Q1.15 format (little-endian int16) and then to byte array
-    return vecs_q15_bytes
+    cache_dir = platformdirs.user_cache_dir("Isabelle_Premise_Embedding", "Qiyuan")
+    cache_file = os.path.join(cache_dir, f"{MODEL_ID.replace('/', '_')}.db")
+    with Rdict(cache_file, options=rocksdict.Options(raw_mode=True)) as db:
+        byte_num = dimension * 2
+        output: list[bytes | None] = [None] * len(texts)
+        new_texts : list[bytes] = []
+        indexes = []
+        for i, text in enumerate(texts):
+            if isinstance(text, str):
+                text = text.encode('utf-8')
+            v = db.get(text, None)
+            if v is None:
+                new_texts.append(text)
+                indexes.append(i)
+            else:
+                output[i] = v
 
-Remote_Procedures["embed"] = embed
+        if len(new_texts) == 0:
+            return cast(list[vector], [v for v in output if v is not None])
 
+        if MODEL_ID.startswith('reasonwang'):
+            # tricks: random normalized vectors (L2 norm = 1)
+            rng = np.random.default_rng()
+            vecs = rng.standard_normal((len(new_texts), dimension)).astype(np.float32)
+            vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+            vecs_int16 = (vecs * 32768).astype('<i2')  # Q1.15 format (little-endian int16)
+            vecs_q15_bytes = [vecs_int16[i].tobytes() for i in range(len(vecs_int16))]
+        else:
+            url = base_url.rstrip("/") + "/v1/embeddings"
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            resp = requests.post(
+                url,
+                json={
+                    "input": [text.decode('utf-8') for text in new_texts],
+                    "model": MODEL_ID,
+                    "encoding_format": "float",
+                },
+                headers=headers,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
+            # OpenAI format: data = [{"embedding": [...], "index": i, ...}, ...]
+            vecs = np.asarray([item["embedding"] for item in data["data"]], dtype=np.float32)
+            vecs /= (np.linalg.norm(vecs, axis=1, keepdims=True) + 0.05) # this "+ 0.05" prevents overflow.
+            vecs_int16 = (vecs * 32768).astype('<i2')  # Q1.15 format (little-endian int16)
+            vecs_q15_bytes = [vecs_int16[i].tobytes() for i in range(len(vecs_int16))]  # list of bytes, one per row
 
-#from sentence_transformers import SentenceTransformer, models
+        for i, text in enumerate(new_texts):
+            db[text] = vecs_q15_bytes[i]
+        for i, j in enumerate(indexes):
+            output[j] = vecs_q15_bytes[i]
+        if len(new_texts) == len(texts):
+            return cast(list[vector], vecs_q15_bytes)
+        else:
+            return cast(list[vector], [v for v in output if v is not None])
 
-# base = "Qwen/Qwen3-0.6B"  # or any Qwen3 causal LM checkpoint
-# 
-# # This loads the base model (hidden states) via HF under the hood
-# word = models.Transformer(
-#     base,
-#     model_args={"torch_dtype": "auto"},
-#     tokenizer_args={"padding_side": "left"},
-# )
-# 
-# # Decoder-only models usually don't have a CLS token; last-token pooling is common.
-# pool = models.Pooling(
-#     word.get_word_embedding_dimension(),
-#     pooling_mode="lasttoken",   # or "mean"
-# )
-# 
-# embedder = SentenceTransformer(modules=[word, pool])
-# 
-# vecs = embedder.encode(
-#     ["hello world", "how to do retrieval with qwen3?"],
-#     normalize_embeddings=True,
-# )
-# print(vecs.shape)
-# 
-# # Calculate L2 norm of vecs (original float vectors) before manual normalization
-# l2_norms_vecs_before = np.linalg.norm(vecs, axis=1)  # L2 norm along axis 1 (each vector)
-# print(f"L2 norms of vecs (before manual normalization): {l2_norms_vecs_before}")
-# 
-# # Manually normalize to ensure L2 norm is exactly 1.0
-# # Note: normalize_embeddings=True may have numerical errors, so we re-normalize explicitly
-# l2_norms_vecs = np.linalg.norm(vecs, axis=1, keepdims=True)  # Keep dimensions for broadcasting
-# vecs = vecs / l2_norms_vecs  # Normalize each vector to have L2 norm = 1.0
-# l2_norms_vecs_after = np.linalg.norm(vecs, axis=1)  # Verify normalization
-# print(f"L2 norms of vecs (after manual normalization): {l2_norms_vecs_after}")
-# print(f"L2 norms shape: {l2_norms_vecs_after.shape}")  # Should be (2,)
-# 
-# # Convert to Q1.15 format (16-bit fixed point: 1 integer bit, 15 fractional bits)
-# # Q1.15 range: -1.0 to 0.999969482421875
-# # Convert float to Q1.15: multiply by 2^15 = 32768, then cast to int16
-# # Note: astype(int) truncates towards zero by default (faster than np.trunc())
-# #       For positive: floor behavior; for negative: ceil behavior
-# vecs_q15 = np.clip(vecs, -1.0, 0.999969482421875)  # Clip to Q1.15 range
-# vecs_q15 = (vecs_q15 * 32768).astype(np.int16)  # Truncate towards zero (default behavior), convert to Q1.15 format
-# print(f"Q1.15 shape: {vecs_q15.shape}")
-# print(f"Q1.15 dtype: {vecs_q15.dtype}")
-# print(f"Q1.15 sample values: {vecs_q15[0, :5]}")  # Print first 5 values of first vector
-# 
-# # Calculate L2 norm of vecs_q15
-# # Understanding "axis 1":
-# # vecs_q15 shape is (2, 1024):
-# #   - axis 0: first dimension (2 vectors) - rows
-# #   - axis 1: second dimension (1024 dimensions per vector) - columns
-# # 
-# # When computing norm along axis=1:
-# #   - We compute the norm for each row (each vector)
-# #   - Result shape: (2,) - one norm value per vector
-# # 
-# # Example visualization:
-# #   vecs_q15 = [[v1_dim1, v1_dim2, ..., v1_dim1024],  <- vector 1 (row 0)
-# #               [v2_dim1, v2_dim2, ..., v2_dim1024]]  <- vector 2 (row 1)
-# #               
-# #   axis=0 (down)        axis=1 (across) ->
-# #   
-# #   norm along axis=1: [norm(v1), norm(v2)]  <- one value per row
-# 
-# # Method 1: Convert back to float and compute L2 norm
-# vecs_float = vecs_q15.astype(np.float32) / 32768.0  # Convert Q1.15 back to float
-# l2_norms_float = np.linalg.norm(vecs_float, axis=1)  # L2 norm along axis 1 (each vector)
-# print(f"L2 norms (converted to float): {l2_norms_float}")
-# print(f"L2 norms shape: {l2_norms_float.shape}")  # Should be (2,)
-# 
-# # Method 2: Compute L2 norm in fixed-point domain (more accurate, avoids float conversion)
-# # Note: squares may overflow int16, so use int32 for intermediate calculations
-# vecs_q15_int32 = vecs_q15.astype(np.int32)  # Convert to int32 to avoid overflow
-# squares = vecs_q15_int32 * vecs_q15_int32  # Square each element
-# sum_squares = np.sum(squares, axis=1)  # Sum of squares for each vector
-# # Convert sum_squares back to float and divide by (2^15)^2 = 2^30 to get squared norm
-# squared_norms = sum_squares.astype(np.float64) / (32768.0 * 32768.0)
-# l2_norms_fixed = np.sqrt(squared_norms)  # Take square root to get L2 norm
-# print(f"L2 norms (fixed-point computation): {l2_norms_fixed}")
-# 
-# exit (0)
+def pretty_unicode(s: str):
+    s = IsaREPL.Client.pretty_unicode(s)
+    s = re.sub(r'::type\b', '', s)
+    s = re.sub(r'__\b', '', s)
+    s = re.sub(r'‹', '\"', s)
+    s = re.sub(r'›', '\"', s)
+    return s
+
+def unicode_of_goal(goal: goal) -> goal:
+    premises, concl, vars = goal
+    premises = [pretty_unicode(premise) for premise in premises]
+    concl = pretty_unicode(concl)
+    vars = [pretty_unicode(var) for var in vars]
+    return (premises, concl, vars)
+
+def unicode_of_premise(premise: premise) -> premise:
+    statement, prem_vars = premise
+    statement = pretty_unicode(statement)
+    prem_vars = [pretty_unicode(var) for var in prem_vars]
+    return (statement, prem_vars)
+
+_tokenizers = {}
+def _count_tokens(text: str, model: str) -> int:
+    from transformers import AutoTokenizer, PreTrainedTokenizerBase
+    global _tokenizers
+    if model not in _tokenizers:
+        _tokenizers[model] = AutoTokenizer.from_pretrained(model)
+    tokenizer: PreTrainedTokenizerBase = _tokenizers[model]
+    # Use backend (Rust) tokenizer when available: avoids materializing Python list of IDs
+    if hasattr(tokenizer, "backend_tokenizer"):
+        enc = tokenizer.backend_tokenizer.encode(text, add_special_tokens=False)  # type: ignore[call-arg]
+        return len(enc)
+    return len(tokenizer.encode(text, add_special_tokens=False))
+
+def _shrink_tokens(statement: str, for_goal: bool, model: str, token_limit: int) -> str:
+    tok_count = _count_tokens(statement, model)
+    if tok_count > token_limit:
+        if not for_goal:
+            raise ValueError(f"tok_count {tok_count} is greater than TOKEN_LIMIT {token_limit}")
+        lines = statement.split('\n')
+        ret_lines = []
+        for i,line in enumerate(lines):
+            if line.startswith('###'):
+                ret_lines.append(line)
+                continue
+            if not line:
+                ret_lines.append(line)
+                continue
+            tok_count -= _count_tokens(line, model)
+            if tok_count <= token_limit:
+                if len(lines) <= 0:
+                    raise ValueError(f"tok_count {tok_count} is greater than TOKEN_LIMIT {token_limit}")
+                ret_lines.extend(lines[i+1:])
+                # if count_tokens("".join(ret_lines)) > TOKEN_LIMIT:
+                #     raise ValueError(f"DDDD tok_count {count_tokens(''.join(ret_lines))} is greater than TOKEN_LIMIT {TOKEN_LIMIT} {for_goal}")
+                return "\n".join(ret_lines)
+        raise ValueError(f"tok_count {tok_count} is greater than TOKEN_LIMIT {token_limit}")
+    return statement
+
+def _trim_context(statement : str, ctxt: str, for_goal: bool, model: str, token_limit: int) -> str:
+    tok_count = _count_tokens(statement, model)
+    if tok_count == token_limit:
+        return statement
+    if tok_count > token_limit:
+        return _shrink_tokens(statement, for_goal, model, token_limit)
+
+    ret = []
+    segs = ctxt.split('\n\n\n')
+    for seg in segs:
+        if not seg:
+            continue
+        if not for_goal and seg.startswith('theory '):
+            continue
+        if tok_count >= token_limit:
+            break
+        seg = seg + "\n\n"
+        cnt = _count_tokens(seg, model)
+        if tok_count + cnt > token_limit:
+            break
+        ret.append(seg)
+        tok_count += cnt
+    def m(cmd : str) -> int:
+        if cmd.startswith('theory '):
+            return -1
+        elif cmd.startswith('notation '):
+            return 0
+        elif cmd.startswith('class '):
+            return 1
+        elif cmd.startswith('fact '):
+            return 3
+        else:
+            return 2
+    k_ret = [(m(cmd), cmd) for cmd in ret]
+    k_ret.sort(key=lambda x: x[0])
+    ret = [cmd for _, cmd in k_ret]
+    # if _count_tokens("".join(ret), model) > token_limit:
+    #     raise ValueError(f"AAAAAAAAAAAA tok_count {_count_tokens(''.join(ret), model)} is greater than TOKEN_LIMIT {token_limit}")
+    return "".join(ret) + statement
+
+type ctxt = str | None
+def encode_goal(goal: goal, ctxt: ctxt, model: str, token_limit: int) -> str:
+    premises, concl, vars = unicode_of_goal(goal)
+    goal_str = "###Variables\n" + "".join([gv + "\n\n" for gv in vars])\
+         + "###Premises\n" + "".join([premise + "\n\n" for premise in premises])\
+         + "###Conclusion\n" + concl
+    if ctxt is None:
+        goal_str = _shrink_tokens(goal_str, True, model, token_limit)
+    else:
+        goal_str = _trim_context(goal_str, ctxt, True, model, token_limit)
+    goal_str = "#Goal\n" + goal_str
+    num = _count_tokens(goal_str, model)
+    if num > token_limit + 3:
+        raise ValueError(f"BBBB Goal has {num} tokens, which is greater than TOKEN_LIMIT {token_limit}")
+    return goal_str
+
+def encode_premise(premise: premise, pctxt: ctxt, model: str, token_limit: int) -> str:
+    statement, prem_vars = unicode_of_premise(premise)
+    encode = "###Variables\n" + "".join([pv + "\n\n" for pv in prem_vars])\
+           + "###Statement\n" + statement
+    if pctxt is None:
+        encode = _shrink_tokens(encode, False, model, token_limit)
+    else:
+        encode = _trim_context(encode, pctxt, False, model, token_limit)
+    encode = "#Fact\n" + encode
+    num = _count_tokens(encode, model)
+    if num > token_limit + 3:
+        raise ValueError(f"CCCC Goal has {num} tokens, which is greater than TOKEN_LIMIT {token_limit}")
+    return encode
+
+@isabelle_remote_procedure("embed_goal")
+def embed_goal(arg: tuple[goal, ctxt, config, int], connection : Connection) -> vector:
+    (goal, ctxt, cfg, token_limit) = arg
+    _, MODEL_ID, _, _ = cfg
+    goal_str = encode_goal(goal, ctxt, MODEL_ID, token_limit)
+    return embed(([goal_str], cfg), connection)[0]
+
+@isabelle_remote_procedure("embed_premises")
+def embed_premises(arg: tuple[list[tuple[premise, ctxt]], config, int], connection : Connection) -> list[vector]:
+    (premises, cfg, token_limit) = arg
+    _, MODEL_ID, _, _ = cfg
+    premises_str = [encode_premise(premise, ctxt, MODEL_ID, token_limit) for premise, ctxt in premises]
+    return embed((premises_str, cfg), connection)
+
+@isabelle_remote_procedure("embed_goal_and_premises")
+def embed_goal_and_premises(arg: tuple[goal, ctxt, list[tuple[premise, ctxt]], config, int], connection : Connection) -> tuple[bytes, list[bytes]]:
+    (goal, gctxt, premises, cfg, token_limit) = arg
+    _, MODEL_ID, _, _ = cfg
+    goal_str = encode_goal(goal, gctxt, MODEL_ID, token_limit)
+    codes = [encode_premise(premise, ctxt, MODEL_ID, token_limit) for premise, ctxt in premises]
+    codes.append(goal_str)
+    vecs = embed((codes, cfg), connection)
+    goal_vec = vecs.pop()
+    prem_vecs = vecs
+    return (goal_vec, prem_vecs)
+
+if __name__ == "__main__":
+    embed(([b"hello world", b"how to do retrieval with qwen3?"], "https://api.openai.com", "text-embedding-3-small", None, 1536), None)

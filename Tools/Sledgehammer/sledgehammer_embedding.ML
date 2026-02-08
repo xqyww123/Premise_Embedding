@@ -3,6 +3,20 @@ end
 
 structure Sledgehammer_Embedding : SLEDGEHAMMER_EMBEDDING = struct
 
+val embedding_model_provider = Attrib.setup_config_string \<^binding>\<open>embedding_model_provider\<close> (K "")
+val embedding_model = Attrib.setup_config_string \<^binding>\<open>embedding_model\<close> (K "reasonwang/embedding-qwen3-1.7b-embedding_unicode_shuf")
+val embedding_API_key = Attrib.setup_config_string \<^binding>\<open>embedding_API_key\<close> (K "")
+val embedding_dim = 2048
+val embedding_token_limit = Attrib.setup_config_int \<^binding>\<open>embedding_token_limit\<close> (K 8000)
+
+fun config_of ctxt =
+  let fun chk s = if s = "" then NONE else SOME s
+   in ( chk (Config.get ctxt embedding_model_provider)
+      , Config.get ctxt embedding_model
+      , chk (Config.get ctxt embedding_API_key)
+      , embedding_dim)
+  end
+
 local open MessagePackBinIO.Pack MessagePackBinIO.Unpack
   val pack_defctxt = packString
   val pack_term = packString
@@ -11,17 +25,99 @@ local open MessagePackBinIO.Pack MessagePackBinIO.Unpack
 
   val unpackVec = unpackBytes
 in
-val embed_cmd = {
+(* val embed_cmd = {
   name = "embed_goal_premises",
   arg_schema = packPair (pack_goal, packList pack_premise),
   ret_schema = unpackPair (unpackVec, unpackList unpackVec),
   callback = NONE,
   timeout = SOME (Time.fromSeconds 120)
+} *)
+val packConfig = packTuple4 (
+      packOption packString,
+      packString,
+      packOption packString,
+      packInt)
+val packGoal = packTuple3 (
+      packList packString, (*premises*)
+      packString,          (*conclusion*)
+      packList packString  (*variables*))
+val packPremise =
+      packPair (packString (*statement*), packList packString (*variables*))
+val packCtxt = packString
+
+val embed_cmd = {
+  name = "embed",
+  arg_schema = packPair (packList (packBytes o Byte.stringToBytes), packConfig),
+  ret_schema = unpackList unpackVec,
+  callback = NONE,
+  timeout = NONE (* SOME (Time.fromSeconds 120) *)
 }
+val embed_goal_cmd = {
+  name = "embed_goal",
+  arg_schema = packTuple4 (packGoal, packCtxt, packConfig, packInt),
+  ret_schema = unpackVec,
+  callback = NONE,
+  timeout = NONE
+}
+val embed_premises_cmd = {
+  name = "embed_premises",
+  arg_schema = packTuple3 (packList (packPair (packPremise, packCtxt)), packConfig, packInt),
+  ret_schema = unpackList unpackVec,
+  callback = NONE,
+  timeout = NONE
+}
+val embed_goal_and_premises_cmd = {
+  name = "embed_goal_and_premises",
+  arg_schema = packTuple5 (
+                  packGoal, packCtxt,
+                  packList (packPair (packPremise, packCtxt)),
+                  packConfig, packInt),
+  ret_schema = unpackPair (unpackVec, unpackList unpackVec),
+  callback = NONE,
+  timeout = NONE
+}
+
 end
 
-structure Vector_Arith = Vector_Arith_Q15_D384
+structure Vector_Arith = Vector_Arith_Q15_D2048
 type vector = Vector_Arith.vector
+
+fun print_typ_full_sort ctxt =
+    let val ctxt' = ctxt
+              |> Config.put Printer.show_types true
+              |> Config.put Printer.show_sorts true
+              |> Config.put Printer.show_markup false
+              |> Config.put Printer.show_structs false
+              |> Config.put Printer.show_question_marks true
+              |> Config.put Printer.show_brackets false
+     in Syntax.string_of_typ ctxt'
+     #> Premise_Embedding_Context_Info.trim_markup
+    end
+
+fun add_typs (Abs (name,typ,X)) rets = add_typs X (insert (op =) (name,typ) rets)
+  | add_typs (A $ B) rets = add_typs B (add_typs A rets)
+  | add_typs (Free (name,typ)) rets = insert (op =) (name,typ) rets
+  | add_typs (Var ((name,0),typ)) rets = insert (op =) (name,typ) rets
+  | add_typs (Var ((name,i),typ)) rets = insert (op =) (name^"."^string_of_int i,typ) rets
+  | add_typs _ rets = rets
+
+(*
+fun vars_of_goal ctxt =
+  let val print_typ_full_sort = print_typ_full_sort ctxt
+   in fn (assms, concl) =>
+  let val vs = fold add_typs (concl::assms) []
+   in map (fn (v,T) => String.concat [v, "::", print_typ_full_sort T]) vs
+  end
+  end
+*)
+
+fun vars_of_term ctxt =
+  let val print_typ_full_sort = print_typ_full_sort ctxt
+   in fn term =>
+  let val vs = add_typs term []
+   in map (fn (v,T) => String.concat [v, "::", print_typ_full_sort T]) vs
+  end
+  end
 
 open ATP_Util
 open ATP_Problem_Generate
@@ -51,8 +147,6 @@ structure Thm_Vector_Local = Proof_Data (
                      | SOME v => Synchronized.var "Thm_Vector_Local" (Synchronized.value v))
 )
 
-val _ = Theory.setup (Thm_Vector.put (SOME (Synchronized.var "Thm_Vector" Termtab.empty)))
-
 val mepo_weight = 0.5 (* FUDGE *)
 val embd_weight = 0.5 (* FUDGE *)
 
@@ -74,27 +168,31 @@ fun relevant_facts ctxt (params as {verbose, fact_filter, timeout, ...}) prover
       
             val SOT = Premise_Embedding_Context_Info.string_of_term ctxt
             val defctxt_string_of = Premise_Embedding_Context_Info.defctxt_string_of ctxt
+            val vars_of_term = vars_of_term ctxt
       
             val assms = map (SOT o Thm.term_of) (Assumption.all_assms_of ctxt)
             val goal = Logic.list_implies (hyp_ts, concl_t)
             val goal_ctxt = defctxt_string_of goal
+            val goal_enc = (assms, SOT goal, vars_of_term goal)
       
-            val (vecs'0, query) = Synchronized.change_result vecs_var (fn vec_store =>
-              let val vecs'0 = map (fn origin as ((_, (scope, _)), thm) =>
+            val vec_store = Synchronized.value vecs_var
+            val vecs'0 = map (fn origin as ((_, (scope, _)), thm) =>
+                      let val prop = Thm.prop_of thm
+                       in (origin, Termtab.lookup vec_store prop)
+                      end) unique_facts
+            val query = Par_List.map (
+                    fn ((tag, thm), NONE) =>
                         let val prop = Thm.prop_of thm
-                         in (origin, Termtab.lookup vec_store prop)
-                        end) facts
-                  val query = map_filter (
-                      fn ((tag, thm), NONE) =>
-                          let val prop = Thm.prop_of thm
-                           in SOME (SOT prop, defctxt_string_of prop)
-                          end
-                       | _ => NONE) vecs'0
-               in ((vecs'0, query), vec_store)
-              end)
-      
+                         in SOME ((SOT prop, vars_of_term prop), defctxt_string_of prop)
+                        end
+                     | _ => NONE) vecs'0
+                         |> map_filter I
+
+            val config = config_of ctxt
+            val embedding_token_limit = Config.get ctxt embedding_token_limit
             val (vgoal, vpremises') =
-                  Remote_Procedure_Calling.call_command embed_cmd ((assms, SOT goal, goal_ctxt), query)
+                  Remote_Procedure_Calling.call_command embed_goal_and_premises_cmd
+                      (goal_enc, goal_ctxt, query, config, embedding_token_limit)
       
             fun is_global ((_,(Global,_)),_) = true
               | is_global _ = false
@@ -164,4 +262,21 @@ val _ = Theory.setup (Sledgehammer_MaSh.add_custom_fact_filter "embd" relevant_f
           Termtab.lookup xtab (Thm.prop_of thm); ()))) facts
       val _ = @{print} time
 *)
+
+fun update_premises thy =
+  let val ctxt = Proof_Context.init_global thy
+      val facts = Sledgehammer_Fact.all_facts ctxt false (Thy_Header.get_keywords thy) [] []
+                      (Sledgehammer_Fact.clasimpset_rule_table_of ctxt)
+   in ()
+  end
+
+val _ = Theory.setup (
+            Thm_Vector.put (SOME (Synchronized.var "Thm_Vector" Termtab.empty))
+         #> Theory.at_begin (fn thy =>
+              let val env = getenv "ISABELLE_PREBUILD_PREMISE_EMBEDDING"
+                  val enabled = (env = "yes" orelse env = "true")
+               in if enabled then update_premises thy else ()
+                ; NONE
+              end))
+
 end

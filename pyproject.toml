@@ -15,7 +15,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
-dependencies = ["msgpack"]
+dependencies = ["msgpack", "rocksdict", "platformdirs", "transformers"]
 
 [project.urls]
 "Homepage" = "https://github.com/xqyww123/Premise_Embedding"

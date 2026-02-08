@@ -191,7 +191,8 @@ fun top_k (assoc_array, query, k) =
    in List.tabulate (k, fn i =>
         let val wi = Word.fromInt i
             val j = Word32.toInt (get32 (result_indexes_ptr, wi))
-            val score = 32768.0 / Real.fromInt (Word.toInt (get16 (result_indexes_ptr, wi)))
+            val raw = Word.toInt (get16 (result_scores_ptr, wi))
+            val score = Real.fromInt (if raw >= 32768 then raw - 65536 else raw) / 32768.0
             val (v, _) = Array.sub (assoc_array, j)
          in (v, score)
         end )
@@ -214,6 +215,14 @@ structure Vector_Arith_Q15_D384 = Vector_Arith(struct
 
 structure Vector_Arith_Q15_D24 = Vector_Arith(struct
     val DIM = 24
+    val encoding = "q15"
+    val encoding_size = 2
+    type dot_ret = int
+    val dot_ret_conv = Foreign.cInt16
+  end)
+
+structure Vector_Arith_Q15_D2048 = Vector_Arith(struct
+    val DIM = 2048
     val encoding = "q15"
     val encoding_size = 2
     type dot_ret = int
