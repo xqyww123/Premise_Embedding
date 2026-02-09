@@ -134,11 +134,28 @@ def _count_tokens(text: str, model: str) -> int:
         return len(enc)
     return len(tokenizer.encode(text, add_special_tokens=False))
 
+def _truncate_to_token_limit(text: str, model: str, token_limit: int) -> str:
+    """
+    Truncate text to at most token_limit tokens for the given model,
+    without raising exceptions.
+    """
+    from transformers import AutoTokenizer, PreTrainedTokenizerBase
+    global _tokenizers
+    if model not in _tokenizers:
+        _tokenizers[model] = AutoTokenizer.from_pretrained(model)
+    tokenizer: PreTrainedTokenizerBase = _tokenizers[model]
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(token_ids) <= token_limit:
+        return text
+    truncated_ids = token_ids[:token_limit]
+    return tokenizer.decode(truncated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+
 def _shrink_tokens(statement: str, for_goal: bool, model: str, token_limit: int) -> str:
     tok_count = _count_tokens(statement, model)
     if tok_count > token_limit:
         if not for_goal:
-            raise ValueError(f"tok_count {tok_count} is greater than TOKEN_LIMIT {token_limit}")
+            return _truncate_to_token_limit(statement, model, token_limit)
+            #raise ValueError(f"tok_count {tok_count} is greater than TOKEN_LIMIT {token_limit}")
         lines = statement.split('\n')
         ret_lines = []
         for i,line in enumerate(lines):
@@ -151,12 +168,14 @@ def _shrink_tokens(statement: str, for_goal: bool, model: str, token_limit: int)
             tok_count -= _count_tokens(line, model)
             if tok_count <= token_limit:
                 if len(lines) <= 0:
-                    raise ValueError(f"tok_count {tok_count} is greater than TOKEN_LIMIT {token_limit}")
+                    return _truncate_to_token_limit(statement, model, token_limit)
+                    #raise ValueError(f"tok_count {tok_count} is greater than TOKEN_LIMIT {token_limit}")
                 ret_lines.extend(lines[i+1:])
                 # if count_tokens("".join(ret_lines)) > TOKEN_LIMIT:
                 #     raise ValueError(f"DDDD tok_count {count_tokens(''.join(ret_lines))} is greater than TOKEN_LIMIT {TOKEN_LIMIT} {for_goal}")
                 return "\n".join(ret_lines)
-        raise ValueError(f"tok_count {tok_count} is greater than TOKEN_LIMIT {token_limit}")
+        return _truncate_to_token_limit(statement, model, token_limit)
+        #raise ValueError(f"tok_count {tok_count} is greater than TOKEN_LIMIT {token_limit}")
     return statement
 
 def _trim_context(statement : str, ctxt: str, for_goal: bool, model: str, token_limit: int) -> str:
