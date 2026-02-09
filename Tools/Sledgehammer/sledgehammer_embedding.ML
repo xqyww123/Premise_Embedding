@@ -9,10 +9,10 @@ val embedding_API_key = Attrib.setup_config_string \<^binding>\<open>embedding_A
 val embedding_dim = 2048
 val embedding_token_limit = Attrib.setup_config_int \<^binding>\<open>embedding_token_limit\<close> (K 8000)
 
-fun config_of ctxt =
+fun config_of ctxt model_id =
   let fun chk s = if s = "" then NONE else SOME s
    in ( chk (Config.get ctxt embedding_model_provider)
-      , Config.get ctxt embedding_model
+      , model_id
       , chk (Config.get ctxt embedding_API_key)
       , embedding_dim)
   end
@@ -25,6 +25,54 @@ local open MessagePackBinIO.Pack MessagePackBinIO.Unpack
 
   val unpackVec = unpackBytes
 in
+
+(*
+fun pack_raw_typ (Type data) =
+      packPair (packInt, packPair (packString, packList pack_raw_typ)) (0, data)
+  | pack_raw_typ (TFree data) =
+      packPair (packInt, packPair (packString, packList packString)) (1, data)
+  | pack_raw_typ (TVar ((n,i),s)) =
+      packPair (packInt, packTuple3 (packString, packInt, packList packString)) (2, (n,i,s))
+
+fun unpack_raw_typ s =
+      unpackPair_dep' unpackInt (
+        fn 0 => unpackPair (unpackString, unpackList unpack_raw_typ)
+             #> apfst Type
+         | 1 => unpackPair (unpackString, unpackList unpackString)
+             #> apfst TFree
+         | 2 => unpackTuple3 (unpackString, unpackInt, unpackList unpackString)
+             #> apfst (fn (n,i,s) => TVar ((n,i),s))
+         | _ => raise Unpack) s
+
+fun pack_raw_term (Const data) =
+      packPair (packInt, packPair (packString, pack_raw_typ)) (3, data)
+  | pack_raw_term (Free data) =
+      packPair (packInt, packPair (packString, pack_raw_typ)) (4, data)
+  | pack_raw_term (Var ((n,i),t)) =
+      packPair (packInt, packTuple3 (packString, packInt, pack_raw_typ)) (5, (n,i,t))
+  | pack_raw_term (Bound data) =
+      packPair (packInt, packInt) (6, data)
+  | pack_raw_term (Abs data) =
+      packPair (packInt, packTuple3 (packString, pack_raw_typ, pack_raw_term)) (7, data)
+  | pack_raw_term (A $ B) =
+      packPair (packInt, packPair (pack_raw_term, pack_raw_term)) (8, (A,B))
+
+fun unpack_raw_term s =
+      unpackPair_dep' unpackInt (
+        fn 3 => unpackPair (unpackString, unpack_raw_typ)
+             #> apfst Const
+         | 4 => unpackPair (unpackString, unpack_raw_typ)
+             #> apfst Free
+         | 5 => unpackTuple3 (unpackString, unpackInt, unpack_raw_typ)
+             #> apfst (fn (n,i,s) => Var ((n,i),s))
+         | 6 => unpackInt #> apfst Bound
+         | 7 => unpackTuple3 (unpackString, unpack_raw_typ, unpack_raw_term)
+             #> apfst Abs
+         | 8 => unpackPair (unpack_raw_term, unpack_raw_term)
+             #> apfst (fn (A,B) => A $ B)
+         | _ => raise Unpack) s
+*)
+
 (* val embed_cmd = {
   name = "embed_goal_premises",
   arg_schema = packPair (pack_goal, packList pack_premise),
@@ -41,8 +89,9 @@ val packGoal = packTuple3 (
       packList packString, (*premises*)
       packString,          (*conclusion*)
       packList packString  (*variables*))
-val packPremise =
-      packPair (packString (*statement*), packList packString (*variables*))
+val packPremise = packPair (
+      packString (*statement*),
+      packList packString (*variables*))
 val packCtxt = packString
 
 val embed_cmd = {
@@ -78,6 +127,33 @@ val embed_goal_and_premises_cmd = {
 }
 
 end
+
+(*
+fun pack_to_bytes packer value =
+  let
+    val chunks = Unsynchronized.ref ([] : Word8Vector.vector list)
+    val wr = BinPrimIO.WR {
+      name = "pack_to_bytes",
+      chunkSize = 4096,
+      writeVec = SOME (fn slice =>
+        let val n = Word8VectorSlice.length slice
+        in chunks := Word8VectorSlice.vector slice :: !chunks; n end),
+      writeArr = SOME (fn slice =>
+        let val n = Word8ArraySlice.length slice
+        in chunks := Word8ArraySlice.vector slice :: !chunks; n end),
+      writeVecNB = NONE, writeArrNB = NONE,
+      block = NONE, canOutput = SOME (fn () => true),
+      getPos = NONE, setPos = NONE, endPos = NONE, verifyPos = NONE,
+      close = fn () => (), ioDesc = NONE
+    }
+    val outs = BinIO.StreamIO.mkOutstream (wr, IO.BLOCK_BUF)
+    val _ = packer value outs
+    val _ = BinIO.StreamIO.closeOut outs
+  in Word8Vector.concat (rev (!chunks))
+  end
+
+val term_to_bytes = pack_to_bytes pack_raw_term
+val typ_to_bytes = pack_to_bytes pack_raw_typ *)
 
 structure Vector_Arith = Vector_Arith_Q15_D2048
 type vector = Vector_Arith.vector
@@ -131,19 +207,19 @@ fun steep_weight_of_fact rank = Math.pow (0.62, log2 (Real.fromInt (rank + 1))) 
 fun weight_facts_steeply facts = map_index (swap o apfst steep_weight_of_fact) facts
 
 structure Thm_Vector = Theory_Data (
-  type T = vector Termtab.table Synchronized.var option
+  type T = vector Termtab.table Symtab.table Synchronized.var option
   val empty = NONE
-  fun merge (NONE, NONE) = SOME (Synchronized.var "Thm_Vector" Termtab.empty)
+  fun merge (NONE, NONE) = SOME (Synchronized.var "Thm_Vector" Symtab.empty)
     | merge (NONE, some) = some
     | merge (some, NONE) = some
     | merge (SOME va, SOME vb) = SOME (Synchronized.var "Thm_Vector" (
-        Termtab.merge (K true) (Synchronized.value va, Synchronized.value vb)))
+        Symtab.join (K (Termtab.merge (K true))) (Synchronized.value va, Synchronized.value vb)))
 )
 
 structure Thm_Vector_Local = Proof_Data (
-  type T = vector Termtab.table Synchronized.var
+  type T = vector Termtab.table Symtab.table Synchronized.var
   fun init thy = (case Thm_Vector.get thy
-                    of NONE => Synchronized.var "Thm_Vector_Local" Termtab.empty
+                    of NONE => Synchronized.var "Thm_Vector_Local" Symtab.empty
                      | SOME v => Synchronized.var "Thm_Vector_Local" (Synchronized.value v))
 )
 
@@ -154,13 +230,14 @@ fun gen_eq_thm ctxt = if Config.get ctxt Sledgehammer_MaSh.duplicates
                       then Thm.eq_thm_strict
                       else Thm.eq_thm_prop
 
-fun cached_embed_premises ctxt vecs_global_var_opt vecs_var goal_opt facts =
+fun cached_embed_premises ctxt vecs_global_var_opt vecs_var model_id goal_opt facts =
   let val _ = Remote_Procedure_Calling.load ["Isabelle_Premise_Embedding"]
       val SOT = Premise_Embedding_Context_Info.string_of_term ctxt
       val defctxt_string_of = Premise_Embedding_Context_Info.defctxt_string_of ctxt
       val vars_of_term = vars_of_term ctxt
 
-      val vec_store = Synchronized.value vecs_var
+      val vec_store = Symtab.lookup (Synchronized.value vecs_var) model_id
+                   |> the_default Termtab.empty
       val vecs'0 = map (fn origin as ((_, (scope, _)), thm) =>
                 let val prop = Thm.prop_of thm
                  in (origin, Termtab.lookup vec_store prop)
@@ -173,7 +250,7 @@ fun cached_embed_premises ctxt vecs_global_var_opt vecs_var goal_opt facts =
                | _ => NONE) vecs'0
                        |> map_filter I
 
-      val config = config_of ctxt
+      val config = config_of ctxt model_id
       val embedding_token_limit = Config.get ctxt embedding_token_limit
       val (vgoal_opt, vpremises') =
             case (goal_opt, null query) of
@@ -209,12 +286,16 @@ fun cached_embed_premises ctxt vecs_global_var_opt vecs_var goal_opt facts =
       val (vpremises, new_add, global_add) = merge_ret ([],[],[]) (vpremises', vecs'0)
 
       val _ = if null new_add then ()
-              else Synchronized.change vecs_var (fold Termtab.update_new new_add)
+              else Synchronized.change vecs_var
+                (Symtab.map_default (model_id, Termtab.empty)
+                    (fold Termtab.update_new new_add))
       val _ = case vecs_global_var_opt
                 of NONE => ()
                  | SOME gvar =>
                     if null global_add then ()
-                    else Synchronized.change gvar (fold Termtab.update_new global_add)
+                    else Synchronized.change gvar
+                      (Symtab.map_default (model_id, Termtab.empty)
+                          (fold Termtab.update_new global_add))
   in (vgoal_opt, vpremises)
   end
 
@@ -239,8 +320,9 @@ fun relevant_facts ctxt (params as {verbose, fact_filter, timeout, ...}) prover
             val goal_ctxt = defctxt_string_of goal
             val goal_enc = (assms, SOT goal, vars_of_term goal)
 
+            val model_id = Config.get ctxt embedding_model
             val (SOME vgoal, vpremises) =
-                  cached_embed_premises ctxt (SOME vecs_global_var) vecs_var
+                  cached_embed_premises ctxt (SOME vecs_global_var) vecs_var model_id
                       (SOME (goal_enc, goal_ctxt)) unique_facts
 
             val vpremises : (Sledgehammer_Fact.lazy_fact * Word8Vector.vector) Array.array
@@ -294,7 +376,7 @@ val _ = Theory.setup (Sledgehammer_MaSh.add_custom_fact_filter "embd" relevant_f
 
 val update_premises_lock = Synchronized.var "update_premises_lock" ()
 
-fun update_premises thy =
+fun update_premises model_id thy =
   Synchronized.change update_premises_lock (fn () =>
   let val ctxt = Proof_Context.init_global thy
       val facts = Sledgehammer_Fact.all_facts ctxt false (Thy_Header.get_keywords thy) [] []
@@ -304,16 +386,15 @@ fun update_premises thy =
             case Thm_Vector.get thy
               of SOME v => v
                | NONE => error "update_premises: Thm_Vector is not initialized"
-      val _ = cached_embed_premises ctxt NONE vecs_global_var NONE facts
+      val _ = cached_embed_premises ctxt NONE vecs_global_var model_id NONE facts
    in ()
   end)
 
 val _ = Theory.setup (
-            Thm_Vector.put (SOME (Synchronized.var "Thm_Vector" Termtab.empty))
+            Thm_Vector.put (SOME (Synchronized.var "Thm_Vector" Symtab.empty))
          #> Theory.at_begin (fn thy =>
-              let val env = getenv "ISABELLE_PREBUILD_PREMISE_EMBEDDING"
-                  val enabled = (env = "yes" orelse env = "true")
-               in if enabled then update_premises thy else ()
+              let val target_ids = space_explode "," (getenv "ISABELLE_PREBUILD_PREMISE_EMBEDDING")
+               in List.app (fn model_id => update_premises model_id thy) target_ids
                 ; NONE
               end))
 

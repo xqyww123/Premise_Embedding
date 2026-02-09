@@ -208,6 +208,7 @@ def encode_goal(goal: goal, ctxt: ctxt, model: str, token_limit: int) -> str:
     if ctxt is None:
         goal_str = _shrink_tokens(goal_str, True, model, token_limit)
     else:
+        ctxt = pretty_unicode(ctxt)
         goal_str = _trim_context(goal_str, ctxt, True, model, token_limit)
     goal_str = "#Goal\n" + goal_str
     num = _count_tokens(goal_str, model)
@@ -222,6 +223,7 @@ def encode_premise(premise: premise, pctxt: ctxt, model: str, token_limit: int) 
     if pctxt is None:
         encode = _shrink_tokens(encode, False, model, token_limit)
     else:
+        pctxt = pretty_unicode(pctxt)
         encode = _trim_context(encode, pctxt, False, model, token_limit)
     encode = "#Fact\n" + encode
     num = _count_tokens(encode, model)
@@ -248,7 +250,7 @@ def embed_goal_and_premises(arg: tuple[goal, ctxt, list[tuple[premise, ctxt]], c
     (goal, gctxt, premises, cfg, token_limit) = arg
     _, MODEL_ID, _, _ = cfg
     goal_str = encode_goal(goal, gctxt, MODEL_ID, token_limit)
-    codes = [encode_premise(premise, ctxt, MODEL_ID, token_limit) for premise, ctxt in premises]
+    codes : list[str] = [encode_premise(premise, ctxt, MODEL_ID, token_limit) for premise, ctxt in premises]
     codes.append(goal_str)
     vecs = embed((codes, cfg), connection)
     goal_vec = vecs.pop()
