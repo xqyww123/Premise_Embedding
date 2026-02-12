@@ -31,6 +31,8 @@ type vector = bytearray | bytes
 
 @isabelle_remote_procedure("embed")
 def embed(arg : tuple[list[bytes | str], config], connection : Connection) -> list[vector]:
+    if connection is not None and getattr(connection.server, "debugging", False):
+        connection.server.logger.debug("embed: %d texts, config model=%s dim=%s", len(arg[0]), arg[1][1], arg[1][3])
     (texts, (base_url, MODEL_ID, api_key, dimension)) = arg
     if base_url is None:
         base_url = TEI_BASE_DEFAULT
@@ -252,6 +254,8 @@ def encode_premise(premise: premise, pctxt: ctxt, model: str, token_limit: int) 
 
 @isabelle_remote_procedure("embed_goal")
 def embed_goal(arg: tuple[goal, ctxt, config, int], connection : Connection) -> vector:
+    if connection is not None and getattr(connection.server, "debugging", False):
+        connection.server.logger.debug("embed_goal: token_limit=%s", arg[3])
     (goal, ctxt, cfg, token_limit) = arg
     _, MODEL_ID, _, _ = cfg
     goal_str = encode_goal(goal, ctxt, MODEL_ID, token_limit)
@@ -259,6 +263,8 @@ def embed_goal(arg: tuple[goal, ctxt, config, int], connection : Connection) -> 
 
 @isabelle_remote_procedure("embed_premises")
 def embed_premises(arg: tuple[list[tuple[premise, ctxt]], config, int], connection : Connection) -> list[vector]:
+    if connection is not None and getattr(connection.server, "debugging", False):
+        connection.server.logger.debug("embed_premises: %d premises, token_limit=%s", len(arg[0]), arg[2])
     (premises, cfg, token_limit) = arg
     _, MODEL_ID, _, _ = cfg
     premises_str = [encode_premise(premise, ctxt, MODEL_ID, token_limit) for premise, ctxt in premises]
@@ -266,6 +272,8 @@ def embed_premises(arg: tuple[list[tuple[premise, ctxt]], config, int], connecti
 
 @isabelle_remote_procedure("embed_goal_and_premises")
 def embed_goal_and_premises(arg: tuple[goal, ctxt, list[tuple[premise, ctxt]], config, int], connection : Connection) -> tuple[bytes, list[bytes]]:
+    if connection is not None and getattr(connection.server, "debugging", False):
+        connection.server.logger.debug("embed_goal_and_premises: %d premises, token_limit=%s", len(arg[2]), arg[4])
     (goal, gctxt, premises, cfg, token_limit) = arg
     _, MODEL_ID, _, _ = cfg
     goal_str = encode_goal(goal, gctxt, MODEL_ID, token_limit)

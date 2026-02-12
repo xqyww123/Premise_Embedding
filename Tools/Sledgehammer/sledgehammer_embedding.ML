@@ -288,14 +288,14 @@ fun cached_embed_premises ctxt vecs_global_var_opt vecs_var model_id goal_opt fa
       val _ = if null new_add then ()
               else Synchronized.change vecs_var
                 (Symtab.map_default (model_id, Termtab.empty)
-                    (fold Termtab.update_new new_add))
+                    (fold Termtab.update new_add))
       val _ = case vecs_global_var_opt
                 of NONE => ()
                  | SOME gvar =>
                     if null global_add then ()
                     else Synchronized.change gvar
                       (Symtab.map_default (model_id, Termtab.empty)
-                          (fold Termtab.update_new global_add))
+                          (fold Termtab.update global_add))
   in (vgoal_opt, vpremises)
   end
 

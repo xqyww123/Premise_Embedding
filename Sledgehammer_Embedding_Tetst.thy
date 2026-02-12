@@ -57,4 +57,12 @@ let val vec_size = 4096
 end
 \<close>
 
+lemma
+  assumes A: P
+  assumes B: Q
+  shows "P \<Longrightarrow> P \<and> Q"
+  sledgehammer [fact_filter = "embd"]
+  sorry
+
+
 end
