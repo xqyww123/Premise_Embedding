@@ -5,6 +5,8 @@ import rocksdict
 import platformdirs
 import numpy as np
 import os
+import re
+import time
 import requests
 import IsaREPL
 import re
@@ -31,9 +33,23 @@ type vector = bytearray | bytes
 
 @isabelle_remote_procedure("embed")
 def embed(arg : tuple[list[bytes | str], config], connection : Connection) -> list[vector]:
-    if connection is not None and getattr(connection.server, "debugging", False):
-        connection.server.logger.debug("embed: %d texts, config model=%s dim=%s", len(arg[0]), arg[1][1], arg[1][3])
     (texts, (base_url, MODEL_ID, api_key, dimension)) = arg
+    if connection is not None and getattr(connection.server, "debugging", False) and texts:
+        try:
+            counts = [_count_tokens(t.decode("utf-8") if isinstance(t, bytes) else t, MODEL_ID) for t in texts]
+            p = np.percentile(counts, [25, 50, 75])
+            q25, q50, q75 = float(p[0]), float(p[1]), float(p[2])
+            n_over_1000 = sum(1 for c in counts if c > 1000)
+            n_over_2000 = sum(1 for c in counts if c > 2000)
+            n_over_3000 = sum(1 for c in counts if c > 3000)
+            token_total = sum(counts)
+            connection.server.logger.debug(
+                "embed: %d texts, model=%s dim=%s, token_count 25th=%.0f 50th=%.0f 75th=%.0f max=%d total=%d, over_1000=%d over_2000=%d over_3000=%d",
+                len(texts), MODEL_ID, dimension, q25, q50, q75, max(counts), token_total, n_over_1000, n_over_2000, n_over_3000,
+            )
+        except Exception:
+            connection.server.logger.debug("embed: %d texts, model=%s dim=%s (token stats unavailable)", len(texts), MODEL_ID, dimension)
+    _t0 = time.perf_counter()
     if base_url is None:
         base_url = TEI_BASE_DEFAULT
         api_key = API_KEY_DEFAULT
@@ -60,6 +76,8 @@ def embed(arg : tuple[list[bytes | str], config], connection : Connection) -> li
                 output[i] = v
 
         if len(new_texts) == 0:
+            if connection is not None and getattr(connection.server, "debugging", False):
+                connection.server.logger.debug("embed: elapsed=%.3fs", time.perf_counter() - _t0)
             return cast(list[vector], [v for v in output if v is not None])
 
         if MODEL_ID.startswith('reasonwang'):
@@ -97,6 +115,8 @@ def embed(arg : tuple[list[bytes | str], config], connection : Connection) -> li
             db[text] = vecs_q15_bytes[i]
         for i, j in enumerate(indexes):
             output[j] = vecs_q15_bytes[i]
+        if connection is not None and getattr(connection.server, "debugging", False):
+            connection.server.logger.debug("embed: elapsed=%.3fs", time.perf_counter() - _t0)
         if len(new_texts) == len(texts):
             return cast(list[vector], vecs_q15_bytes)
         else:
@@ -254,26 +274,45 @@ def encode_premise(premise: premise, pctxt: ctxt, model: str, token_limit: int) 
 
 @isabelle_remote_procedure("embed_goal")
 def embed_goal(arg: tuple[goal, ctxt, config, int], connection : Connection) -> vector:
-    if connection is not None and getattr(connection.server, "debugging", False):
-        connection.server.logger.debug("embed_goal: token_limit=%s", arg[3])
+    _t0 = time.perf_counter()
     (goal, ctxt, cfg, token_limit) = arg
     _, MODEL_ID, _, _ = cfg
     goal_str = encode_goal(goal, ctxt, MODEL_ID, token_limit)
-    return embed(([goal_str], cfg), connection)[0]
+    result = embed(([goal_str], cfg), connection)[0]
+    if connection is not None and getattr(connection.server, "debugging", False):
+        elapsed = time.perf_counter() - _t0
+        n = _count_tokens(goal_str, MODEL_ID)
+        connection.server.logger.debug(
+            "embed_goal: token_limit=%s, token_count 25th=50th=75th=max=%s total=%d, over_1000=%d over_2000=%d over_3000=%d, elapsed=%.3fs",
+            token_limit, n, n, (1 if n > 1000 else 0), (1 if n > 2000 else 0), (1 if n > 3000 else 0), elapsed,
+        )
+    return result
 
 @isabelle_remote_procedure("embed_premises")
 def embed_premises(arg: tuple[list[tuple[premise, ctxt]], config, int], connection : Connection) -> list[vector]:
-    if connection is not None and getattr(connection.server, "debugging", False):
-        connection.server.logger.debug("embed_premises: %d premises, token_limit=%s", len(arg[0]), arg[2])
+    _t0 = time.perf_counter()
     (premises, cfg, token_limit) = arg
     _, MODEL_ID, _, _ = cfg
     premises_str = [encode_premise(premise, ctxt, MODEL_ID, token_limit) for premise, ctxt in premises]
-    return embed((premises_str, cfg), connection)
+    result = embed((premises_str, cfg), connection)
+    if connection is not None and getattr(connection.server, "debugging", False) and premises_str:
+        elapsed = time.perf_counter() - _t0
+        counts = [_count_tokens(s, MODEL_ID) for s in premises_str]
+        p = np.percentile(counts, [25, 50, 75])
+        q25, q50, q75 = float(p[0]), float(p[1]), float(p[2])
+        n_over_1000 = sum(1 for c in counts if c > 1000)
+        n_over_2000 = sum(1 for c in counts if c > 2000)
+        n_over_3000 = sum(1 for c in counts if c > 3000)
+        token_total = sum(counts)
+        connection.server.logger.debug(
+            "embed_premises: %d premises, token_limit=%s, token_count 25th=%.0f 50th=%.0f 75th=%.0f max=%d total=%d, over_1000=%d over_2000=%d over_3000=%d, elapsed=%.3fs",
+            len(premises), token_limit, q25, q50, q75, max(counts), token_total, n_over_1000, n_over_2000, n_over_3000, elapsed,
+        )
+    return result
 
 @isabelle_remote_procedure("embed_goal_and_premises")
 def embed_goal_and_premises(arg: tuple[goal, ctxt, list[tuple[premise, ctxt]], config, int], connection : Connection) -> tuple[bytes, list[bytes]]:
-    if connection is not None and getattr(connection.server, "debugging", False):
-        connection.server.logger.debug("embed_goal_and_premises: %d premises, token_limit=%s", len(arg[2]), arg[4])
+    _t0 = time.perf_counter()
     (goal, gctxt, premises, cfg, token_limit) = arg
     _, MODEL_ID, _, _ = cfg
     goal_str = encode_goal(goal, gctxt, MODEL_ID, token_limit)
@@ -282,6 +321,18 @@ def embed_goal_and_premises(arg: tuple[goal, ctxt, list[tuple[premise, ctxt]], c
     vecs = embed((codes, cfg), connection)
     goal_vec = vecs.pop()
     prem_vecs = vecs
+    if connection is not None and getattr(connection.server, "debugging", False) and codes:
+        elapsed = time.perf_counter() - _t0
+        counts = [_count_tokens(s, MODEL_ID) for s in codes]
+        q25, q50, q75 = (float(np.percentile(counts, 25)), float(np.percentile(counts, 50)), float(np.percentile(counts, 75)))
+        n_over_1000 = sum(1 for c in counts if c > 1000)
+        n_over_2000 = sum(1 for c in counts if c > 2000)
+        n_over_3000 = sum(1 for c in counts if c > 3000)
+        token_total = sum(counts)
+        connection.server.logger.debug(
+            "embed_goal_and_premises: %d premises+goal, token_limit=%s, token_count 25th=%.0f 50th=%.0f 75th=%.0f max=%d total=%d, over_1000=%d over_2000=%d over_3000=%d, elapsed=%.3fs",
+            len(codes), token_limit, q25, q50, q75, max(counts), token_total, n_over_1000, n_over_2000, n_over_3000, elapsed,
+        )
     return (goal_vec, prem_vecs)
 
 if __name__ == "__main__":
