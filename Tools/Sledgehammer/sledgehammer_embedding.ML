@@ -231,7 +231,7 @@ fun gen_eq_thm ctxt = if Config.get ctxt Sledgehammer_MaSh.duplicates
                       else Thm.eq_thm_prop
 
 fun cached_embed_premises ctxt vecs_global_var_opt vecs_var model_id goal_opt facts =
-  let val _ = Remote_Procedure_Calling.load ["Isabelle_Premise_Embedding"]
+  let val _ = Remote_Procedure_Calling.load ["Isabelle_Semantic_Embedding"]
       val SOT = Premise_Embedding_Context_Info.string_of_term ctxt
       val defctxt_string_of = Premise_Embedding_Context_Info.defctxt_string_of ctxt
       val vars_of_term = vars_of_term ctxt
@@ -393,7 +393,7 @@ fun update_premises model_id thy =
 val _ = Theory.setup (
             Thm_Vector.put (SOME (Synchronized.var "Thm_Vector" Symtab.empty))
          #> Theory.at_begin (fn thy =>
-              let val target_ids = space_explode "," (getenv "ISABELLE_PREBUILD_PREMISE_EMBEDDING")
+              let val target_ids = ["test"] (*space_explode "," (getenv "ISABELLE_PREBUILD_PREMISE_EMBEDDING")*)
                in List.app (fn model_id => update_premises model_id thy) target_ids
                 ; NONE
               end))

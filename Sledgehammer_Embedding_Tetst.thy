@@ -13,7 +13,7 @@ ML \<open>
 Vector_Arith_Q15_D2048.dot(v1,v2)
 \<close>
 
-ML \<open>
+M L \<open>
 let val vec_size = 4096
     fun rand_vec () = Word8Vector.tabulate (vec_size, fn _ =>
           Word8.fromInt (Random.random_range 0 255))

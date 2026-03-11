@@ -7,7 +7,7 @@ import platformdirs
 import os
 
 def dump(model_id: str, target_file: str):
-    cache_dir = platformdirs.user_cache_dir("Isabelle_Premise_Embedding", "Qiyuan")
+    cache_dir = platformdirs.user_cache_dir("Isabelle_Semantic_Embedding", "Qiyuan")
     cache_file = os.path.join(cache_dir, f"{model_id.replace('/', '_')}.db")
     with Rdict(cache_file, options=rocksdict.Options(raw_mode=True)) as db:
         with open(target_file, "w") as f:

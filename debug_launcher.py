@@ -1,5 +1,5 @@
 from Isabelle_RPC_Host import launch_server_, mk_logger_
-import Isabelle_Premise_Embedding
+import Isabelle_Semantic_Embedding
 
 if __name__ == "__main__":
     addr = "127.0.0.1:27182"

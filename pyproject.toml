@@ -3,7 +3,7 @@ requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "Isabelle_Premise_Embedding"
+name = "Isabelle_Semantic_Embedding"
 version = "0.1.0"
 description = "Isabelle RPC Host"
 readme = "README.md"
@@ -18,8 +18,8 @@ classifiers = [
 dependencies = ["msgpack", "rocksdict", "platformdirs", "transformers"]
 
 [project.urls]
-"Homepage" = "https://github.com/xqyww123/Premise_Embedding"
+"Homepage" = "https://github.com/xqyww123/Semantic_Embedding"
 
 [tool.setuptools.packages.find]
-include = ["Isabelle_Premise_Embedding", "Isabelle_Premise_Embedding.*"]
+include = ["Isabelle_Semantic_Embedding", "Isabelle_Semantic_Embedding.*"]
 exclude = ["contrib", "contrib.*"]

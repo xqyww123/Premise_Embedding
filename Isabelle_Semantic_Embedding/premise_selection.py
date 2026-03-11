@@ -58,7 +58,7 @@ def embed(arg : tuple[list[bytes | str], config], connection : Connection) -> li
     if api_key == "":
         api_key = API_KEY_DEFAULT
 
-    cache_dir = platformdirs.user_cache_dir("Isabelle_Premise_Embedding", "Qiyuan")
+    cache_dir = platformdirs.user_cache_dir("Isabelle_Semantic_Embedding", "Qiyuan")
     cache_file = os.path.join(cache_dir, f"{MODEL_ID.replace('/', '_')}.db")
     with Rdict(cache_file, options=rocksdict.Options(raw_mode=True)) as db:
         byte_num = dimension * 2
@@ -286,6 +286,7 @@ def embed_goal(arg: tuple[goal, ctxt, config, int], connection : Connection) -> 
             "embed_goal: token_limit=%s, token_count 25th=50th=75th=max=%s total=%d, over_1000=%d over_2000=%d over_3000=%d, elapsed=%.3fs",
             token_limit, n, n, (1 if n > 1000 else 0), (1 if n > 2000 else 0), (1 if n > 3000 else 0), elapsed,
         )
+    raise Exception("Intentional Error")
     return result
 
 @isabelle_remote_procedure("embed_premises")
@@ -308,6 +309,7 @@ def embed_premises(arg: tuple[list[tuple[premise, ctxt]], config, int], connecti
             "embed_premises: %d premises, token_limit=%s, token_count 25th=%.0f 50th=%.0f 75th=%.0f max=%d total=%d, over_1000=%d over_2000=%d over_3000=%d, elapsed=%.3fs",
             len(premises), token_limit, q25, q50, q75, max(counts), token_total, n_over_1000, n_over_2000, n_over_3000, elapsed,
         )
+    raise Exception("Intentional Error")
     return result
 
 @isabelle_remote_procedure("embed_goal_and_premises")
@@ -333,6 +335,7 @@ def embed_goal_and_premises(arg: tuple[goal, ctxt, list[tuple[premise, ctxt]], c
             "embed_goal_and_premises: %d premises+goal, token_limit=%s, token_count 25th=%.0f 50th=%.0f 75th=%.0f max=%d total=%d, over_1000=%d over_2000=%d over_3000=%d, elapsed=%.3fs",
             len(codes), token_limit, q25, q50, q75, max(counts), token_total, n_over_1000, n_over_2000, n_over_3000, elapsed,
         )
+    raise Exception("Intentional Error")
     return (goal_vec, prem_vecs)
 
 if __name__ == "__main__":

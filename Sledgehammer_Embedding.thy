@@ -1,5 +1,5 @@
 theory Sledgehammer_Embedding
-  imports Isabelle_RPC.Remote_Procedure_Calling
+  imports Semantic_Embedding
 begin 
 
 ML_file \<open>Tools/simd_vector.ML\<close>
