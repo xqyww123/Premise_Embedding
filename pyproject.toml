@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "Isabelle_Semantic_Embedding"
 version = "0.1.0"
-description = "Isabelle RPC Host"
+description = "Isabelle Semantic Embedding"
 readme = "README.md"
 license = "LGPL-2.1-or-later"
 authors = [

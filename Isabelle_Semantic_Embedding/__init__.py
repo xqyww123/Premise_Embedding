@@ -10,6 +10,7 @@ from .premise_selection import (
     encode_goal,
     encode_premise,
 )
+from .semantic_interpretation import interpret_file
 
 __all__ = [
     "embed",
@@ -18,4 +19,5 @@ __all__ = [
     "embed_goal_and_premises",
     "encode_goal",
     "encode_premise",
+    "interpret_file",
 ]
