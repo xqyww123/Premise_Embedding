@@ -139,11 +139,15 @@ def _build_prompt(
     kinds: list[int],
     display_names: list[str],
     prop_strs: list[str],
+    line_numbers: list[int],
 ) -> str:
     entry_lines = []
-    for i, (kind, name, prop) in enumerate(zip(kinds, display_names, prop_strs)):
+    for i, (kind, name, prop, lineno) in enumerate(zip(kinds, display_names, prop_strs, line_numbers)):
         label = _KIND_PROMPT_LABELS.get(kind, "unknown")
-        line = f"  {i}. {label} {name}"
+        if lineno > 0:
+            line = f"  {i}. [line {lineno}] {label} {name}"
+        else:
+            line = f"  {i}. {label} {name}"
         if prop:
             line += f": {prop}"
         entry_lines.append(line)
@@ -208,15 +212,16 @@ async def _run_agent(options: ClaudeAgentOptions, prompt: str) -> None:
 @isabelle_remote_procedure("Semantic_Store.interpret_file")
 def interpret_file(arg: Any, connection: Connection) -> list[str | None]:
     (file_path, theory_longname, deps_longname, raw_entries) = arg
-    kinds = [kind for (kind, _, _) in raw_entries]
-    prop_strs = [prop for (_, _, prop) in raw_entries]
+    kinds = [kind for (kind, _, _, _) in raw_entries]
+    prop_strs = [prop for (_, _, prop, _) in raw_entries]
+    line_numbers = [lineno for (_, _, _, lineno) in raw_entries]
 
     # Strip the leading theory-name qualifier from fully qualified names.
     # E.g. if theory_longname is "List", "List.append_def" becomes "append_def".
-    prefix = theory_longname + "."
+    prefix = theory_longname.split(".")[-1] + "."
     display_names = [
         name[len(prefix):] if name.startswith(prefix) else name
-        for (_, name, _) in raw_entries
+        for (_, name, _, _) in raw_entries
     ]
 
     # Set up thread-local state for MCP tool handlers
@@ -226,7 +231,7 @@ def interpret_file(arg: Any, connection: Connection) -> list[str | None]:
     _local.kinds = kinds
 
     # Build prompt
-    prompt = _build_prompt(file_path, theory_longname, deps_longname, kinds, display_names, prop_strs)
+    prompt = _build_prompt(file_path, theory_longname, deps_longname, kinds, display_names, prop_strs, line_numbers)
 
     # Create MCP server and agent options
     mcp = create_sdk_mcp_server("isabelle_semantics", tools=[_query_tool, _answer_tool])

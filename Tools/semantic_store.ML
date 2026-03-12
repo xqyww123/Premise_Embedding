@@ -58,7 +58,7 @@ local
 
   val pack_arg = fn {file_path, theory_longname, deps_longname, entries} =>
     packTuple4 (packString, packString, packList packString,
-                packList (packTuple3 (pack_entry_kind, packString, packString)))
+                packList (packTuple4 (pack_entry_kind, packString, packString, packInt)))
                (file_path, theory_longname, deps_longname, entries)
 
 in
@@ -127,7 +127,7 @@ fun make_query_callback (context : Context.generic) (current_names : string list
 
 fun make_interpret_file_cmd (query_cb : Remote_Procedure_Calling.callback') :
     ({file_path: string, theory_longname: string,
-      deps_longname: string list, entries: (key * string * string) list},
+      deps_longname: string list, entries: (key * string * string * int) list},
      semantics option list) Remote_Procedure_Calling.command = {
   name = "Semantic_Store.interpret_file",
   arg_schema = pack_arg,
@@ -224,36 +224,61 @@ fun preserved_datatype_const_names (thy : theory) : string list =
     maps (fn T => ctr_sugar_names T @ bnf_names T) local_type_names
   end
 
-(* Filter out datatype infrastructure constants, keeping preserved ones *)
-fun filter_datatype_infra_consts (thy : theory) (preserved_set : unit Strhashtab.table)
-    (entries : (key * string * Position.T) list) : (key * string * Position.T) list =
+(* Filter datatype infrastructure constants and return the infra predicate.
+   Pre-BNF intermediate constants (e.g. pre_list.* ) are infrastructure.
+   Class instance constants (e.g. equal_list_inst.* ) are infrastructure.
+   Other type-prefixed constants are infrastructure unless in the preserved set. *)
+fun gen_is_ADT_infra (thy : theory)
+    : {is_infra_const: string -> bool, is_infra_thm: string -> bool} =
   let
     val thy_name = Context.theory_long_name thy
     val type_space = Sign.type_space thy
     val local_type_names = Name_Space.get_names type_space
       |> filter (fn name =>
           #theory_long_name (Name_Space.the_entry type_space name) = thy_name)
+    val preserved_set = Strhashtab.make_set (preserved_datatype_const_names thy)
+    val pre_prefixes = map_filter (fn T =>
+      case BNF_FP_Def_Sugar.fp_sugar_of_global thy T of
+        NONE => NONE
+      | SOME fp =>
+          let val map_name = fst (Term.dest_Const (BNF_Def.map_of_bnf (#pre_bnf fp)))
+          in SOME (Long_Name.qualifier map_name ^ ".") end)
+      local_type_names
+    val inst_infixes = map (fn T => "_" ^ Long_Name.base_name T ^ "_inst.") local_type_names
     fun is_infra_const name =
-      exists (fn T => String.isPrefix (T ^ ".") name) local_type_names
-      andalso not (Strhashtab.defined preserved_set name)
+      exists (fn pfx => String.isPrefix pfx name) pre_prefixes
+      orelse exists (fn infix_ => String.isSubstring infix_ name) inst_infixes
+      orelse (exists (fn T => String.isPrefix (T ^ ".") name) local_type_names
+              andalso not (Strhashtab.defined preserved_set name))
+    fun is_infra_thm display_name =
+      exists (fn T =>
+        String.isPrefix (T ^ ".") display_name
+        andalso let val suffix = fst (parse_thm_name
+                      (String.extract (display_name, size T + 1, NONE)))
+                in String.isSuffix "_def" suffix
+                   orelse suffix = "splits"
+                   orelse String.isPrefix "split_" suffix end)
+        local_type_names
   in
-    filter (fn (_, name, _) => not (is_infra_const name)) entries
+    {is_infra_const = is_infra_const, is_infra_thm = is_infra_thm}
   end
 
 (* Filter internal theorems that don't need interpretation:
    - theorems with [code] attribute
-   - theorems whose propositions reference Lifting/BNF_Def/Transfer constants *)
-fun filter_internal_thms
+   - theorems whose propositions reference Lifting/BNF_Def/Transfer or
+     datatype infrastructure constants *)
+fun filter_internal_thms (is_infra : string -> bool)
     (entries : ((string * Position.T * thm) * (int * int * bool)) list)
     : ((string * Position.T * thm) * (int * int * bool)) list =
   let
-    val internal_prefixes = ["Lifting.", "BNF_Def.", "Transfer."]
-    fun has_internal_constant term =
-      Term.exists_Const (fn (name, _) =>
-        exists (fn pfx => String.isPrefix pfx name) internal_prefixes) term
+    val internal_prefixes = ["Lifting.", "BNF_Def.", "Transfer.", "BNF_Cardinal_Order_Relation.", "HOL.equal"]
+    fun is_internal_constant (name, _) =
+      exists (fn pfx => String.isPrefix pfx name) internal_prefixes
+      orelse is_infra name
   in
     filter (fn ((_, _, thm), (_, _, has_code)) =>
-      not has_code andalso not (has_internal_constant (Thm.prop_of thm))) entries
+      not has_code andalso not (Term.exists_Const is_internal_constant (Thm.prop_of thm)))
+      entries
   end
 
 fun string_of_term ctxt =
@@ -279,9 +304,8 @@ fun interpret_file (thy : theory) : unit =
     (* 2. Extract constants and theorems *)
     val const_entries = get_constants_with_positions thy
       (* (Constant_Key (name, pos), display_name, pos) *)
-    val preserved = preserved_datatype_const_names thy
-    val preserved_set = Strhashtab.make_set preserved
-    val const_entries = filter_datatype_infra_consts thy preserved_set const_entries
+    val {is_infra_const, is_infra_thm} = gen_is_ADT_infra thy
+    val const_entries = filter (fn (_, name, _) => not (is_infra_const name)) const_entries
 
     val raw_thm_entries = get_theorems_with_positions thy
       (* (display_name, pos, thm) *)
@@ -297,13 +321,13 @@ fun interpret_file (thy : theory) : unit =
       handle Remote_Procedure_Calling.Remote_Calling_Failure {message, ...} =>
         (warning ("check_theorem_name_in_file RPC failed: " ^ message);
          map (K (0, ~1, false)) thm_display_names)
-    val raw_thm_entries_with_offsets = map_filter
-          (fn (entry, (word_off, goal_off, has_code)) =>
-            if word_off >= 0 then SOME (entry, (word_off, goal_off, has_code)) else NONE)
+    val raw_thm_entries_with_offsets =
           (raw_thm_entries ~~ name_check_results)
 
     (* 2c. Remove internal theorems that don't need interpretation *)
-    val raw_thm_entries_with_offsets = filter_internal_thms raw_thm_entries_with_offsets
+    val raw_thm_entries_with_offsets = filter_internal_thms is_infra_const raw_thm_entries_with_offsets
+    val raw_thm_entries_with_offsets = filter (fn ((name, _, _), _) =>
+        not (is_infra_thm name)) raw_thm_entries_with_offsets
 
     (* 3. Register theorems and assign serial-based keys *)
     val transfer = Global_Theory.transfer_theories thy
@@ -341,12 +365,22 @@ fun interpret_file (thy : theory) : unit =
     val ctxt = Proof_Context.init_global thy
     val pp = string_of_term ctxt
 
+    fun key_kind_ord (Constant_Key _, Theorem_Key _) = LESS
+      | key_kind_ord (Theorem_Key _, Constant_Key _) = GREATER
+      | key_kind_ord _ = EQUAL
+    fun entry_ord (e1, e2) =
+      (case int_ord (the_default 0 (Position.line_of (#3 e1)),
+                     the_default 0 (Position.line_of (#3 e2))) of
+        EQUAL => (case key_kind_ord (#1 e1, #1 e2) of
+          EQUAL => string_ord (#2 e1, #2 e2)
+        | ord => ord)
+      | ord => ord)
     val all_entries_with_pos =
       (map (fn (key, name, pos) => (key, name, pos, ~1)) const_entries
        @ deduped_thm_entries)
-      |> sort (int_ord o apply2 (the_default 0 o Position.line_of o #3))
+      |> sort entry_ord
 
-    val entries = all_entries_with_pos |> map (fn (key, name, _, goal_off) =>
+    val entries = all_entries_with_pos |> map (fn (key, name, pos, goal_off) =>
       let val prop_str =
         case key of
           Theorem_Key s =>
@@ -356,7 +390,8 @@ fun interpret_file (thy : theory) : unit =
                   | NONE => "")
             else ""
         | _ => ""
-      in (key, name, prop_str) end)
+        val line = the_default ~1 (Position.line_of pos)
+      in (key, name, prop_str, line) end)
 
     val display_names = map #2 entries
 
