@@ -11,7 +11,7 @@ from .premise_selection import (
     encode_premise,
 )
 from .semantic_interpretation import interpret_file
-from .theory_structure import mk_unicode_file
+from .theory_structure import mk_unicode_file, theory_info
 
 __all__ = [
     "embed",
@@ -21,4 +21,5 @@ __all__ = [
     "encode_goal",
     "encode_premise",
     "interpret_file",
+    "theory_info",
 ]

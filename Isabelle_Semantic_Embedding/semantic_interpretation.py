@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import threading
 from typing import Any
 
+import platformdirs
+import xxhash
 from Isabelle_RPC_Host import Connection, isabelle_remote_procedure
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -15,6 +16,7 @@ from claude_agent_sdk import (
     create_sdk_mcp_server,
     tool,
 )
+from rocksdict import Options, Rdict
 import IsaREPL
 
 # --- Thread-local state ---
@@ -26,10 +28,22 @@ _KIND_PROMPT_LABELS = {_KIND_CONSTANT: "constant", _KIND_THEOREM: "lemma"}
 class _LocalState(threading.local):
     connection: Connection
     results: dict[int, str]       # index -> semantics
-    display_names: list[str]
+    names: list[str]
     kinds: list[int]              # _KIND_CONSTANT or _KIND_THEOREM
 
 _local = _LocalState()
+
+
+# --- Persistent cache ---
+
+def _open_cache() -> Rdict:
+    cache_dir = platformdirs.user_cache_dir("Isabelle_Semantic_Embedding", "Qiyuan")
+    os.makedirs(cache_dir, exist_ok=True)
+    return Rdict(os.path.join(cache_dir, "semantics.db"),
+                 options=Options(raw_mode=True))
+
+def _cache_key(file_hash: bytes, name: str) -> bytes:
+    return file_hash + b":" + name.encode("utf-8")
 
 
 # --- MCP tool return helper ---
@@ -73,7 +87,7 @@ async def _query_tool(args: dict[str, Any]) -> ToolCall_ret:
         return _mk_ret(f"Invalid type: {t!r}. Must be 'constant' or 'theorem'.")
     if not isinstance(name, str) or not name:
         return _mk_ret("Invalid name: must be a non-empty string.")
-    if name in _local.display_names:
+    if name in _local.names:
         return _mk_ret(
             f"\"{name}\" is one of the entries you are currently interpreting. "
             "You should interpret it yourself based on the source file, not query it."
@@ -124,7 +138,7 @@ async def _answer_tool(args: dict[str, Any]) -> ToolCall_ret:
     for item in interpretations:
         _local.results[item["index"]] = item["semantics"]
     count = len(interpretations)
-    remaining = len(_local.display_names) - len(_local.results)
+    remaining = len(_local.names) - len(_local.results)
     cs = "" if count == 1 else "s"
     rs = "" if remaining == 1 else "s"
     return _mk_ret(f"Answered {count} interpretation{cs}, remaining {remaining} to answer.")
@@ -137,12 +151,12 @@ def _build_prompt(
     theory_longname: str,
     deps_longname: list[str],
     kinds: list[int],
-    display_names: list[str],
+    names: list[str],
     prop_strs: list[str],
     line_numbers: list[int],
 ) -> str:
     entry_lines = []
-    for i, (kind, name, prop, lineno) in enumerate(zip(kinds, display_names, prop_strs, line_numbers)):
+    for i, (kind, name, prop, lineno) in enumerate(zip(kinds, names, prop_strs, line_numbers)):
         label = _KIND_PROMPT_LABELS.get(kind, "unknown")
         if lineno > 0:
             line = f"  {i}. [line {lineno}] {label} {name}"
@@ -186,7 +200,7 @@ Guidelines:
 # --- Agent runner ---
 
 async def _run_agent(options: ClaudeAgentOptions, prompt: str) -> None:
-    n = len(_local.display_names)
+    n = len(_local.names)
     async with ClaudeSDKClient(options=options) as client:
         await client.query(prompt)
         async for message in client.receive_response():
@@ -196,7 +210,7 @@ async def _run_agent(options: ClaudeAgentOptions, prompt: str) -> None:
             if not missing:
                 break
             missing_lines = "\n".join(
-                f"  {i}. {_KIND_PROMPT_LABELS.get(_local.kinds[i], 'unknown')} {_local.display_names[i]}"
+                f"  {i}. {_KIND_PROMPT_LABELS.get(_local.kinds[i], 'unknown')} {_local.names[i]}"
                 for i in missing
             )
             await client.query(
@@ -215,116 +229,61 @@ def interpret_file(arg: Any, connection: Connection) -> list[str | None]:
     kinds = [kind for (kind, _, _, _) in raw_entries]
     prop_strs = [prop for (_, _, prop, _) in raw_entries]
     line_numbers = [lineno for (_, _, _, lineno) in raw_entries]
+    names = [name for (_, name, _, _) in raw_entries]
+    n = len(names)
 
-    # Strip the leading theory-name qualifier from fully qualified names.
-    # E.g. if theory_longname is "List", "List.append_def" becomes "append_def".
-    prefix = theory_longname.split(".")[-1] + "."
-    display_names = [
-        name[len(prefix):] if name.startswith(prefix) else name
-        for (_, name, _, _) in raw_entries
-    ]
+    # Compute file content hash
+    with open(file_path, "rb") as f:
+        file_hash = xxhash.xxh128(f.read()).digest()
 
-    # Set up thread-local state for MCP tool handlers
-    _local.connection = connection
-    _local.results = {}
-    _local.display_names = display_names
-    _local.kinds = kinds
+    # Check cache
+    results: dict[int, str] = {}
+    with _open_cache() as db:
+        for i, name in enumerate(names):
+            v = db.get(_cache_key(file_hash, name))
+            if v is not None:
+                results[i] = v.decode("utf-8")
 
-    # Build prompt
-    prompt = _build_prompt(file_path, theory_longname, deps_longname, kinds, display_names, prop_strs, line_numbers)
+    uncached = [i for i in range(n) if i not in results]
 
-    # Create MCP server and agent options
-    mcp = create_sdk_mcp_server("isabelle_semantics", tools=[_query_tool, _answer_tool])
-    options = ClaudeAgentOptions(
-        cwd=os.path.dirname(file_path),
-        permission_mode="default",
-        allowed_tools=[
-            "Read",
-            "Grep",
-            "Glob",
-            "mcp__isabelle_semantics__query_semantics",
-            "mcp__isabelle_semantics__answer",
-        ],
-        mcp_servers={"isabelle_semantics": mcp},
-    )
+    if uncached:
+        # Set up thread-local state for only uncached entries
+        _local.connection = connection
+        _local.results = {}
+        _local.names = [names[i] for i in uncached]
+        _local.kinds = [kinds[i] for i in uncached]
 
-    # Run the agent
-    asyncio.run(_run_agent(options, prompt))
+        from .theory_structure import mk_unicode_file
+        unicode_file_path = mk_unicode_file(file_path)
 
-    # Collect results in index order
-    return [_local.results.get(i) for i in range(len(display_names))]
+        prompt = _build_prompt(
+            unicode_file_path, theory_longname, deps_longname,
+            _local.kinds, _local.names,
+            [prop_strs[i] for i in uncached],
+            [line_numbers[i] for i in uncached],
+        )
 
+        mcp = create_sdk_mcp_server("isabelle_semantics", tools=[_query_tool, _answer_tool])
+        options = ClaudeAgentOptions(
+            cwd=os.path.dirname(file_path),
+            permission_mode="default",
+            allowed_tools=[
+                "Read",
+                "Grep",
+                "Glob",
+                "mcp__isabelle_semantics__query_semantics",
+                "mcp__isabelle_semantics__answer",
+            ],
+            mcp_servers={"isabelle_semantics": mcp},
+        )
 
-_GOAL_KEYWORDS = ("lemma", "theorem", "proposition", "corollary", "schematic_goal")
+        asyncio.run(_run_agent(options, prompt))
 
-# Precompiled patterns for single-pass file preprocessing
-_WORD_RE = re.compile(r"\b\w+(?:\.\w+)*\b")
-_GOAL_RE = re.compile(
-    r"(?:" + "|".join(_GOAL_KEYWORDS) + r")\s+(\w+(?:\.\w+)*)\b"
-)
-_GOAL_CODE_RE = re.compile(
-    r"(?:" + "|".join(_GOAL_KEYWORDS) + r")\s+(\w+(?:\.\w+)*)\s*\[[^\]]*\bcode\b[^\]]*\]"
-)
+        # Remap agent results to original indices and write to cache
+        with _open_cache() as db:
+            for agent_idx, sem in _local.results.items():
+                orig_idx = uncached[agent_idx]
+                results[orig_idx] = sem
+                db[_cache_key(file_hash, names[orig_idx])] = sem.encode("utf-8")
 
-
-@isabelle_remote_procedure("Semantic_Store.check_theorem_name_in_file")
-def check_theorem_name_in_file(arg: Any, connection: Connection) -> list[tuple[int, int, bool]]:
-    """Check each name against the file content and return a triple per name.
-
-    The file is preprocessed once into lookup structures, then each name is
-    resolved via dict/set lookups (O(1) per name instead of O(file_size)).
-
-    Returns a list of (word_offset, goal_keyword_offset, has_code_attr) tuples:
-
-    - word_offset: byte offset of the first occurrence of the name as a whole word
-      (using ``\\w+(?:\\.\\w+)*`` to capture dotted Isabelle names like ``foo.simps``),
-      or -1 if the name does not appear at all.
-
-    - goal_keyword_offset: byte offset of the first occurrence where the name
-      immediately follows one of the Isar goal keywords
-      (lemma, theorem, proposition, corollary, schematic_goal),
-      or -1 if no such occurrence exists.  This distinguishes explicitly stated
-      theorems from auto-generated ones (e.g. datatype .simps / .induct).
-
-    - has_code_attr: True if the name follows a goal keyword and is accompanied
-      by an attribute list containing the word ``code``, i.e. matches
-      ``(lemma|theorem|...)\\s+name\\s*\\[...code...]``.
-
-    Names are expected to be fully qualified (e.g. ``Foo.bar_def``, ``Foo.bar.simps(2)``).
-    Before lookup, each name is reduced to its base form: the ``(N)`` index suffix is
-    stripped, then the last dot-separated component is taken (e.g. ``bar_def``, ``simps``).
-    """
-    (file_path, names) = arg
-    content = open(file_path).read()
-
-    # 1. Build word_offsets: first occurrence of each word-boundary token
-    word_offsets: dict[str, int] = {}
-    for m in _WORD_RE.finditer(content):
-        word = m.group()
-        if word not in word_offsets:
-            word_offsets[word] = m.start()
-
-    # 2. Build goal_offsets: first occurrence of name after a goal keyword
-    goal_offsets: dict[str, int] = {}
-    for m in _GOAL_RE.finditer(content):
-        name = m.group(1)
-        if name not in goal_offsets:
-            goal_offsets[name] = m.start()
-
-    # 3. Build code_names: names following a goal keyword with [code] attribute
-    code_names: set[str] = set()
-    for m in _GOAL_CODE_RE.finditer(content):
-        code_names.add(m.group(1))
-
-    # 4. O(1) lookups per name, using base name (last dot-separated component,
-    #    with any trailing "(N)" index suffix stripped)
-    results: list[tuple[int, int, bool]] = []
-    for name in names:
-        # Strip "(N)" suffix if present, then take last dot-separated component
-        base = re.sub(r"\(\d+\)$", "", name).rsplit(".", 1)[-1]
-        results.append((
-            word_offsets.get(base, -1),
-            goal_offsets.get(base, -1),
-            base in code_names,
-        ))
-    return results
+    return [results.get(i) for i in range(n)]
