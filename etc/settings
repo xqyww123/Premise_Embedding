@@ -1,0 +1,3 @@
+# -*- shell-script -*- :mode=shellscript:
+ISABELLE_SEMANTIC_EMBEDDING_HOME="$COMPONENT"
+classpath "$ISABELLE_SEMANTIC_EMBEDDING_HOME/lib/semantic_embedding.jar"

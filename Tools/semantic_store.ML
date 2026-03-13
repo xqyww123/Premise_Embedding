@@ -6,8 +6,11 @@ structure Semantic_Store : SEMANTIC_STORE = struct
 
 (* --- Store data structures --- *)
 
-datatype key = Constant_Key of string * Position.T
+datatype key = Constant_Key of string (*fully quantified name*) * Position.T
              | Theorem_Key  of serial (*serial from Term_Serial_Index*)
+             | Type_Key     of string * Position.T
+             | Class_Key    of string * Position.T
+             | Locale_Key   of string * Position.T
 type semantics = string (*in English*)
 type entry = {
         semantics: semantics,
@@ -18,8 +21,14 @@ structure EntryTab = Hash_Table(struct
   type key = key
   fun hash (Constant_Key (name, _)) = hash_string name
     | hash (Theorem_Key s) = hash_int s
+    | hash (Type_Key (name, _)) = hash_string name
+    | hash (Class_Key (name, _)) = hash_string name
+    | hash (Locale_Key (name, _)) = hash_string name
   fun eq (Constant_Key (a1, p1), Constant_Key (a2, p2)) = a1 = a2 andalso p1 = p2
     | eq (Theorem_Key a, Theorem_Key b) = (a = b)
+    | eq (Type_Key (a1, p1), Type_Key (a2, p2)) = a1 = a2 andalso p1 = p2
+    | eq (Class_Key (a1, p1), Class_Key (a2, p2)) = a1 = a2 andalso p1 = p2
+    | eq (Locale_Key (a1, p1), Locale_Key (a2, p2)) = a1 = a2 andalso p1 = p2
     | eq _ = false
 end)
 
@@ -33,6 +42,9 @@ local
 
   fun pack_entry_kind (Constant_Key _) = packInt 0
     | pack_entry_kind (Theorem_Key _) = packInt 1
+    | pack_entry_kind (Type_Key _) = packInt 2
+    | pack_entry_kind (Class_Key _) = packInt 3
+    | pack_entry_kind (Locale_Key _) = packInt 4
 
   val pack_arg = fn {file_path, theory_longname, deps_longname, entries} =>
     packTuple4 (packString, packString, packList packString,
@@ -43,6 +55,7 @@ in
 fun make_query_callback (context : Context.generic) (current_names : string list)
     : Remote_Procedure_Calling.callback' =
   let
+    val thy = Context.cases I Proof_Context.theory_of context
     val consts = Context.cases Sign.consts_of Proof_Context.consts_of context
     val consts_space = Consts.space_of consts
     val ctxt = Context.cases Proof_Context.init_global I context
@@ -88,6 +101,23 @@ fun make_query_callback (context : Context.generic) (current_names : string list
         if String.isPrefix (String.concat ["Undefined fact: ", name]) msg
         then error (String.concat ["Theorem ", name, " is not defined in this context"])
         else raise ERROR msg)
+
+    fun query_ns_key make_key space kind_label name =
+      (let
+        val full_name = Name_Space.intern space name
+        val _ = check_not_current full_name
+        val ns_entry = Name_Space.the_entry space full_name
+      in
+        lookup_store (make_key (full_name, #pos ns_entry))
+      end
+      handle ERROR msg =>
+        if String.isPrefix (String.concat ["Undefined ", kind_label, ": ", name]) msg
+        then error (String.concat [kind_label, " ", name, " is not defined in this context"])
+        else raise ERROR msg)
+
+    val query_type   = query_ns_key Type_Key (Sign.type_space thy) "Type"
+    val query_class  = query_ns_key Class_Key (Sign.class_space thy) "Class"
+    val query_locale = query_ns_key Locale_Key (Locale.locale_space thy) "Locale"
   in
     Remote_Procedure_Calling.mk_callback {
       name = "Semantic_Store.query",
@@ -97,6 +127,9 @@ fun make_query_callback (context : Context.generic) (current_names : string list
         case tag of
           0 => query_constant name
         | 1 => query_theorem name
+        | 2 => query_type name
+        | 3 => query_class name
+        | 4 => query_locale name
         | _ => NONE,
       timeout = NONE
     }
@@ -148,7 +181,8 @@ fun interpret_file (thy : theory) : unit =
     val deps_longname = Theory.parents_of thy |> map Context.theory_long_name
 
     (* 2. Extract constants and theorems, filtering infrastructure *)
-    val {is_infra_const, is_infra_thm} = Infra_Filter.gen_infra_filters thy
+    val {is_infra_const, is_infra_thm, is_infra_type, is_infra_class, is_infra_locale} =
+      Infra_Filter.gen_infra_filters thy
 
     val const_entries = Theory_Structure.get_constants_with_positions thy
       |> map_filter (fn (name, pos) =>
@@ -215,7 +249,23 @@ fun interpret_file (thy : theory) : unit =
         (Theorem_Key s, name, pos, goal_off) :: acc)
       best_serials []
 
-    (* 5. Build entries list, sorted by source position.
+    (* 5. Extract types, classes, and locales *)
+    val type_entries = Theory_Structure.get_types_with_positions thy
+      |> map_filter (fn (name, pos) =>
+          if is_infra_type name then NONE
+          else SOME (Type_Key (name, pos), name, pos))
+
+    val class_entries = Theory_Structure.get_classes_with_positions thy
+      |> map_filter (fn (name, pos) =>
+          if is_infra_class name then NONE
+          else SOME (Class_Key (name, pos), name, pos))
+
+    val locale_entries = Theory_Structure.get_locales_with_positions thy
+      |> map_filter (fn (name, pos) =>
+          if is_infra_locale name then NONE
+          else SOME (Locale_Key (name, pos), name, pos))
+
+    (* 6. Build entries list, sorted by source position.
        For theorems not introduced by a goal keyword, include their pretty-printed
        proposition so the interpreter can see what they state. *)
     val ctxt = Proof_Context.init_global thy
@@ -233,7 +283,10 @@ fun interpret_file (thy : theory) : unit =
       | ord => ord)
     val all_entries_with_pos =
       (map (fn (key, name, pos) => (key, name, pos, ~1)) const_entries
-       @ deduped_thm_entries)
+       @ deduped_thm_entries
+       @ map (fn (key, name, pos) => (key, name, pos, ~1)) type_entries
+       @ map (fn (key, name, pos) => (key, name, pos, ~1)) class_entries
+       @ map (fn (key, name, pos) => (key, name, pos, ~1)) locale_entries)
       |> sort entry_ord
 
     val entries = all_entries_with_pos |> map (fn (key, name, pos, goal_off) =>

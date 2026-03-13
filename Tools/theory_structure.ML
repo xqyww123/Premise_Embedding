@@ -4,6 +4,9 @@ signature THEORY_STRUCTURE = sig
   val get_constants_with_positions : theory -> (string (* full_name *) * Position.T) list
   val get_theorems_with_positions : theory ->
     (string (* full_name *) * int (* idx *) * Position.T * thm) list
+  val get_types_with_positions : theory -> (string * Position.T) list
+  val get_classes_with_positions : theory -> (string * Position.T) list
+  val get_locales_with_positions : theory -> (string * Position.T) list
   val parse_thm_name : string -> string * int option
   val make_theory_info_callback : Context.generic -> Remote_Procedure_Calling.callback'
 end
@@ -37,6 +40,51 @@ fun get_theory_file_path thy =
     val expanded_path = File.full_path master_dir thy_file
   in
     File.platform_path expanded_path
+  end
+
+(* Get types with positions from theory (local definitions only) *)
+fun get_types_with_positions thy =
+  let
+    val thy_name = Context.theory_long_name thy
+    val space = Sign.type_space thy
+  in
+    Name_Space.get_names space
+    |> map_filter (fn name =>
+        let val entry = Name_Space.the_entry space name
+        in if #theory_long_name entry = thy_name
+           then SOME (name, #pos entry)
+           else NONE
+        end)
+  end
+
+(* Get classes with positions from theory (local definitions only) *)
+fun get_classes_with_positions thy =
+  let
+    val thy_name = Context.theory_long_name thy
+    val space = Sign.class_space thy
+  in
+    Name_Space.get_names space
+    |> map_filter (fn name =>
+        let val entry = Name_Space.the_entry space name
+        in if #theory_long_name entry = thy_name
+           then SOME (name, #pos entry)
+           else NONE
+        end)
+  end
+
+(* Get locales with positions from theory (local definitions only) *)
+fun get_locales_with_positions thy =
+  let
+    val parent_locale_names =
+      Theory.parents_of thy
+      |> maps (fn parent => Name_Space.get_names (Locale.locale_space parent))
+      |> Symtab.make_set
+    val space = Locale.locale_space thy
+  in
+    Name_Space.get_names space
+    |> map_filter (fn name =>
+        if Symtab.defined parent_locale_names name then NONE
+        else SOME (name, #pos (Name_Space.the_entry space name)))
   end
 
 (* Parse "name(N)" into (name, SOME N) or (name, NONE) *)

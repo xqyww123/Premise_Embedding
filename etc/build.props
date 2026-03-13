@@ -1,0 +1,9 @@
+title = Isabelle/Scala/Semantic_Embedding
+module = lib/semantic_embedding.jar
+no_build = true
+requirements = \
+  env:ISABELLE_SCALA_JAR
+sources = \
+  src/scala/pide_state.scala
+services = \
+  isabelle.semantic_embedding.PIDE_State_Functions

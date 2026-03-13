@@ -23,7 +23,16 @@ import IsaREPL
 
 _KIND_CONSTANT = 0
 _KIND_THEOREM = 1
-_KIND_PROMPT_LABELS = {_KIND_CONSTANT: "constant", _KIND_THEOREM: "lemma"}
+_KIND_TYPE = 2
+_KIND_CLASS = 3
+_KIND_LOCALE = 4
+_KIND_PROMPT_LABELS = {
+    _KIND_CONSTANT: "constant",
+    _KIND_THEOREM: "lemma",
+    _KIND_TYPE: "type",
+    _KIND_CLASS: "typeclass",
+    _KIND_LOCALE: "locale",
+}
 
 class _LocalState(threading.local):
     connection: Connection
@@ -61,12 +70,12 @@ _query_schema = {
     "properties": {
         "type": {
             "type": "string",
-            "enum": ["constant", "theorem"],
-            "description": "The kind of entity to query: 'constant' or 'theorem'.",
+            "enum": ["constant", "theorem", "type", "typeclass", "locale"],
+            "description": "The kind of entity to query.",
         },
         "name": {
             "type": "string",
-            "description": "The name of the constant or theorem to look up. "
+            "description": "The name of the entity to look up. "
             "For multi-variant theorems, include a '(idx)' suffix (e.g. 'conjI(2)').",
         },
     },
@@ -74,17 +83,21 @@ _query_schema = {
 }
 
 
+_QUERY_TAGS = {"constant": 0, "theorem": 1, "type": 2, "typeclass": 3, "locale": 4}
+
+
 @tool(
     "query_semantics",
-    "Query the semantic interpretation of a previously interpreted constant or theorem from Isabelle. "
+    "Query the semantic interpretation of a previously interpreted entity from Isabelle. "
     "Use this to look up the meaning of dependencies that the current entries rely on.",
     input_schema=_query_schema,
 )
 async def _query_tool(args: dict[str, Any]) -> ToolCall_ret:
     t = args.get("type")
     name = args.get("name")
-    if t not in ("constant", "theorem"):
-        return _mk_ret(f"Invalid type: {t!r}. Must be 'constant' or 'theorem'.")
+    tag = _QUERY_TAGS.get(t)
+    if tag is None:
+        return _mk_ret(f"Invalid type: {t!r}. Must be one of {list(_QUERY_TAGS)}.")
     if not isinstance(name, str) or not name:
         return _mk_ret("Invalid name: must be a non-empty string.")
     if name in _local.names:
@@ -92,7 +105,6 @@ async def _query_tool(args: dict[str, Any]) -> ToolCall_ret:
             f"\"{name}\" is one of the entries you are currently interpreting. "
             "You should interpret it yourself based on the source file, not query it."
         )
-    tag = 0 if t == "constant" else 1
     result = _local.connection.callback("Semantic_Store.query", (tag, name))
     if result is None:
         return _mk_ret(f"No semantics found for {t} \"{name}\"")
@@ -170,7 +182,7 @@ def _build_prompt(
     deps_text = ", ".join(deps_longname) if deps_longname else "(none)"
 
     ret = f"""\
-You are interpreting the semantics of constants and theorems defined in the Isabelle theory "{theory_longname}".
+You are interpreting the semantics of entities defined in the Isabelle theory "{theory_longname}".
 
 The theory source file is at: {file_path}
 Parent theories: {deps_text}
@@ -178,7 +190,7 @@ Parent theories: {deps_text}
 Your task:
 1. Read the source file to understand the definitions.
 2. For each entry listed below, write a concise English interpretation of what it means or states.
-3. Use the `query_semantics` tool to look up interpretations of dependency constants/theorems from parent theories if needed.
+3. Use the `query_semantics` tool to look up interpretations of dependencies from parent theories if needed.
 4. Submit ALL your interpretations using the `mcp__isabelle_semantics__answer` tool, identifying each entry by its index.
 
 Entries to interpret:
@@ -189,10 +201,13 @@ Guidelines:
 - For theorems: describe what the theorem states in plain English.
   Some auto-generated theorems (not introduced by a goal keyword in the source) include
   their pretty-printed proposition below the entry — use it to understand the statement.
+- For types: describe what the type represents and its structure (e.g. datatype constructors, type synonym expansion).
+- For typeclasses: describe what properties or operations the class requires of its instances.
+- For locales: describe what assumptions and fixed parameters the locale provides as context.
 - Be concise but precise. One to three sentences per entry is typical.
 - You MUST submit interpretations for ALL entries listed above.
 - Use the 0-based index shown before each entry when answering.
-- When querying dependencies, use `query_semantics` with the name of the constant or theorem.
+- When querying dependencies, use `query_semantics` with the name and type of the entity.
 - Read the source file first before interpreting."""
     return IsaREPL.Client.pretty_unicode(ret)
 

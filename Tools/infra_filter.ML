@@ -1,13 +1,18 @@
 signature INFRA_FILTER = sig
   val gen_infra_filters : theory ->
     {is_infra_const: string -> bool,
-     is_infra_thm: string * thm -> bool}
+     is_infra_thm: string * thm -> bool,
+     is_infra_type: string -> bool,
+     is_infra_class: string -> bool,
+     is_infra_locale: string -> bool}
 end
 
 structure Infra_Filter : INFRA_FILTER = struct
 
 fun gen_infra_filters (thy : theory)
-    : {is_infra_const: string -> bool, is_infra_thm: string * thm -> bool} =
+    : {is_infra_const: string -> bool, is_infra_thm: string * thm -> bool,
+       is_infra_type: string -> bool, is_infra_class: string -> bool,
+       is_infra_locale: string -> bool} =
   let
     val thy_name = Context.theory_long_name thy
     val type_space = Sign.type_space thy
@@ -112,7 +117,8 @@ fun gen_infra_filters (thy : theory)
       orelse is_inductive_infra_thm full_name
       orelse Term.exists_Const is_internal_constant (Thm.prop_of thm)
   in
-    {is_infra_const = is_infra_const, is_infra_thm = is_infra_thm}
+    {is_infra_const = is_infra_const, is_infra_thm = is_infra_thm,
+     is_infra_type = K false, is_infra_class = K false, is_infra_locale = K false}
   end
 
 end
