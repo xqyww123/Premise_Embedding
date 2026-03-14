@@ -1,5 +1,5 @@
 signature SEMANTIC_STORE = sig
-  val interpret_file : theory -> unit
+  val interpret : Context.generic -> unit
 end
 
 structure Semantic_Store : SEMANTIC_STORE = struct
@@ -46,16 +46,17 @@ local
     | pack_entry_kind (Class_Key _) = packInt 3
     | pack_entry_kind (Locale_Key _) = packInt 4
 
-  val pack_arg = fn {file_path, theory_longname, deps_longname, entries} =>
-    packTuple4 (packString, packString, packList packString,
-                packList (packTuple4 (pack_entry_kind, packString, packString, packInt)))
-               (file_path, theory_longname, deps_longname, entries)
+  val pack_arg = fn {file_path, theory_longname, deps_longname, entries, context_info} =>
+    packTuple5 (packString, packString, packList packString,
+                packList (packTuple4 (pack_entry_kind, packString, packString, packInt)),
+                packString)
+               (file_path, theory_longname, deps_longname, entries, context_info)
 in
 
 fun make_query_callback (context : Context.generic) (current_names : string list)
     : Remote_Procedure_Calling.callback' =
   let
-    val thy = Context.cases I Proof_Context.theory_of context
+    val thy = Context.theory_of context
     val consts = Context.cases Sign.consts_of Proof_Context.consts_of context
     val consts_space = Consts.space_of consts
     val ctxt = Context.cases Proof_Context.init_global I context
@@ -146,7 +147,8 @@ val check_theorem_name_in_file_cmd :
 
 fun make_interpret_file_cmd callbacks :
     ({file_path: string, theory_longname: string,
-      deps_longname: string list, entries: (key * string * string * int) list},
+      deps_longname: string list, entries: (key * string * string * int) list,
+      context_info: string},
      semantics option list) Remote_Procedure_Calling.command = {
   name = "Semantic_Store.interpret_file",
   arg_schema = pack_arg,
@@ -173,30 +175,43 @@ fun string_of_term ctxt =
 
 (* --- Main orchestration --- *)
 
-fun interpret_file (thy : theory) : unit =
+fun key_kind_ord (Constant_Key _, Theorem_Key _) = LESS
+  | key_kind_ord (Theorem_Key _, Constant_Key _) = GREATER
+  | key_kind_ord _ = EQUAL
+fun entry_ord (e1, e2) =
+  (case int_ord (the_default 0 (Position.line_of (#3 e1)),
+                 the_default 0 (Position.line_of (#3 e2))) of
+    EQUAL => (case key_kind_ord (#1 e1, #1 e2) of
+      EQUAL => string_ord (#2 e1, #2 e2)
+    | ord => ord)
+  | ord => ord)
+
+fun interpret (context : Context.generic) : unit =
   let
     (* 1. Get theory information *)
+    val thy = Context.theory_of context
     val thy_name = Context.theory_long_name thy
     val thy_file_path = Theory_Structure.get_theory_file_path thy
     val deps_longname = Theory.parents_of thy |> map Context.theory_long_name
 
     (* 2. Extract constants and theorems, filtering infrastructure *)
     val {is_infra_const, is_infra_thm, is_infra_type, is_infra_class, is_infra_locale} =
-      Infra_Filter.gen_infra_filters thy
+      Infra_Filter.gen_infra_filters context
 
-    val const_entries = Theory_Structure.get_constants_with_positions thy
+    val const_entries = Theory_Structure.get_constants_with_positions context
       |> map_filter (fn (name, pos) =>
           if is_infra_const name then NONE
           else SOME (Constant_Key (name, pos), name, pos))
 
-    val raw_thm_entries = Theory_Structure.get_theorems_with_positions thy
+    val raw_thm_entries = Theory_Structure.get_theorems_with_positions context
       |> filter (fn (name, _, _, thm) => not (is_infra_thm (name, thm)))
 
     (* 2c. Build named entries and check which appear in the source file.
        The RPC returns (word_offset, goal_keyword_offset, has_code_attr) per name:
          word_offset >= 0        : name appears as a word at that byte offset
          goal_keyword_offset >= 0 : name follows a goal keyword (lemma/theorem/etc.)
-         has_code_attr            : name follows a goal keyword with [code] attribute *)
+         has_code_attr            : name follows a goal keyword with [code] attribute
+       For proof contexts, skip the RPC and return dummy results. *)
     val raw_thm_entries_named = raw_thm_entries
       |> map (fn (name, idx, pos, thm) =>
         (Thm_Name.print (name, idx), pos, thm))
@@ -207,11 +222,14 @@ fun interpret_file (thy : theory) : unit =
       then String.extract (name, size thy_prefix, NONE)
       else name
     val file_match_names = map (strip_thy_prefix o #1) raw_thm_entries_named
-    val name_check_results = Remote_Procedure_Calling.call_command
+    val name_check_results = Context.cases
+      (fn _ => Remote_Procedure_Calling.call_command
           check_theorem_name_in_file_cmd (thy_file_path, file_match_names)
-      handle Remote_Procedure_Calling.Remote_Calling_Failure {message, ...} =>
-        (warning ("check_theorem_name_in_file RPC failed: " ^ message);
-         map (K (0, ~1, false)) file_match_names)
+        handle Remote_Procedure_Calling.Remote_Calling_Failure {message, ...} =>
+          (warning ("check_theorem_name_in_file RPC failed: " ^ message);
+           map (K (0, ~1, false)) file_match_names))
+      (fn _ => map (K (0, ~1, false)) file_match_names)
+      context
     val raw_thm_entries_with_offsets =
           (raw_thm_entries_named ~~ name_check_results)
 
@@ -250,17 +268,17 @@ fun interpret_file (thy : theory) : unit =
       best_serials []
 
     (* 5. Extract types, classes, and locales *)
-    val type_entries = Theory_Structure.get_types_with_positions thy
+    val type_entries = Theory_Structure.get_types_with_positions context
       |> map_filter (fn (name, pos) =>
           if is_infra_type name then NONE
           else SOME (Type_Key (name, pos), name, pos))
 
-    val class_entries = Theory_Structure.get_classes_with_positions thy
+    val class_entries = Theory_Structure.get_classes_with_positions context
       |> map_filter (fn (name, pos) =>
           if is_infra_class name then NONE
           else SOME (Class_Key (name, pos), name, pos))
 
-    val locale_entries = Theory_Structure.get_locales_with_positions thy
+    val locale_entries = Theory_Structure.get_locales_with_positions context
       |> map_filter (fn (name, pos) =>
           if is_infra_locale name then NONE
           else SOME (Locale_Key (name, pos), name, pos))
@@ -268,19 +286,9 @@ fun interpret_file (thy : theory) : unit =
     (* 6. Build entries list, sorted by source position.
        For theorems not introduced by a goal keyword, include their pretty-printed
        proposition so the interpreter can see what they state. *)
-    val ctxt = Proof_Context.init_global thy
+    val ctxt = Context.cases Proof_Context.init_global I context
     val pp = string_of_term ctxt
 
-    fun key_kind_ord (Constant_Key _, Theorem_Key _) = LESS
-      | key_kind_ord (Theorem_Key _, Constant_Key _) = GREATER
-      | key_kind_ord _ = EQUAL
-    fun entry_ord (e1, e2) =
-      (case int_ord (the_default 0 (Position.line_of (#3 e1)),
-                     the_default 0 (Position.line_of (#3 e2))) of
-        EQUAL => (case key_kind_ord (#1 e1, #1 e2) of
-          EQUAL => string_ord (#2 e1, #2 e2)
-        | ord => ord)
-      | ord => ord)
     val all_entries_with_pos =
       (map (fn (key, name, pos) => (key, name, pos, ~1)) const_entries
        @ deduped_thm_entries
@@ -304,24 +312,35 @@ fun interpret_file (thy : theory) : unit =
 
     val names = map #2 entries
 
-    (* 6. Build callbacks capturing theory context *)
-    val context = Context.Theory thy
+    (* 6b. Build context_info — empty for theory, assumptions for proof context *)
+    val context_info = Context.cases (K "")
+      (fn ctxt' =>
+        let val pp' = string_of_term ctxt'
+            val assumptions = Assumption.all_prems_of ctxt'
+              |> map (fn thm => pp' (Thm.prop_of thm))
+        in if null assumptions then ""
+           else String.concatWith "\n" (map (fn a => "  - " ^ a) assumptions)
+        end)
+      context
+
+    (* 7. Build callbacks capturing context *)
     val query_cb = make_query_callback context names
     val theory_info_cb = Theory_Structure.make_theory_info_callback context
     val cmd = make_interpret_file_cmd [query_cb, theory_info_cb]
 
-    (* 7. Call RPC command *)
+    (* 8. Call RPC command *)
     val rpc_arg = {
       file_path = thy_file_path,
       theory_longname = thy_name,
       deps_longname = deps_longname,
-      entries = entries
+      entries = entries,
+      context_info = context_info
     }
     val results = Remote_Procedure_Calling.call_command cmd rpc_arg
       handle Remote_Procedure_Calling.Remote_Calling_Failure {message, ...} =>
         error (String.concat ["Semantic interpretation RPC failed: ", message])
 
-    (* 8. Store results — each result corresponds to an entry in all_entries_with_pos *)
+    (* 9. Store results — each result corresponds to an entry in all_entries_with_pos *)
     val _ = Synchronized.change STORE_lock (fn () =>
       (map2 (fn (key, _, pos, _) => fn result_opt =>
         case result_opt of

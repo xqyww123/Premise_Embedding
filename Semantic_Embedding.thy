@@ -12,8 +12,8 @@ ML_file \<open>Tools/theory_structure.ML\<close>
 ML_file \<open>Tools/infra_filter.ML\<close>
 ML_file \<open>Tools/semantic_store.ML\<close>
 
-
-text \<open>Tes t1\<close>
+text \<open>Tes t
+1\<close>
 
 definition \<open>AAA = True\<close>
 

@@ -1,12 +1,12 @@
 signature THEORY_STRUCTURE = sig
   val resolve_theory : Context.generic -> string -> theory
   val get_theory_file_path : theory -> string
-  val get_constants_with_positions : theory -> (string (* full_name *) * Position.T) list
-  val get_theorems_with_positions : theory ->
+  val get_constants_with_positions : Context.generic -> (string (* full_name *) * Position.T) list
+  val get_theorems_with_positions : Context.generic ->
     (string (* full_name *) * int (* idx *) * Position.T * thm) list
-  val get_types_with_positions : theory -> (string * Position.T) list
-  val get_classes_with_positions : theory -> (string * Position.T) list
-  val get_locales_with_positions : theory -> (string * Position.T) list
+  val get_types_with_positions : Context.generic -> (string * Position.T) list
+  val get_classes_with_positions : Context.generic -> (string * Position.T) list
+  val get_locales_with_positions : Context.generic -> (string * Position.T) list
   val parse_thm_name : string -> string * int option
   val make_theory_info_callback : Context.generic -> Remote_Procedure_Calling.callback'
 end
@@ -42,11 +42,11 @@ fun get_theory_file_path thy =
     File.platform_path expanded_path
   end
 
-(* Get types with positions from theory (local definitions only) *)
-fun get_types_with_positions thy =
+(* Get types with positions (local definitions only) *)
+fun get_types_with_positions context =
   let
-    val thy_name = Context.theory_long_name thy
-    val space = Sign.type_space thy
+    val thy_name = Context.theory_long_name (Context.theory_of context)
+    val space = Context.cases Sign.type_space Proof_Context.type_space context
   in
     Name_Space.get_names space
     |> map_filter (fn name =>
@@ -57,11 +57,11 @@ fun get_types_with_positions thy =
         end)
   end
 
-(* Get classes with positions from theory (local definitions only) *)
-fun get_classes_with_positions thy =
+(* Get classes with positions (local definitions only) *)
+fun get_classes_with_positions context =
   let
-    val thy_name = Context.theory_long_name thy
-    val space = Sign.class_space thy
+    val thy_name = Context.theory_long_name (Context.theory_of context)
+    val space = Context.cases Sign.class_space Proof_Context.class_space context
   in
     Name_Space.get_names space
     |> map_filter (fn name =>
@@ -72,9 +72,10 @@ fun get_classes_with_positions thy =
         end)
   end
 
-(* Get locales with positions from theory (local definitions only) *)
-fun get_locales_with_positions thy =
+(* Get locales with positions (theory-level only, uses Context.theory_of) *)
+fun get_locales_with_positions context =
   let
+    val thy = Context.theory_of context
     val parent_locale_names =
       Theory.parents_of thy
       |> maps (fn parent => Name_Space.get_names (Locale.locale_space parent))
@@ -113,10 +114,10 @@ fun parse_thm_name s =
   end
 
 (* Get constants with positions from theory (local definitions only) *)
-fun get_constants_with_positions thy =
+fun get_constants_with_positions ctxt =
   let
-    val thy_name = Context.theory_long_name thy
-    val space = Consts.space_of (Sign.consts_of thy)
+    val thy_name = Context.theory_long_name (Context.theory_of ctxt)
+    val space = Consts.space_of (Context.cases Sign.consts_of Proof_Context.consts_of ctxt)
   in
     Name_Space.get_names space
     |> map_filter (fn name =>
@@ -127,18 +128,21 @@ fun get_constants_with_positions thy =
         end)
   end
 
-(* Get theorems with positions from theory.
+(* Get theorems with positions.
    Returns (full_name, index, position, thm) tuples.
    full_name is the fully qualified fact name from Facts.dest_static. *)
-fun get_theorems_with_positions thy =
+fun get_theorems_with_positions context =
   let
-    val parent_facts = map Global_Theory.facts_of (Theory.parents_of thy)
-    val facts = Global_Theory.facts_of thy
+    val (parent_facts, facts) = Context.cases
+      (fn thy => (map Global_Theory.facts_of (Theory.parents_of thy), Global_Theory.facts_of thy))
+      (fn ctxt => ([Global_Theory.facts_of (Proof_Context.theory_of ctxt)], Proof_Context.facts_of ctxt))
+      context
     val space = Facts.space_of facts
     val facts_list = Facts.dest_static false parent_facts facts
   in
     facts_list |> maps (fn (name, thms) =>
-      let val pos = #pos (Name_Space.the_entry space name)
+      let val pos = (case try (Name_Space.the_entry space) name of
+              SOME entry => #pos entry | NONE => Position.none)
           val n = length thms
       in thms |> map_index (fn (idx, thm) =>
           (name, if n = 1 then 0 else idx + 1, pos, thm))

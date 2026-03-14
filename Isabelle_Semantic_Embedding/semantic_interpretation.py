@@ -10,6 +10,7 @@ from typing import Any
 import platformdirs
 import xxhash
 from Isabelle_RPC_Host import Connection, isabelle_remote_procedure
+from Isabelle_RPC_Host.unicode import pretty_unicode
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
@@ -17,7 +18,6 @@ from claude_agent_sdk import (
     tool,
 )
 from rocksdict import Options, Rdict
-import IsaREPL
 
 # --- Thread-local state ---
 
@@ -166,6 +166,7 @@ def _build_prompt(
     names: list[str],
     prop_strs: list[str],
     line_numbers: list[int],
+    context_info: str = "",
 ) -> str:
     entry_lines = []
     for i, (kind, name, prop, lineno) in enumerate(zip(kinds, names, prop_strs, line_numbers)):
@@ -181,12 +182,16 @@ def _build_prompt(
 
     deps_text = ", ".join(deps_longname) if deps_longname else "(none)"
 
+    context_section = ""
+    if context_info:
+        context_section = f"\nLocal proof context assumptions:\n{context_info}\n"
+
     ret = f"""\
 You are interpreting the semantics of entities defined in the Isabelle theory "{theory_longname}".
 
 The theory source file is at: {file_path}
 Parent theories: {deps_text}
-
+{context_section}
 Your task:
 1. Read the source file to understand the definitions.
 2. For each entry listed below, write a concise English interpretation of what it means or states.
@@ -209,7 +214,7 @@ Guidelines:
 - Use the 0-based index shown before each entry when answering.
 - When querying dependencies, use `query_semantics` with the name and type of the entity.
 - Read the source file first before interpreting."""
-    return IsaREPL.Client.pretty_unicode(ret)
+    return pretty_unicode(ret)
 
 
 # --- Agent runner ---
@@ -240,7 +245,11 @@ async def _run_agent(options: ClaudeAgentOptions, prompt: str) -> None:
 
 @isabelle_remote_procedure("Semantic_Store.interpret_file")
 def interpret_file(arg: Any, connection: Connection) -> list[str | None]:
-    (file_path, theory_longname, deps_longname, raw_entries) = arg
+    if len(arg) == 5:
+        (file_path, theory_longname, deps_longname, raw_entries, context_info) = arg
+    else:
+        (file_path, theory_longname, deps_longname, raw_entries) = arg
+        context_info = ""
     kinds = [kind for (kind, _, _, _) in raw_entries]
     prop_strs = [prop for (_, _, prop, _) in raw_entries]
     line_numbers = [lineno for (_, _, _, lineno) in raw_entries]
@@ -276,6 +285,7 @@ def interpret_file(arg: Any, connection: Connection) -> list[str | None]:
             _local.kinds, _local.names,
             [prop_strs[i] for i in uncached],
             [line_numbers[i] for i in uncached],
+            context_info=context_info,
         )
 
         mcp = create_sdk_mcp_server("isabelle_semantics", tools=[_query_tool, _answer_tool])

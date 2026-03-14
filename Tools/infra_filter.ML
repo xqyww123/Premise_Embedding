@@ -1,5 +1,5 @@
 signature INFRA_FILTER = sig
-  val gen_infra_filters : theory ->
+  val gen_infra_filters : Context.generic ->
     {is_infra_const: string -> bool,
      is_infra_thm: string * thm -> bool,
      is_infra_type: string -> bool,
@@ -9,13 +9,13 @@ end
 
 structure Infra_Filter : INFRA_FILTER = struct
 
-fun gen_infra_filters (thy : theory)
+fun gen_infra_filters (context : Context.generic)
     : {is_infra_const: string -> bool, is_infra_thm: string * thm -> bool,
        is_infra_type: string -> bool, is_infra_class: string -> bool,
        is_infra_locale: string -> bool} =
   let
-    val thy_name = Context.theory_long_name thy
-    val type_space = Sign.type_space thy
+    val thy_name = Context.theory_long_name (Context.theory_of context)
+    val type_space = Context.cases Sign.type_space Proof_Context.type_space context
     val local_type_names = Name_Space.get_names type_space
       |> filter (fn name =>
           #theory_long_name (Name_Space.the_entry type_space name) = thy_name)
@@ -25,14 +25,14 @@ fun gen_infra_filters (thy : theory)
     (* Preserved datatype constant names: constructors, selectors, case, map, pred, rel, sets *)
     val const_name = fst o Term.dest_Const
     fun ctr_sugar_names T =
-      case Ctr_Sugar.ctr_sugar_of_global thy T of
+      case Context.cases Ctr_Sugar.ctr_sugar_of_global Ctr_Sugar.ctr_sugar_of context T of
         NONE => []
       | SOME cs =>
           map const_name (#ctrs cs)
           @ maps (map const_name) (#selss cs)
           @ [const_name (#casex cs)]
     fun bnf_names T =
-      case BNF_Def.bnf_of_global thy T of
+      case Context.cases BNF_Def.bnf_of_global BNF_Def.bnf_of context T of
         NONE => []
       | SOME bnf =>
           [const_name (BNF_Def.map_of_bnf bnf),
@@ -44,7 +44,7 @@ fun gen_infra_filters (thy : theory)
 
     (* Pre-BNF intermediate constant prefixes *)
     val pre_prefixes = map_filter (fn T =>
-      case BNF_FP_Def_Sugar.fp_sugar_of_global thy T of
+      case Context.cases BNF_FP_Def_Sugar.fp_sugar_of_global BNF_FP_Def_Sugar.fp_sugar_of context T of
         NONE => NONE
       | SOME fp =>
           let val map_name = fst (Term.dest_Const (BNF_Def.map_of_bnf (#pre_bnf fp)))
@@ -73,12 +73,13 @@ fun gen_infra_filters (thy : theory)
 
     (* --- Inductive infrastructure theorem names --- *)
 
-    val ctxt = Proof_Context.init_global thy
-    val local_const_names = Theory_Structure.get_constants_with_positions thy |> map #1
+    val ctxt = Context.proof_of context
+    val local_const_names = Theory_Structure.get_constants_with_positions context |> map #1
+    val consts = Context.cases Sign.consts_of Proof_Context.consts_of context
     val inductive_names =
       local_const_names
       |> map_filter (fn name =>
-          let val t = Const (name, Sign.the_const_type thy name)
+          let val t = Const (name, Consts.the_constraint consts name)
           in (Inductive.the_inductive ctxt t; SOME name)
           end
           handle ERROR _ => NONE | Match => NONE | Empty => NONE

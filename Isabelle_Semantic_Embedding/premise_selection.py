@@ -1,5 +1,6 @@
 from typing import cast
 from Isabelle_RPC_Host import Connection, isabelle_remote_procedure
+from Isabelle_RPC_Host.unicode import pretty_unicode as _pretty_unicode
 from rocksdict import Rdict
 import rocksdict
 import platformdirs
@@ -8,8 +9,6 @@ import os
 import re
 import time
 import requests
-import IsaREPL
-import re
 
 TEI_BASE_DEFAULT = os.getenv("TEI_BASE", None)
 API_KEY_DEFAULT = os.getenv("API_KEY", None)
@@ -123,7 +122,7 @@ def embed(arg : tuple[list[bytes | str], config], connection : Connection) -> li
             return cast(list[vector], [v for v in output if v is not None])
 
 def pretty_unicode(s: str):
-    s = IsaREPL.Client.pretty_unicode(s)
+    s = _pretty_unicode(s)
     s = re.sub(r'::type\b', '', s)
     s = re.sub(r'__\b', '', s)
     s = re.sub(r'‹', '\"', s)

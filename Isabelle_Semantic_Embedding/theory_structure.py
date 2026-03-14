@@ -2,8 +2,8 @@ import os
 import re
 from typing import TYPE_CHECKING, Any
 
-import IsaREPL
 from Isabelle_RPC_Host import isabelle_remote_procedure
+from Isabelle_RPC_Host.unicode import pretty_unicode
 
 if TYPE_CHECKING:
     from Isabelle_RPC_Host import Connection
@@ -22,7 +22,7 @@ def mk_unicode_file(path: str) -> str:
         return unicode_path
     with open(path, "r") as f:
         content = f.read()
-    unicode_content = IsaREPL.Client.pretty_unicode(content)
+    unicode_content = pretty_unicode(content)
     with open(unicode_path, "w") as f:
         f.write(unicode_content)
     return unicode_path
