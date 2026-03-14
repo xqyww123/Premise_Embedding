@@ -175,9 +175,15 @@ fun string_of_term ctxt =
 
 (* --- Main orchestration --- *)
 
-fun key_kind_ord (Constant_Key _, Theorem_Key _) = LESS
-  | key_kind_ord (Theorem_Key _, Constant_Key _) = GREATER
-  | key_kind_ord _ = EQUAL
+local
+  fun key_kind_rank (Class_Key _) = 0
+    | key_kind_rank (Locale_Key _) = 1
+    | key_kind_rank (Type_Key _) = 2
+    | key_kind_rank (Constant_Key _) = 3
+    | key_kind_rank (Theorem_Key _) = 4
+in
+fun key_kind_ord (k1, k2) = int_ord (key_kind_rank k1, key_kind_rank k2)
+end
 fun entry_ord (e1, e2) =
   (case int_ord (the_default 0 (Position.line_of (#3 e1)),
                  the_default 0 (Position.line_of (#3 e2))) of

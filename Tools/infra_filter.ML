@@ -107,6 +107,14 @@ fun gen_infra_filters (context : Context.generic)
     (* --- Proposition content check --- *)
 
     val internal_prefixes = ["Lifting.", "BNF_Def.", "Transfer.", "BNF_Cardinal_Order_Relation.", "HOL.equal"]
+    fun is_internal_class (Const(name1, _) $ Const(\<^const_name>\<open>Pure.type\<close>, _)) =
+          String.isSuffix "_class" name1
+      | is_internal_class (Const(\<^const_name>\<open>Pure.eq\<close>, _) $ A $ B) =
+          is_internal_class A orelse is_internal_class B
+      | is_internal_class (Const(\<^const_name>\<open>Pure.imp\<close>, _) $ _ $ X) = is_internal_class X
+      | is_internal_class (Const(\<^const_name>\<open>Pure.conjunction\<close>, _) $ A $ B) =
+          is_internal_class A orelse is_internal_class B
+      | is_internal_class _ = false
     fun is_internal_constant (name, _) =
       exists (fn pfx => String.isPrefix pfx name) internal_prefixes
       orelse is_infra_const name
@@ -117,6 +125,7 @@ fun gen_infra_filters (context : Context.generic)
       is_ADT_infra_thm full_name
       orelse is_inductive_infra_thm full_name
       orelse Term.exists_Const is_internal_constant (Thm.prop_of thm)
+      orelse is_internal_class (Thm.prop_of thm)
   in
     {is_infra_const = is_infra_const, is_infra_thm = is_infra_thm,
      is_infra_type = K false, is_infra_class = K false, is_infra_locale = K false}

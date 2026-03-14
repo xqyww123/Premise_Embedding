@@ -10,6 +10,7 @@ from .premise_selection import (
     encode_goal,
     encode_premise,
 )
+from .hover import goto_definition, hover_message
 from .semantic_interpretation import interpret_file
 from .theory_structure import mk_unicode_file, theory_info
 
@@ -20,6 +21,8 @@ __all__ = [
     "embed_goal_and_premises",
     "encode_goal",
     "encode_premise",
+    "goto_definition",
+    "hover_message",
     "interpret_file",
     "theory_info",
 ]
