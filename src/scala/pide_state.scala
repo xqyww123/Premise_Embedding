@@ -123,6 +123,34 @@ object DB_Snapshots {
   // theory_name -> snapshot
   private var snapshot_cache: Map[String, Document.Snapshot] = Map.empty
 
+  // Cached Store instance (shared Term.Cache for string interning across snapshots)
+  // One Session per Isabelle process, so this is effectively a singleton cache.
+  private var cached_store: Option[(Session, Store)] = None
+
+  private def get_store(session: Session): Store = synchronized {
+    cached_store match {
+      case Some((s, store)) if s eq session => store
+      case _ =>
+        val store = Store(session.session_options)
+        cached_store = Some((session, store))
+        store
+    }
+  }
+
+  // file_path -> sha1 digest (files are immutable once built)
+  private var file_digest_cache: Map[String, String] = Map.empty
+
+  private def file_digest(path: Path): String = synchronized {
+    val key = path.implode
+    file_digest_cache.get(key) match {
+      case Some(d) => d
+      case None =>
+        val d = SHA1.digest(path).toString
+        file_digest_cache += (key -> d)
+        d
+    }
+  }
+
   private def index_session(store: Store, session_name: String): Unit = synchronized {
     if (indexed_sessions.contains(session_name)) return
     indexed_sessions += session_name
@@ -130,15 +158,23 @@ object DB_Snapshots {
     store.try_open_database(session_name, server_mode = false) match {
       case Some(db) =>
         try {
-          val sources = store.read_sources(db, session_name)
-          val thy_sources = sources.filter(_.name.endsWith(".thy"))
+          // Query only name and digest columns for .thy files — skip reading file bodies
+          val thy_digests = db.execute_query_statement(
+            Store.private_data.Sources.table.select(
+              List(Store.private_data.Sources.name, Store.private_data.Sources.digest),
+              sql = SQL.where_and(
+                Store.private_data.Sources.session_name.equal(session_name),
+                Store.private_data.Sources.name.ident + " LIKE '%.thy'")),
+            List.from[(String, String)],
+            res => (res.string(Store.private_data.Sources.name),
+                    res.string(Store.private_data.Sources.digest)))
           Output.warning("DB_Snapshots.index_session: " + session_name +
-            " — " + sources.length + " sources, " + thy_sources.length + " .thy files")
-          for (source <- thy_sources) {
-            val base = Library.try_unsuffix(".thy", Path.explode(source.name).file_name).getOrElse("")
+            " — " + thy_digests.length + " .thy files")
+          for ((name, digest) <- thy_digests) {
+            val base = Library.try_unsuffix(".thy", Path.explode(name).file_name).getOrElse("")
             if (base.nonEmpty) {
               val theory_name = session_name + "." + base
-              digest_index += (source.digest.toString -> (session_name, theory_name))
+              digest_index += (digest -> (session_name, theory_name))
             }
           }
         }
@@ -180,7 +216,7 @@ object DB_Snapshots {
   }
 
   def get_snapshot(session: Session, file_path: String): Option[Document.Snapshot] = {
-    val store = Store(session.session_options)
+    val store = get_store(session)
     val sessions_structure = session.resources.sessions_structure
     val current_session = session.resources.session_base.session_name
     val ancestors = sessions_structure.build_hierarchy(current_session)
@@ -198,7 +234,7 @@ object DB_Snapshots {
       Output.warning("DB_Snapshots.get_snapshot: file does not exist: " + file.implode)
       return None
     }
-    val digest = SHA1.digest(file).toString
+    val digest = file_digest(file)
 
     Output.warning("DB_Snapshots.get_snapshot: file digest=" + digest +
       " digest_index size=" + digest_index.size +

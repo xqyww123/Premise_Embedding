@@ -47,6 +47,11 @@ ML \<open>PIDE_State.offset_to_line_column "~~/src/HOL/List.thy" 1694\<close>
  
  
 ML \<open>PIDE_State.goto_definition (Position.make {line=74, offset=1694, end_offset=530, props={label="", file="~~/src/HOL/List.thy", id=""}})\<close>
+ML \<open>PIDE_State.offset_to_line_column "~~/src/HOL/List.thy" 208\<close>
+ML \<open>PIDE_State.line_column_to_offset "~~/src/HOL/List.thy" 394 29\<close>
+ML \<open>PIDE_State.offset_to_line_column "~~/src/HOL/List.thy" 13983\<close>
+ML \<open>PIDE_State.goto_definition (Position.make {line=74, offset=13983, end_offset=530, props={label="", file="~~/src/HOL/List.thy", id=""}})\<close>
+ML \<open>PIDE_State.offset_to_line_column "~~/src/HOL/List.thy" 13702\<close>
 
 ML \<open>PIDE_State.absolutize_id_based_pos {write_to_temp_file=true} pos\<close>
 

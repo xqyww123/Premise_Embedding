@@ -154,13 +154,7 @@ val offset_to_line_column_cmd :
   name = "position.offset_to_line_column",
   arg_schema = packPair (packString, packInt),
   ret_schema = unpackPair (unpackInt, unpackInt),
-  callback = [Remote_Procedure_Calling.mk_callback {
-    name = "position.symbol_explode",
-    arg_schema = unpackString,
-    ret_schema = packList packString,
-    function = fn text => Symbol_Pos.explode (text, Position.none) |> map fst,
-    timeout = NONE
-  }],
+  callback = [],
   timeout = NONE
 }
 
@@ -169,13 +163,7 @@ val line_column_to_offset_cmd :
   name = "position.line_column_to_offset",
   arg_schema = packTuple3 (packString, packInt, packInt),
   ret_schema = unpackInt,
-  callback = [Remote_Procedure_Calling.mk_callback {
-    name = "position.symbol_explode",
-    arg_schema = unpackString,
-    ret_schema = packList packString,
-    function = fn text => Symbol_Pos.explode (text, Position.none) |> map fst,
-    timeout = NONE
-  }],
+  callback = [],
   timeout = NONE
 }
 
@@ -252,13 +240,6 @@ val _ = Theory.setup (Context.theory_map (
       arg_schema = unpackUnit,
       ret_schema = packList (packPair (packString, packString)),
       function = fn () => PIDE_State.get_session_databases (),
-      timeout = NONE
-    }
-  #> Remote_Procedure_Calling.register_global_callback {
-      name = "position.symbol_explode",
-      arg_schema = unpackString,
-      ret_schema = packList packString,
-      function = fn text => Symbol_Pos.explode (text, Position.none) |> map fst,
       timeout = NONE
     }
 ))
