@@ -10,9 +10,10 @@ from .premise_selection import (
     encode_goal,
     encode_premise,
 )
+
+from .theory_structure import mk_unicode_file, theory_info
 from .hover import goto_definition, hover_message
 from .semantic_interpretation import interpret_file
-from .theory_structure import mk_unicode_file, theory_info
 
 __all__ = [
     "embed",

@@ -26,6 +26,15 @@ sig
   (* Given a position (file + offset), return the hover tooltip text.
      Tries live PIDE state first, falls back to session export DB. *)
   val hover_message: Position.T -> string option
+
+  (* Convert between symbol offset and line:column via Python RPC.
+     Requires the Isabelle_RPC Python host to be running. *)
+  val offset_to_line_column: string -> int -> int * int
+  val line_column_to_offset: string -> int -> int -> int
+
+  (* Return all ancestor sessions (whose heaps are loaded) with their export database paths.
+     Each entry is (session_name, db_path). *)
+  val get_session_databases: unit -> (string * string) list
 end;
 
 structure PIDE_State: PIDE_STATE =
@@ -86,11 +95,19 @@ fun absolutize_id_based_pos {write_to_temp_file} positions =
       else pos)
   end;
 
+(* Expand Isabelle path variables and make absolute.
+   Fast path: skip if already an absolute path without variables. *)
+fun expand_path s =
+  if s = "" then ""
+  else if String.isPrefix "/" s andalso not (Char.contains s #"$")
+  then s
+  else File.absolute_path (Path.explode s) |> Path.implode;
+
 (* Extract file path and offset from a Position.T, absolutizing if needed *)
 fun pos_file_offset pos =
   let
     val pos' = hd (absolutize_id_based_pos {write_to_temp_file = false} [pos]);
-    val file = the_default "" (Position.file_of pos');
+    val file = the_default "" (Position.file_of pos') |> expand_path;
     val offset = the_default 0 (Position.offset_of pos');
   in (file, offset) end;
 
@@ -120,65 +137,86 @@ fun hover_message_pide file_path symbol_offset =
         (file_path, symbol_offset);
     val yxml = Scala.function1 "pide_state.hover_message"
       (YXML.string_of_body input_body);
-    val msg = YXML.parse_body yxml |> XML.Decode.string;
+    val msg = if YXML.detect yxml
+      then (warning "hover_message: unexpected YXML markup in result"; YXML.content_of yxml)
+      else yxml;
   in
     if msg = "" then NONE
     else SOME msg
   end;
 
-(* DB fallback via Python RPC *)
+(* Position conversion via Python RPC *)
 
 local open MessagePackBinIO.Pack MessagePackBinIO.Unpack in
 
-val goto_definition_from_db_cmd :
-    (string * int, (string * int * int * int) option) Remote_Procedure_Calling.command = {
-  name = "pide_state.goto_definition_from_db",
+val offset_to_line_column_cmd :
+    (string * int, (int * int)) Remote_Procedure_Calling.command = {
+  name = "position.offset_to_line_column",
   arg_schema = packPair (packString, packInt),
-  ret_schema = unpackOption (unpackTuple4 (unpackString, unpackInt, unpackInt, unpackInt)),
-  callback = [],
+  ret_schema = unpackPair (unpackInt, unpackInt),
+  callback = [Remote_Procedure_Calling.mk_callback {
+    name = "position.symbol_explode",
+    arg_schema = unpackString,
+    ret_schema = packList packString,
+    function = fn text => Symbol_Pos.explode (text, Position.none) |> map fst,
+    timeout = NONE
+  }],
   timeout = NONE
 }
 
-val hover_message_from_db_cmd :
-    (string * int, string option) Remote_Procedure_Calling.command = {
-  name = "pide_state.hover_message_from_db",
-  arg_schema = packPair (packString, packInt),
-  ret_schema = unpackOption unpackString,
-  callback = [],
+val line_column_to_offset_cmd :
+    (string * int * int, int) Remote_Procedure_Calling.command = {
+  name = "position.line_column_to_offset",
+  arg_schema = packTuple3 (packString, packInt, packInt),
+  ret_schema = unpackInt,
+  callback = [Remote_Procedure_Calling.mk_callback {
+    name = "position.symbol_explode",
+    arg_schema = unpackString,
+    ret_schema = packList packString,
+    function = fn text => Symbol_Pos.explode (text, Position.none) |> map fst,
+    timeout = NONE
+  }],
   timeout = NONE
 }
 
 end (*local MessagePack*)
 
-fun goto_definition_from_db file_path offset =
-  Remote_Procedure_Calling.call_command goto_definition_from_db_cmd (file_path, offset)
-  |> Option.map (fn (def_file, def_line, def_offset, def_end_offset) =>
-       Position.make0 def_line def_offset def_end_offset "" def_file "");
+fun offset_to_line_column file_path offset =
+  Remote_Procedure_Calling.call_command offset_to_line_column_cmd (expand_path file_path, offset);
 
-fun hover_message_from_db file_path offset =
-  Remote_Procedure_Calling.call_command hover_message_from_db_cmd (file_path, offset);
+fun line_column_to_offset file_path line column =
+  Remote_Procedure_Calling.call_command line_column_to_offset_cmd (expand_path file_path, line, column);
 
-(* Auto: try live PIDE first, then DB fallback *)
+(* Goto definition and hover message: Scala handles both live PIDE + DB fallback *)
 
 fun goto_definition pos =
-  let val (file, offset) = pos_file_offset pos
+  let
+    val (file, offset) = pos_file_offset pos
+    val _ = warning ("goto_definition: file=" ^ file ^ " offset=" ^ string_of_int offset)
   in
-    if file = "" orelse offset = 0 then NONE
+    if file = "" orelse offset = 0 then (warning "goto_definition: empty file or zero offset"; NONE)
     else
-      (case goto_definition_pide file offset of
-        SOME result => SOME result
-      | NONE => goto_definition_from_db file offset)
+      let val _ = warning "goto_definition: calling Scala..."
+          val result = goto_definition_pide file offset
+          val _ = warning ("goto_definition: Scala returned " ^
+            (case result of NONE => "NONE" | SOME _ => "SOME(...)"))
+      in result end
   end;
 
 fun hover_message pos =
   let val (file, offset) = pos_file_offset pos
   in
     if file = "" orelse offset = 0 then NONE
-    else
-      (case hover_message_pide file offset of
-        SOME result => SOME result
-      | NONE => hover_message_from_db file offset)
+    else hover_message_pide file offset
   end;
+
+val get_session_databases : unit -> (string * string) list =
+  let
+    val cache = Synchronized.cache (fn () =>
+      Scala.function1 "pide_state.get_session_databases" ""
+      |> YXML.parse_body
+      |> XML.Decode.list (XML.Decode.pair XML.Decode.string XML.Decode.string));
+  in fn () => Synchronized.cache_eval {persistent = false} cache end;
 
 end;
 
@@ -208,6 +246,20 @@ val _ = Theory.setup (Context.theory_map (
       function = fn (file, offset) =>
         PIDE_State.hover_message (Position.make0 0 offset 0 "" file ""),
       timeout = SOME (Time.fromSeconds 10)
+    }
+  #> Remote_Procedure_Calling.register_global_callback {
+      name = "pide_state.get_session_databases",
+      arg_schema = unpackUnit,
+      ret_schema = packList (packPair (packString, packString)),
+      function = fn () => PIDE_State.get_session_databases (),
+      timeout = NONE
+    }
+  #> Remote_Procedure_Calling.register_global_callback {
+      name = "position.symbol_explode",
+      arg_schema = unpackString,
+      ret_schema = packList packString,
+      function = fn text => Symbol_Pos.explode (text, Position.none) |> map fst,
+      timeout = NONE
     }
 ))
 

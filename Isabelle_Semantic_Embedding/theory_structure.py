@@ -14,6 +14,14 @@ def theory_info(connection: "Connection", theory_name: str) -> tuple[str, str]:
     return tuple(connection.callback("Theory_Structure.theory_info", theory_name))
 
 
+def get_session_databases(connection: "Connection") -> list[tuple[str, str]]:
+    """Return all loaded (ancestor) sessions and their export database paths.
+
+    Returns a list of (session_name, db_path) pairs.
+    """
+    return connection.callback("pide_state.get_session_databases", None)
+
+
 def mk_unicode_file(path: str) -> str:
     if not path.endswith(".thy"):
         raise ValueError(f"Expected .thy file, got: {path}")

@@ -5,12 +5,212 @@ Scala functions for accessing PIDE document state from ML:
   - Save theory file contents (read-only: returns file/source pairs for ML to write)
   - Command ID to file+line position mapping
   - Go-to-definition: resolve entity reference at a position to its definition position
+    (live PIDE first, then DB fallback via Build.read_theory)
   - Hover message: extract tooltip information at a position
+    (live PIDE first, then DB fallback via Build.read_theory)
 */
 
 package isabelle.semantic_embedding
 
 import isabelle._
+
+
+/* Shared query helpers operating on any Document.Snapshot */
+
+object PIDE_Query {
+  private def symbol_offset_to_range(
+    snapshot: Document.Snapshot, offset: Int
+  ): Text.Range = {
+    snapshot.snippet_command match {
+      case Some(command) =>
+        // Snippet: convert from symbol offset to decoded text offset
+        val start = command.chunk.decode(offset)
+        val stop = command.chunk.decode(offset + 1)
+        Text.Range(start, stop)
+      case None =>
+        // Live PIDE: offsets are already in the right coordinate system
+        Text.Range(offset - 1, offset)
+    }
+  }
+
+  def goto_definition(snapshot: Document.Snapshot, offset: Int)
+      : (String, Int, Int, Int) = {
+    val range = symbol_offset_to_range(snapshot, offset)
+
+    val links = snapshot.cumulate[List[(String, Int, Int, Int)]](
+      range, Nil, Markup.Elements(Markup.ENTITY), _ => {
+        case (acc, Text.Info(_, XML.Elem(Markup(Markup.ENTITY, props), _))) =>
+          props match {
+            case Position.Item_Def_File(name, line, def_range) =>
+              Some((name, line, def_range.start, def_range.stop) :: acc)
+            case Position.Item_Def_Id(id, def_range) =>
+              snapshot.find_command(id) match {
+                case Some((node, command)) =>
+                  val name = command.node_name.node
+                  val preceding_symbols =
+                    node.commands.iterator.takeWhile(_ != command)
+                      .map(_.chunk.range.stop).sum
+                  val within_lines =
+                    if (def_range.start <= 0) 0
+                    else {
+                      val decoded = command.chunk.decode(def_range.start)
+                      Text.Range(0, decoded).try_substring(command.source) match {
+                        case Some(text) => Library.count_newlines(text)
+                        case None => 0
+                      }
+                    }
+                  val line = node.command_start_line(command).getOrElse(1) + within_lines
+                  Some((name, line,
+                        preceding_symbols + def_range.start,
+                        preceding_symbols + def_range.stop) :: acc)
+                case None => None
+              }
+            case _ => None
+          }
+        case _ => None
+      })
+
+    links match {
+      case Text.Info(_, result :: _) :: _ => result
+      case _ => ("", 0, 0, 0)
+    }
+  }
+
+  private val tooltip_elements = Markup.Elements(
+    Markup.ENTITY, Markup.TYPING, Markup.SORTING, Markup.ML_TYPING)
+
+  def hover_message(snapshot: Document.Snapshot, offset: Int): String = {
+    val range = symbol_offset_to_range(snapshot, offset)
+
+    val results = snapshot.cumulate[List[String]](
+      range, Nil, tooltip_elements, _ => {
+        case (tips, Text.Info(_, XML.Elem(Markup.Entity(kind, name), _)))
+          if kind != "" && kind != Markup.ML_DEF =>
+          val kind1 = Word.implode(Word.explode('_', kind))
+          val txt =
+            if (name == "") kind1
+            else if (kind1 == "") name
+            else kind1 + " " + quote(name)
+          Some(txt :: tips)
+
+        case (tips, Text.Info(_, XML.Elem(Markup(name, _), body)))
+          if name == Markup.TYPING || name == Markup.SORTING =>
+          val body_text = XML.content(Pretty.formatted(body))
+          Some((":: " + body_text) :: tips)
+
+        case (tips, Text.Info(_, XML.Elem(Markup(Markup.ML_TYPING, _), body))) =>
+          val body_text = XML.content(Pretty.formatted(body))
+          Some(("ML: " + body_text) :: tips)
+
+        case _ => None
+      })
+
+    results match {
+      case Text.Info(_, tips) :: _ => tips.reverse.mkString("\n")
+      case _ => ""
+    }
+  }
+}
+
+
+/* DB snapshot loading and caching */
+
+object DB_Snapshots {
+  // digest -> (session_name, theory_name)
+  private var digest_index: Map[String, (String, String)] = Map.empty
+  private var indexed_sessions: Set[String] = Set.empty
+
+  // theory_name -> snapshot
+  private var snapshot_cache: Map[String, Document.Snapshot] = Map.empty
+
+  private def index_session(store: Store, session_name: String): Unit = synchronized {
+    if (indexed_sessions.contains(session_name)) return
+    indexed_sessions += session_name
+
+    store.try_open_database(session_name, server_mode = false) match {
+      case Some(db) =>
+        try {
+          val sources = store.read_sources(db, session_name)
+          val thy_sources = sources.filter(_.name.endsWith(".thy"))
+          Output.warning("DB_Snapshots.index_session: " + session_name +
+            " — " + sources.length + " sources, " + thy_sources.length + " .thy files")
+          for (source <- thy_sources) {
+            val base = Library.try_unsuffix(".thy", Path.explode(source.name).file_name).getOrElse("")
+            if (base.nonEmpty) {
+              val theory_name = session_name + "." + base
+              digest_index += (source.digest.toString -> (session_name, theory_name))
+            }
+          }
+        }
+        finally { db.close() }
+      case None =>
+        Output.warning("DB_Snapshots.index_session: " + session_name + " — no database found")
+    }
+  }
+
+  private def load_snapshot(
+    store: Store,
+    session_name: String,
+    theory_name: String
+  ): Option[Document.Snapshot] = synchronized {
+    snapshot_cache.get(theory_name) match {
+      case some @ Some(_) =>
+        Output.warning("DB_Snapshots.load_snapshot: " + theory_name + " — cache hit")
+        some
+      case None =>
+        Output.warning("DB_Snapshots.load_snapshot: " + theory_name + " — loading from DB")
+        try {
+          val result =
+            using(Export.open_session_context0(store, session_name)) { session_context =>
+              val theory_context = session_context.theory(theory_name)
+              val snapshot = Build.read_theory(theory_context)
+              Output.warning("DB_Snapshots.load_snapshot: Build.read_theory returned " +
+                (if (snapshot.isDefined) "Some(snapshot)" else "None"))
+              snapshot
+            }
+          result.foreach(snapshot => snapshot_cache += (theory_name -> snapshot))
+          result
+        }
+        catch {
+          case exn: Exception =>
+            Output.warning("DB_Snapshots.load_snapshot: exception — " + exn.getMessage)
+            None
+        }
+    }
+  }
+
+  def get_snapshot(session: Session, file_path: String): Option[Document.Snapshot] = {
+    val store = Store(session.session_options)
+    val sessions_structure = session.resources.sessions_structure
+    val current_session = session.resources.session_base.session_name
+    val ancestors = sessions_structure.build_hierarchy(current_session)
+
+    Output.warning("DB_Snapshots.get_snapshot: file_path=" + quote(file_path) +
+      " current_session=" + quote(current_session) +
+      " ancestors=" + commas_quote(ancestors))
+
+    // Index all ancestor sessions
+    for (name <- ancestors) index_session(store, name)
+
+    // Compute file digest and look up
+    val file = Path.explode(file_path)
+    if (!file.is_file) {
+      Output.warning("DB_Snapshots.get_snapshot: file does not exist: " + file.implode)
+      return None
+    }
+    val digest = SHA1.digest(file).toString
+
+    Output.warning("DB_Snapshots.get_snapshot: file digest=" + digest +
+      " digest_index size=" + digest_index.size +
+      " match=" + digest_index.get(digest))
+
+    digest_index.get(digest) match {
+      case Some((session_name, theory_name)) =>
+        load_snapshot(store, session_name, theory_name)
+      case None => None
+    }
+  }
+}
 
 
 object Save_Thy_Files extends Scala.Fun("pide_state.save_thy_files", thread = true)
@@ -130,10 +330,6 @@ object Goto_Definition extends Scala.Fun("pide_state.goto_definition", thread = 
 {
   val here = Scala_Project.here
 
-  private def find_node_name(version: Document.Version, file_path: String)
-      : Option[Document.Node.Name] =
-    version.nodes.iterator.map(_._1).find(name => name.node == file_path)
-
   override def invoke(session: Session, args: List[Bytes]): List[Bytes] = {
     val (file_path, offset) =
       XML.Decode.pair(XML.Decode.string, XML.Decode.int)(
@@ -142,34 +338,33 @@ object Goto_Definition extends Scala.Fun("pide_state.goto_definition", thread = 
     val state = session.get_state()
     val version = state.recent_finished.version.get_finished
 
-    val result: (String, Int, Int, Int) = find_node_name(version, file_path) match {
-      case Some(node_name) =>
-        val snapshot = state.snapshot(node_name = node_name)
-        val range = Text.Range(offset - 1, offset)
+    Output.warning("Goto_Definition: file_path=" + quote(file_path) + " offset=" + offset)
 
-        val links = snapshot.cumulate[List[(String, Int, Int, Int)]](
-          range, Nil, Markup.Elements(Markup.ENTITY), _ => {
-            case (acc, Text.Info(_, XML.Elem(Markup(Markup.ENTITY, props), _))) =>
-              props match {
-                case Position.Item_Def_File(name, line, def_range) =>
-                  Some((name, line, def_range.start, def_range.stop) :: acc)
-                case Position.Item_Def_Id(id, def_range) =>
-                  snapshot.find_command_position(id, def_range.start) match {
-                    case Some(node_pos) =>
-                      Some((node_pos.name, node_pos.line1, 0, 0) :: acc)
-                    case None => None
-                  }
-                case _ => None
-              }
-            case _ => None
-          })
+    // Try live PIDE state first
+    val live_result: (String, Int, Int, Int) =
+      version.nodes.iterator.map(_._1).find(_.node == file_path) match {
+        case Some(node_name) =>
+          Output.warning("Goto_Definition: found live node " + node_name)
+          PIDE_Query.goto_definition(state.snapshot(node_name = node_name), offset)
+        case None =>
+          Output.warning("Goto_Definition: no live node, trying DB fallback")
+          ("", 0, 0, 0)
+      }
 
-        links match {
-          case Text.Info(_, result :: _) :: _ => result
-          case _ => ("", 0, 0, 0)
+    // Fall back to DB if live returns nothing
+    val result =
+      if (live_result != ("", 0, 0, 0)) live_result
+      else {
+        DB_Snapshots.get_snapshot(session, file_path) match {
+          case Some(snapshot) =>
+            val r = PIDE_Query.goto_definition(snapshot, offset)
+            Output.warning("Goto_Definition: DB query returned " + r)
+            r
+          case None =>
+            Output.warning("Goto_Definition: no DB snapshot found")
+            ("", 0, 0, 0)
         }
-      case None => ("", 0, 0, 0)
-    }
+      }
 
     val body = {
       val (a, b, c, d) = result
@@ -195,51 +390,51 @@ object Hover_Message extends Scala.Fun("pide_state.hover_message", thread = true
     val state = session.get_state()
     val version = state.recent_finished.version.get_finished
 
-    val node_name_opt =
-      version.nodes.iterator.map(_._1).find(name => name.node == file_path)
+    // Try live PIDE state first
+    val live_result: String =
+      version.nodes.iterator.map(_._1).find(_.node == file_path) match {
+        case Some(node_name) =>
+          PIDE_Query.hover_message(state.snapshot(node_name = node_name), offset)
+        case None => ""
+      }
 
-    val result: String = node_name_opt match {
-      case Some(node_name) =>
-        val snapshot = state.snapshot(node_name = node_name)
-        val range = Text.Range(offset - 1, offset)
-
-        val tooltip_elements = Markup.Elements(
-          Markup.ENTITY, Markup.TYPING, Markup.SORTING, Markup.ML_TYPING)
-
-        val results = snapshot.cumulate[List[String]](
-          range, Nil, tooltip_elements, _ => {
-            case (tips, Text.Info(_, XML.Elem(Markup.Entity(kind, name), _)))
-              if kind != "" && kind != Markup.ML_DEF =>
-              val kind1 = Word.implode(Word.explode('_', kind))
-              val txt =
-                if (name == "") kind1
-                else if (kind1 == "") name
-                else kind1 + " " + quote(name)
-              Some(txt :: tips)
-
-            case (tips, Text.Info(_, XML.Elem(Markup(name, _), body)))
-              if name == Markup.TYPING || name == Markup.SORTING =>
-              val body_text = XML.content(Pretty.formatted(body))
-              Some((":: " + body_text) :: tips)
-
-            case (tips, Text.Info(_, XML.Elem(Markup(Markup.ML_TYPING, _), body))) =>
-              val body_text = XML.content(Pretty.formatted(body))
-              Some(("ML: " + body_text) :: tips)
-
-            case _ => None
-          })
-
-        results match {
-          case Text.Info(_, tips) :: _ => tips.reverse.mkString("\n")
-          case _ => ""
+    // Fall back to DB if live returns nothing
+    val result =
+      if (live_result.nonEmpty) live_result
+      else {
+        DB_Snapshots.get_snapshot(session, file_path) match {
+          case Some(snapshot) => PIDE_Query.hover_message(snapshot, offset)
+          case None => ""
         }
-      case None => ""
-    }
+      }
 
     List(Bytes(YXML.string_of_body(XML.Encode.string(result))))
   }
 }
 
 
+object Get_Session_Databases extends Scala.Fun("pide_state.get_session_databases", thread = true)
+  with Scala.Single_Fun
+{
+  val here = Scala_Project.here
+
+  override def invoke(session: Session, args: List[Bytes]): List[Bytes] = {
+    val store = Store(session.session_options)
+    val sessions_structure = session.resources.sessions_structure
+    val current_session = session.resources.session_base.session_name
+    val ancestors = sessions_structure.build_hierarchy(current_session)
+
+    val results: List[(String, String)] = ancestors.flatMap { name =>
+      val s = store.get_session(name)
+      s.log_db.map(path => (name, File.standard_path(path)))
+    }
+
+    val body = XML.Encode.list(
+      XML.Encode.pair(XML.Encode.string, XML.Encode.string))(results)
+    List(Bytes(YXML.string_of_body(body)))
+  }
+}
+
+
 class PIDE_State_Functions extends Scala.Functions(
-  Save_Thy_Files, Resolve_Positions, Goto_Definition, Hover_Message)
+  Save_Thy_Files, Resolve_Positions, Goto_Definition, Hover_Message, Get_Session_Databases)
