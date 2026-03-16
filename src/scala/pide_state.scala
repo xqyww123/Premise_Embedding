@@ -79,6 +79,24 @@ object PIDE_Query {
   private val tooltip_elements = Markup.Elements(
     Markup.ENTITY, Markup.TYPING, Markup.SORTING, Markup.ML_TYPING)
 
+  def entity_at_position(snapshot: Document.Snapshot, offset: Int)
+      : (String, String) = {
+    val range = symbol_offset_to_range(snapshot, offset)
+
+    val results = snapshot.cumulate[(String, String)](
+      range, ("", ""), Markup.Elements(Markup.ENTITY), _ => {
+        case (("", ""), Text.Info(_, XML.Elem(Markup.Entity(kind, name), _)))
+          if kind != "" && kind != Markup.ML_DEF =>
+          Some((kind, name))
+        case _ => None
+      })
+
+    results match {
+      case Text.Info(_, result) :: _ if result != ("", "") => result
+      case _ => ("", "")
+    }
+  }
+
   def hover_message(snapshot: Document.Snapshot, offset: Int): String = {
     val range = symbol_offset_to_range(snapshot, offset)
 
@@ -449,6 +467,41 @@ object Hover_Message extends Scala.Fun("pide_state.hover_message", thread = true
 }
 
 
+object Entity_At_Position extends Scala.Fun("pide_state.entity_at_position", thread = true)
+  with Scala.Single_Fun
+{
+  val here = Scala_Project.here
+
+  override def invoke(session: Session, args: List[Bytes]): List[Bytes] = {
+    val (file_path, offset) =
+      XML.Decode.pair(XML.Decode.string, XML.Decode.int)(
+        YXML.parse_body(args.head.text))
+
+    val state = session.get_state()
+    val version = state.recent_finished.version.get_finished
+
+    val live_result: (String, String) =
+      version.nodes.iterator.map(_._1).find(_.node == file_path) match {
+        case Some(node_name) =>
+          PIDE_Query.entity_at_position(state.snapshot(node_name = node_name), offset)
+        case None => ("", "")
+      }
+
+    val result =
+      if (live_result != ("", "")) live_result
+      else {
+        DB_Snapshots.get_snapshot(session, file_path) match {
+          case Some(snapshot) => PIDE_Query.entity_at_position(snapshot, offset)
+          case None => ("", "")
+        }
+      }
+
+    val body = XML.Encode.pair(XML.Encode.string, XML.Encode.string)(result)
+    List(Bytes(YXML.string_of_body(body)))
+  }
+}
+
+
 object Get_Session_Databases extends Scala.Fun("pide_state.get_session_databases", thread = true)
   with Scala.Single_Fun
 {
@@ -473,4 +526,5 @@ object Get_Session_Databases extends Scala.Fun("pide_state.get_session_databases
 
 
 class PIDE_State_Functions extends Scala.Functions(
-  Save_Thy_Files, Resolve_Positions, Goto_Definition, Hover_Message, Get_Session_Databases)
+  Save_Thy_Files, Resolve_Positions, Goto_Definition, Hover_Message,
+  Entity_At_Position, Get_Session_Databases)

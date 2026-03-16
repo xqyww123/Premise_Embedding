@@ -133,6 +133,7 @@ fun get_constants_with_positions ctxt =
    full_name is the fully qualified fact name from Facts.dest_static. *)
 fun get_theorems_with_positions context =
   let
+    val thy = Context.theory_of context
     val (parent_facts, facts) = Context.cases
       (fn thy => (map Global_Theory.facts_of (Theory.parents_of thy), Global_Theory.facts_of thy))
       (fn ctxt => ([Global_Theory.facts_of (Proof_Context.theory_of ctxt)], Proof_Context.facts_of ctxt))
@@ -145,7 +146,7 @@ fun get_theorems_with_positions context =
               SOME entry => #pos entry | NONE => Position.none)
           val n = length thms
       in thms |> map_index (fn (idx, thm) =>
-          (name, if n = 1 then 0 else idx + 1, pos, thm))
+          (name, if n = 1 then 0 else idx + 1, pos, Thm.transfer thy thm))
       end)
   end
 

@@ -13,7 +13,12 @@ from .premise_selection import (
 
 from .theory_structure import mk_unicode_file, theory_info
 from .hover import goto_definition, hover_message
+from .semantics import (
+    mk_query_by_name_tool as query_by_name_tool,
+    mk_query_by_position_tool as query_by_position_tool,
+)
 from .semantic_interpretation import interpret_file
+from .theory_hash import theory_xxhash128
 
 __all__ = [
     "embed",
@@ -25,5 +30,8 @@ __all__ = [
     "goto_definition",
     "hover_message",
     "interpret_file",
+    "query_by_name_tool",
+    "query_by_position_tool",
     "theory_info",
+    "theory_xxhash128",
 ]

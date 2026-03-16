@@ -9,6 +9,9 @@ end
 
 structure Infra_Filter : INFRA_FILTER = struct
 
+val hol_simpset =
+  Raw_Simplifier.simpset_of (Proof_Context.init_global \<^theory>\<open>HOL\<close>)
+
 fun gen_infra_filters (context : Context.generic)
     : {is_infra_const: string -> bool, is_infra_thm: string * thm -> bool,
        is_infra_type: string -> bool, is_infra_class: string -> bool,
@@ -16,6 +19,11 @@ fun gen_infra_filters (context : Context.generic)
   let
     val thy_name = Context.theory_long_name (Context.theory_of context)
     val type_space = Context.cases Sign.type_space Proof_Context.type_space context
+    val const_space = Consts.space_of (Context.cases Sign.consts_of Proof_Context.consts_of context)
+    val fact_space = Facts.space_of
+      (Context.cases Global_Theory.facts_of Proof_Context.facts_of context)
+    val class_space = Context.cases Sign.class_space Proof_Context.class_space context
+    val locale_space = Locale.locale_space (Context.theory_of context)
     val local_type_names = Name_Space.get_names type_space
       |> filter (fn name =>
           #theory_long_name (Name_Space.the_entry type_space name) = thy_name)
@@ -55,7 +63,8 @@ fun gen_infra_filters (context : Context.generic)
     val inst_infixes = map (fn T => "_" ^ Long_Name.base_name T ^ "_inst.") local_type_names
 
     fun is_infra_const name =
-      exists (fn pfx => String.isPrefix pfx name) pre_prefixes
+      Name_Space.is_concealed const_space name
+      orelse exists (fn pfx => String.isPrefix pfx name) pre_prefixes
       orelse exists (fn infix_ => String.isSubstring infix_ name) inst_infixes
       orelse (exists (fn T => String.isPrefix (T ^ ".") name) local_type_names
               andalso not (Strhashtab.defined preserved_set name))
@@ -74,6 +83,7 @@ fun gen_infra_filters (context : Context.generic)
     (* --- Inductive infrastructure theorem names --- *)
 
     val ctxt = Context.proof_of context
+    val hol_ss_ctxt = put_simpset hol_simpset ctxt
     val local_const_names = Theory_Structure.get_constants_with_positions context |> map #1
     val consts = Context.cases Sign.consts_of Proof_Context.consts_of context
     val inductive_names =
@@ -119,16 +129,31 @@ fun gen_infra_filters (context : Context.generic)
       exists (fn pfx => String.isPrefix pfx name) internal_prefixes
       orelse is_infra_const name
 
+    (* --- Trivial theorem check --- *)
+
+    fun is_trivial_thm thm =
+      (let
+        val thm' = Conv.fconv_rule (Object_Logic.atomize ctxt) thm
+        val thm'' = Timeout.apply (Time.fromSeconds 5)
+          (Simplifier.asm_full_simplify hol_ss_ctxt) thm'
+      in Envir.beta_eta_contract (Thm.prop_of thm'') aconv \<^prop>\<open>True\<close> end)
+      handle THM _ => false | CTERM _ => false | TERM _ => false | TYPE _ => false
+           | Timeout.TIMEOUT _ => false
+
     (* --- Combined theorem predicate --- *)
 
     fun is_infra_thm (full_name, thm) =
-      is_ADT_infra_thm full_name
+      Name_Space.is_concealed fact_space full_name
+      orelse is_ADT_infra_thm full_name
       orelse is_inductive_infra_thm full_name
       orelse Term.exists_Const is_internal_constant (Thm.prop_of thm)
       orelse is_internal_class (Thm.prop_of thm)
+      orelse is_trivial_thm thm
   in
     {is_infra_const = is_infra_const, is_infra_thm = is_infra_thm,
-     is_infra_type = K false, is_infra_class = K false, is_infra_locale = K false}
+     is_infra_type = Name_Space.is_concealed type_space,
+     is_infra_class = Name_Space.is_concealed class_space,
+     is_infra_locale = Name_Space.is_concealed locale_space}
   end
 
 end

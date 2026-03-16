@@ -6,6 +6,7 @@ Access PIDE document state via Scala functions:
   - absolutize_id_based_pos: resolve ID-based positions to file/line/offset positions
   - goto_definition: resolve entity reference at a position to its definition position
   - hover_message: extract tooltip information at a position
+  - entity_at_position: return (kind, fully_qualified_name) of entity at a position
 *)
 
 signature PIDE_STATE =
@@ -26,6 +27,11 @@ sig
   (* Given a position (file + offset), return the hover tooltip text.
      Tries live PIDE state first, falls back to session export DB. *)
   val hover_message: Position.T -> string option
+
+  (* Given a position (file + offset), return the (kind, name) of the entity
+     at that location, where name is the fully qualified name.
+     Tries live PIDE state first, falls back to session export DB. *)
+  val entity_at_position: Position.T -> (string * string) option
 
   (* Convert between symbol offset and line:column via Python RPC.
      Requires the Isabelle_RPC Python host to be running. *)
@@ -100,6 +106,7 @@ fun absolutize_id_based_pos {write_to_temp_file} positions =
 fun expand_path s =
   if s = "" then ""
   else if String.isPrefix "/" s andalso not (Char.contains s #"$")
+    andalso not (String.isSubstring "./" s)
   then s
   else File.absolute_path (Path.explode s) |> Path.implode;
 
@@ -127,7 +134,7 @@ fun goto_definition_pide file_path symbol_offset =
              (XML.Decode.pair XML.Decode.int XML.Decode.int));
   in
     if def_file = "" then NONE
-    else SOME (Position.make0 def_line def_offset def_end_offset "" def_file "")
+    else SOME (Position.make0 def_line def_offset def_end_offset "" (expand_path def_file) "")
   end;
 
 fun hover_message_pide file_path symbol_offset =
@@ -198,6 +205,28 @@ fun hover_message pos =
     else hover_message_pide file offset
   end;
 
+fun entity_at_position_pide file_path symbol_offset =
+  let
+    val input_body =
+      XML.Encode.pair XML.Encode.string XML.Encode.int
+        (file_path, symbol_offset);
+    val yxml = Scala.function1 "pide_state.entity_at_position"
+      (YXML.string_of_body input_body);
+    val (kind, name) =
+      YXML.parse_body yxml
+      |> XML.Decode.pair XML.Decode.string XML.Decode.string;
+  in
+    if kind = "" andalso name = "" then NONE
+    else SOME (kind, name)
+  end;
+
+fun entity_at_position pos =
+  let val (file, offset) = pos_file_offset pos
+  in
+    if file = "" orelse offset = 0 then NONE
+    else entity_at_position_pide file offset
+  end;
+
 val get_session_databases : unit -> (string * string) list =
   let
     val cache = Synchronized.cache (fn () =>
@@ -233,6 +262,14 @@ val _ = Theory.setup (Context.theory_map (
       ret_schema = packOption packString,
       function = fn (file, offset) =>
         PIDE_State.hover_message (Position.make0 0 offset 0 "" file ""),
+      timeout = SOME (Time.fromSeconds 10)
+    }
+  #> Remote_Procedure_Calling.register_global_callback {
+      name = "pide_state.entity_at_position",
+      arg_schema = unpackPair (unpackString, unpackInt),
+      ret_schema = packOption (packPair (packString, packString)),
+      function = fn (file, offset) =>
+        PIDE_State.entity_at_position (Position.make0 0 offset 0 "" file ""),
       timeout = SOME (Time.fromSeconds 10)
     }
   #> Remote_Procedure_Calling.register_global_callback {
