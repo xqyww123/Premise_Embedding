@@ -3,7 +3,7 @@ signature THEORY_STRUCTURE = sig
   val get_theory_file_path : theory -> string
   val get_constants_with_positions : Context.generic -> (string (* full_name *) * Position.T) list
   val get_theorems_with_positions : Context.generic ->
-    (string (* full_name *) * int (* idx *) * Position.T * thm) list
+    (string (* full_name *) * int (* idx *) * Position.T * thm * bool (* is_global *)) list
   val get_types_with_positions : Context.generic -> (string * Position.T) list
   val get_classes_with_positions : Context.generic -> (string * Position.T) list
   val get_locales_with_positions : Context.generic -> (string * Position.T) list
@@ -138,6 +138,8 @@ fun get_theorems_with_positions context =
       (fn thy => (map Global_Theory.facts_of (Theory.parents_of thy), Global_Theory.facts_of thy))
       (fn ctxt => ([Global_Theory.facts_of (Proof_Context.theory_of ctxt)], Proof_Context.facts_of ctxt))
       context
+    val global_facts = Global_Theory.facts_of thy
+    val is_global = Facts.defined global_facts
     val space = Facts.space_of facts
     val facts_list = Facts.dest_static false parent_facts facts
   in
@@ -145,8 +147,9 @@ fun get_theorems_with_positions context =
       let val pos = (case try (Name_Space.the_entry space) name of
               SOME entry => #pos entry | NONE => Position.none)
           val n = length thms
+          val global = is_global name
       in thms |> map_index (fn (idx, thm) =>
-          (name, if n = 1 then 0 else idx + 1, pos, Thm.transfer thy thm))
+          (name, if n = 1 then 0 else idx + 1, pos, Thm.transfer thy thm, global))
       end)
   end
 

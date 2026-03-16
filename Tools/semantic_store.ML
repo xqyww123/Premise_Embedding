@@ -51,6 +51,20 @@ end)
 val STORE : entry EntryTab.table = EntryTab.empty 4096
 val STORE_lock = Synchronized.var "SEMANTIC_STORE" ()
 
+structure Local_Store = Proof_Data(
+  type T = entry EntryTab.table option Unsynchronized.ref
+  val init = fn _ => Unsynchronized.ref NONE
+)
+
+fun get_local_store ctxt =
+  let val r = Local_Store.get ctxt
+  in case !r of
+       SOME tab => tab
+     | NONE =>
+         let val tab = EntryTab.empty 256
+         in r := SOME tab; tab end
+  end
+
 val INTERPRETED : unit Inthashtab.table = Inthashtab.empty 256
 
 fun is_interpreted thy =
@@ -98,7 +112,14 @@ fun make_query_callback (context : Context.generic) (current_names : string list
 
     fun lookup_store key =
       Synchronized.change_result STORE_lock
-        (fn () => (Option.map #semantics (EntryTab.lookup STORE key), ()))
+        (fn () =>
+          (case context of
+             Context.Proof ctxt =>
+               (case EntryTab.lookup (get_local_store ctxt) key of
+                  SOME e => SOME (#semantics e)
+                | NONE => Option.map #semantics (EntryTab.lookup STORE key))
+           | _ => Option.map #semantics (EntryTab.lookup STORE key),
+           ()))
 
     fun query_constant name =
       (let
@@ -279,7 +300,7 @@ fun interpret' (context : Context.generic) : unit =
           else SOME (Constant_Key (name, ver pos), name, pos))
 
     val raw_thm_entries = Theory_Structure.get_theorems_with_positions context
-      |> filter (fn (name, _, _, thm) => not (is_infra_thm (name, thm)))
+      |> filter (fn (name, _, _, thm, _) => not (is_infra_thm (name, thm)))
 
     (* 2c. Build named entries and check which appear in the source file.
        The RPC returns (word_offset, goal_keyword_offset, has_code_attr) per name:
@@ -288,8 +309,8 @@ fun interpret' (context : Context.generic) : unit =
          has_code_attr            : name follows a goal keyword with [code] attribute
        For proof contexts, skip the RPC and return dummy results. *)
     val raw_thm_entries_named = raw_thm_entries
-      |> map (fn (name, idx, pos, thm) =>
-        (Thm_Name.print (name, idx), pos, thm))
+      |> map (fn (name, idx, pos, thm, is_global) =>
+        (Thm_Name.print (name, idx), pos, thm, is_global))
     (* Strip theory prefix for source file matching — source uses short names *)
     val thy_prefix = thy_name ^ "."
     fun strip_thy_prefix name =
@@ -314,31 +335,31 @@ fun interpret' (context : Context.generic) : unit =
 
     (* 3. Register theorems and assign digest-based keys *)
     val thm_entries_with_keys = raw_thm_entries_with_offsets
-      |> map (fn ((name, pos, thm), (word_off, goal_off, _)) =>
+      |> map (fn ((name, pos, thm, is_global), (word_off, goal_off, _)) =>
         let val s = Term_Digest.thm128 thm
-        in (s, name, pos, thm, word_off, goal_off) end)
+        in (s, name, pos, thm, word_off, goal_off, is_global) end)
 
     (* 4. Deduplicate theorems by digest — keep earliest occurrence per digest.
        Prefer entries that follow a goal keyword; among those, pick the earliest.
        Fall back to earliest word occurrence otherwise. *)
-    val best_thms : (string * Position.T * thm * int * int) Thm_Dedup.table = Thm_Dedup.empty 1024
+    val best_thms : (string * Position.T * thm * int * int * bool) Thm_Dedup.table = Thm_Dedup.empty 1024
     val _ = thm_entries_with_keys
-      |> List.app (fn (s, name, pos, thm, word_off, goal_off) =>
+      |> List.app (fn (s, name, pos, thm, word_off, goal_off, is_global) =>
         case Thm_Dedup.lookup best_thms s of
-          NONE => Thm_Dedup.update best_thms (s, (name, pos, thm, word_off, goal_off))
-        | SOME (_, _, _, prev_word_off, prev_goal_off) =>
+          NONE => Thm_Dedup.update best_thms (s, (name, pos, thm, word_off, goal_off, is_global))
+        | SOME (_, _, _, prev_word_off, prev_goal_off, _) =>
             let val dominated =
               if goal_off >= 0 andalso prev_goal_off < 0 then true
               else if prev_goal_off >= 0 andalso goal_off < 0 then false
               else if goal_off >= 0 then goal_off < prev_goal_off
               else word_off < prev_word_off
             in if dominated
-               then Thm_Dedup.update best_thms (s, (name, pos, thm, word_off, goal_off))
+               then Thm_Dedup.update best_thms (s, (name, pos, thm, word_off, goal_off, is_global))
                else ()
             end)
     val deduped_thm_entries = Thm_Dedup.fold
-      (fn (s, (name, pos, thm, _, goal_off)) => fn acc =>
-        (Theorem_Key (s, ver pos), name, pos, goal_off, thm) :: acc)
+      (fn (s, (name, pos, thm, _, goal_off, is_global)) => fn acc =>
+        (Theorem_Key (s, ver pos), name, pos, goal_off, SOME thm, is_global) :: acc)
       best_thms []
 
     (* 5. Extract types, classes, and locales *)
@@ -365,14 +386,14 @@ fun interpret' (context : Context.generic) : unit =
     val pp_typ = string_of_typ ctxt
 
     val all_entries_with_pos =
-      (map (fn (key, name, pos) => (key, name, pos, ~1, NONE : thm option)) const_entries
-       @ map (fn (key, name, pos, goal_off, thm) => (key, name, pos, goal_off, SOME thm)) deduped_thm_entries
-       @ map (fn (key, name, pos) => (key, name, pos, ~1, NONE)) type_entries
-       @ map (fn (key, name, pos) => (key, name, pos, ~1, NONE)) class_entries
-       @ map (fn (key, name, pos) => (key, name, pos, ~1, NONE)) locale_entries)
+      (map (fn (key, name, pos) => (key, name, pos, ~1, NONE : thm option, true)) const_entries
+       @ deduped_thm_entries
+       @ map (fn (key, name, pos) => (key, name, pos, ~1, NONE, true)) type_entries
+       @ map (fn (key, name, pos) => (key, name, pos, ~1, NONE, true)) class_entries
+       @ map (fn (key, name, pos) => (key, name, pos, ~1, NONE, true)) locale_entries)
       |> sort entry_ord
 
-    val entries = all_entries_with_pos |> map (fn (key, name, pos, goal_off, thm_opt) =>
+    val entries = all_entries_with_pos |> map (fn (key, name, pos, goal_off, thm_opt, _) =>
       let val prop_str =
         case (key, thm_opt) of
           (Theorem_Key _, SOME thm) => pp (Thm.prop_of thm)
@@ -416,9 +437,15 @@ fun interpret' (context : Context.generic) : unit =
 
     (* 9. Store results — each result corresponds to an entry in all_entries_with_pos *)
     val _ = Synchronized.change STORE_lock (fn () =>
-      (map2 (fn (key, _, pos, _, _) => fn result_opt =>
+      (map2 (fn (key, _, pos, _, _, is_global) => fn result_opt =>
         case result_opt of
-          SOME sem => EntryTab.update STORE (key, {semantics = sem, position = pos})
+          SOME sem =>
+            let val e = {semantics = sem, position = pos}
+            in if is_global then EntryTab.update STORE (key, e)
+               else (case context of
+                       Context.Proof ctxt => EntryTab.update (get_local_store ctxt) (key, e)
+                     | _ => EntryTab.update STORE (key, e))
+            end
         | NONE => ())
       all_entries_with_pos results; ()))
   in
