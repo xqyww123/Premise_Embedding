@@ -481,7 +481,6 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
       Remote_Procedure_Calling.call_command cmd rpc_arg
         handle Remote_Procedure_Calling.Remote_Calling_Failure {message, ...} =>
           error (String.concat ["Semantic interpretation RPC failed: ", message])
-
     val fmt_cost = Real.fmt (StringCvt.FIX (SOME 4))
     val _ = tracing (String.concat [
       "[Semantic_Store] ", thy_name,

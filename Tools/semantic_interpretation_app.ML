@@ -6,9 +6,9 @@
 
   Protocol:
     Client sends: theory_name (msgpack string)
-    Server streams: [msg, None] pairs (REPL output format) during interpretation
+    Server streams: packString messages during interpretation (from tracing)
     Server sends:   packUnit when done successfully
-    On error:       sends [None, error_msg] then packUnit
+    On error:       sends packString "ERROR: ..." then packUnit
 *)
 
 local open MessagePackBinIO.Pack MessagePackBinIO.Unpack in
@@ -18,6 +18,8 @@ val _ = REPL_Server.register_app "Semantic_Store.collect" (fn (cin, cout, state)
     fun read unpacker =
       let val (ret, cin') = doUnpack unpacker (!cin)
       in cin := cin'; ret end
+    fun send msg = (REPL_Server.output cout packString msg;
+                    BinIO.StreamIO.flushOut cout)
     fun done () = (REPL_Server.output cout packUnit ();
                    BinIO.StreamIO.flushOut cout)
   in
@@ -25,12 +27,19 @@ val _ = REPL_Server.register_app "Semantic_Store.collect" (fn (cin, cout, state)
       let
         val thy_name = read unpackString
         val thy = Thy_Info.get_theory thy_name
-        val _ = Semantic_Store.interpret (Context.Theory thy)
+
+        (* Hijack tracing to stream messages over the socket *)
+        val old_tracing = !Private_Output.tracing_fn
+        val _ = Private_Output.tracing_fn :=
+          (fn msgs => List.app send msgs)
+
+        val _ = \<^try>\<open>Semantic_Store.interpret (Context.Theory thy)
+          catch exn => (Private_Output.tracing_fn := old_tracing; Exn.reraise exn)\<close>
+        val _ = Private_Output.tracing_fn := old_tracing
         val _ = done ()
       in state end
     catch exn =>
-      (REPL_Server.output cout packString ("ERROR: " ^ Runtime.exn_message exn);
-       BinIO.StreamIO.flushOut cout;
+      (send ("ERROR: " ^ Runtime.exn_message exn);
        done ();
        state)\<close>
   end)

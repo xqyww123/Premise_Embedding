@@ -53,26 +53,31 @@ has_error = False
 try:
     while True:
         raw = c.unpack.unpack()
-        # The REPL wraps app output in [msg, error] pairs
+        # App done marker: ((), ()) from REPL_Server.output cout packUnit ()
         if isinstance(raw, (list, tuple)) and len(raw) == 2:
             msg, err = raw
-            if err is not None:
-                print(f"ERROR: {err}", file=sys.stderr, flush=True)
+            if err is not None and err != ():
+                err_str = err.decode("utf-8") if isinstance(err, bytes) else str(err)
+                print(err_str, file=sys.stderr, flush=True)
                 has_error = True
-            if msg is None:
-                break
+                continue
+            if msg is None or msg == ():
+                # Check if this is the done marker (both sides are unit)
+                if (msg is None or msg == ()) and (err is None or err == ()):
+                    break
+                continue
+            if isinstance(msg, bytes):
+                msg = msg.decode("utf-8", errors="replace")
+            if isinstance(msg, str):
+                if msg.startswith("ERROR:"):
+                    print(msg, file=sys.stderr, flush=True)
+                    has_error = True
+                else:
+                    print(msg, flush=True)
         elif raw is None:
             break
         else:
-            msg = raw
-        if isinstance(msg, bytes):
-            msg = msg.decode("utf-8", errors="replace")
-        if isinstance(msg, str):
-            if msg.startswith("ERROR:"):
-                print(msg, file=sys.stderr, flush=True)
-                has_error = True
-            else:
-                print(msg, flush=True)
+            print(f"[unexpected: {raw!r}]", flush=True)
 except Exception as e:
     print(f"Connection error: {e}", file=sys.stderr, flush=True)
     has_error = True
