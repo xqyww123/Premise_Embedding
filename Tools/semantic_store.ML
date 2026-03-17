@@ -9,34 +9,26 @@ signature SEMANTIC_STORE = sig
   val make_query_functions : Context.generic -> string list -> bool -> query_functions
   val interpret : Context.generic -> unit
   val clean_wip : unit -> unit
+  val save_store : Path.T -> unit
+  val load_store : Path.T -> unit
 end
 
 structure Semantic_Store : SEMANTIC_STORE = struct
 
 (* --- Store data structures --- *)
 
-datatype version = Ver_WIP (*All the WIP version must be updated manually*)
-                 | Ver_Finished of theory
-datatype key = Constant_Key of string (*fully quantified name*) * version
-             | Theorem_Key  of Term_Digest.digest128 * version
-             | Type_Key     of string * version
-             | Class_Key    of string * version
-             | Locale_Key   of string * version
+type theory_long_name = string
+datatype key' = Constant_Key of string (*fully quantified name*)
+              | Theorem_Key  of Term_Digest.digest128
+              | Type_Key     of string
+              | Class_Key    of string
+              | Locale_Key   of string
+type key = key' * theory_long_name
 type semantics = string (*in English*)
 type entry = {
         semantics: semantics,
-        pretty_printed: string,
-        position: Position.T
+        pretty_printed: string
      }
-
-fun eq_version (Ver_WIP, Ver_WIP) = true
-  | eq_version (Ver_Finished t1, Ver_Finished t2) =
-      Context.theory_identifier t1 = Context.theory_identifier t2
-  | eq_version _ = false
-
-fun mk_version thy : version =
-  if Resources.loaded_theory (Context.theory_long_name thy) then Ver_Finished thy
-  else Ver_WIP
 
 structure Thm_Dedup = Hash_Table(struct
   type key = Term_Digest.digest128
@@ -46,17 +38,12 @@ end)
 
 structure EntryTab = Hash_Table(struct
   type key = key
-  fun hash (Constant_Key (name, _)) = Word.xorb (0w1, Hashers.string_key name)
-    | hash (Theorem_Key (d, _))     = Word.xorb (0w2, Term_Digest.digest128_hasher d)
-    | hash (Type_Key (name, _))     = Word.xorb (0w3, Hashers.string_key name)
-    | hash (Class_Key (name, _))    = Word.xorb (0w4, Hashers.string_key name)
-    | hash (Locale_Key (name, _))   = Word.xorb (0w5, Hashers.string_key name)
-  fun eq (Constant_Key (a1, v1), Constant_Key (a2, v2)) = a1 = a2 andalso eq_version (v1, v2)
-    | eq (Theorem_Key (a1, v1), Theorem_Key (a2, v2)) = a1 = a2 andalso eq_version (v1, v2)
-    | eq (Type_Key (a1, v1), Type_Key (a2, v2)) = a1 = a2 andalso eq_version (v1, v2)
-    | eq (Class_Key (a1, v1), Class_Key (a2, v2)) = a1 = a2 andalso eq_version (v1, v2)
-    | eq (Locale_Key (a1, v1), Locale_Key (a2, v2)) = a1 = a2 andalso eq_version (v1, v2)
-    | eq _ = false
+  fun hash (Constant_Key name, thy) = Word.xorb (0w1, Hashers.string_key name + Hashers.string_key thy)
+    | hash (Theorem_Key d, thy)     = Word.xorb (0w2, Term_Digest.digest128_hasher d + Hashers.string_key thy)
+    | hash (Type_Key name, thy)     = Word.xorb (0w3, Hashers.string_key name + Hashers.string_key thy)
+    | hash (Class_Key name, thy)    = Word.xorb (0w4, Hashers.string_key name + Hashers.string_key thy)
+    | hash (Locale_Key name, thy)   = Word.xorb (0w5, Hashers.string_key name + Hashers.string_key thy)
+  fun eq ((k1, v1), (k2, v2)) = k1 = k2 andalso v1 = v2
 end)
 
 val STORE : entry EntryTab.table = EntryTab.empty 4096
@@ -76,29 +63,28 @@ fun get_local_store ctxt =
          in r := SOME tab; tab end
   end
 
-val INTERPRETED : unit Inthashtab.table = Inthashtab.empty 256
-
-val skip_theories = ["Pure", "Tools.Code_Generator", "HOL.Code_Evaluation"]
+val INTERPRETED : unit Strhashtab.table = Strhashtab.empty 256
+val _ = List.app (fn name => Strhashtab.update INTERPRETED (name, ()))
+  ["Pure", "Tools.Code_Generator", "HOL.Code_Evaluation"]
 
 fun is_interpreted thy =
-  member (op =) skip_theories (Context.theory_long_name thy) orelse
   Synchronized.change_result STORE_lock (fn () =>
-    (Inthashtab.defined INTERPRETED (Context.theory_identifier thy), ()))
+    (Strhashtab.defined INTERPRETED (Context.theory_long_name thy), ()))
 
 fun mark_interpreted thy =
   Synchronized.change STORE_lock (fn () =>
-    (Inthashtab.update INTERPRETED (Context.theory_identifier thy, ()); ()))
+    (Strhashtab.update INTERPRETED (Context.theory_long_name thy, ()); ()))
 
 (* --- RPC protocol --- *)
 
 local
   open MessagePackBinIO.Pack MessagePackBinIO.Unpack
 
-  fun pack_entry_kind (Constant_Key _) = packInt 0
-    | pack_entry_kind (Theorem_Key _) = packInt 1
-    | pack_entry_kind (Type_Key _) = packInt 2
-    | pack_entry_kind (Class_Key _) = packInt 3
-    | pack_entry_kind (Locale_Key _) = packInt 4
+  fun pack_entry_kind (Constant_Key _, _) = packInt 0
+    | pack_entry_kind (Theorem_Key _, _) = packInt 1
+    | pack_entry_kind (Type_Key _, _) = packInt 2
+    | pack_entry_kind (Class_Key _, _) = packInt 3
+    | pack_entry_kind (Locale_Key _, _) = packInt 4
 
   val pack_arg = fn {file_path, theory_longname, thy_hash, deps_longname, entries, context_info} =>
     packTuple6 (packString, packString, packBytes, packList packString,
@@ -123,11 +109,6 @@ fun make_query_functions (context : Context.generic) (current_names : string lis
     val consts_space = Consts.space_of consts
     val ctxt = Context.cases Proof_Context.init_global I context
     val current_set = Symtab.make_set current_names
-
-    fun ver_of_entry ns_entry =
-      let val def_thy_name = #theory_long_name ns_entry
-      in mk_version (Context.get_theory {long=true} thy def_thy_name) end
-      handle ERROR _ => Ver_WIP
 
     fun check_not_current name =
       if Symtab.defined current_set name
@@ -158,7 +139,7 @@ fun make_query_functions (context : Context.generic) (current_names : string lis
         val _ = check_not_current full_name
         val ns_entry = Name_Space.the_entry consts_space full_name
       in
-        lookup_store (Constant_Key (full_name, ver_of_entry ns_entry))
+        lookup_store (Constant_Key full_name, #theory_long_name ns_entry)
       end
       handle ERROR msg =>
         if String.isPrefix (String.concat ["Undefined constant: ", name]) msg
@@ -167,33 +148,34 @@ fun make_query_functions (context : Context.generic) (current_names : string lis
 
     fun query_theorem name =
       (let
-        val _ = check_not_current name
         val (base_name, idx_opt) = Theory_Structure.parse_thm_name name
-        val thms = Proof_Context.get_thms ctxt base_name
+        val facts = Proof_Context.facts_of ctxt
+        val fact_space = Facts.space_of facts
+        val full_name = Name_Space.intern fact_space base_name
+        val _ = check_not_current full_name
+        val ns_entry = Name_Space.the_entry fact_space full_name
+        val {thms, ...} = case Facts.lookup context facts full_name of
+            SOME result => result
+          | NONE => error (String.concat ["Lemma ", name, " is not defined in this context"])
         val thm = case idx_opt of
             NONE => hd thms
           | SOME n => nth thms (n - 1)
         val s = Term_Digest.thm128 thm
-        val ver = case Thm.derivation_id thm of
-            SOME {theory_name, ...} =>
-              (mk_version (Context.get_theory {long=true} thy theory_name)
-               handle ERROR _ => Ver_WIP)
-          | NONE => Ver_WIP
       in
-        lookup_store (Theorem_Key (s, ver))
+        lookup_store (Theorem_Key s, #theory_long_name ns_entry)
       end
       handle ERROR msg =>
-        if String.isPrefix (String.concat ["Undefined fact: ", name]) msg
-        then error (String.concat ["Theorem ", name, " is not defined in this context"])
+        if String.isPrefix "Undefined " msg
+        then error (String.concat ["Lemma ", name, " is not defined in this context"])
         else raise ERROR msg)
 
-    fun query_ns_key make_key space kind_label name =
+    fun query_ns_key make_key' space kind_label name =
       (let
         val full_name = Name_Space.intern space name
         val _ = check_not_current full_name
         val ns_entry = Name_Space.the_entry space full_name
       in
-        lookup_store (make_key (full_name, ver_of_entry ns_entry))
+        lookup_store (make_key' full_name, #theory_long_name ns_entry)
       end
       handle ERROR msg =>
         if String.isPrefix "Undefined " msg
@@ -311,13 +293,13 @@ fun string_of_typ ctxt =
 (* --- Main orchestration --- *)
 
 local
-  fun key_kind_rank (Class_Key _) = 0
-    | key_kind_rank (Locale_Key _) = 1
-    | key_kind_rank (Type_Key _) = 2
-    | key_kind_rank (Constant_Key _) = 3
-    | key_kind_rank (Theorem_Key _) = 4
+  fun key'_kind_rank (Class_Key _) = 0
+    | key'_kind_rank (Locale_Key _) = 1
+    | key'_kind_rank (Type_Key _) = 2
+    | key'_kind_rank (Constant_Key _) = 3
+    | key'_kind_rank (Theorem_Key _) = 4
 in
-fun key_kind_ord (k1, k2) = int_ord (key_kind_rank k1, key_kind_rank k2)
+fun key_kind_ord ((k1, _), (k2, _)) = int_ord (key'_kind_rank k1, key'_kind_rank k2)
 end
 fun entry_ord (e1, e2) =
   (case int_ord (the_default 0 (Position.line_of (#3 e1)),
@@ -332,13 +314,12 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
   let
     (* 1. Get theory information *)
     val thy = Context.theory_of context
-    val ver = mk_version thy
     val thy_name = Context.theory_long_name thy
     val thy_file_path = Theory_Structure.get_theory_file_path thy
     val deps_longname = Theory.parents_of thy |> map Context.theory_long_name
-    val thy_hash = case ver of
-        Ver_Finished t => Theory_Hash.hash_of t
-      | Ver_WIP => Byte.stringToBytes thy_name
+    val thy_hash = if Resources.loaded_theory thy_name
+                   then Theory_Hash.hash_of thy
+                   else Byte.stringToBytes thy_name
 
     (* 2. Extract constants and theorems, filtering infrastructure *)
     val {is_infra_const, is_infra_thm, is_infra_type, is_infra_class, is_infra_locale} =
@@ -347,7 +328,7 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
     val const_entries = Theory_Structure.get_constants_with_positions context
       |> map_filter (fn (name, pos) =>
           if is_infra_const name then NONE
-          else SOME (Constant_Key (name, ver), name, pos))
+          else SOME ((Constant_Key name, thy_name), name, pos))
 
     val raw_thm_entries = Theory_Structure.get_theorems_with_positions context
       |> filter (fn (name, _, _, thm, _) => not (is_infra_thm (name, thm)))
@@ -401,24 +382,24 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
             end)
     val deduped_thm_entries = Thm_Dedup.fold
       (fn (s, (name, pos, thm, _, goal_off, is_global)) => fn acc =>
-        (Theorem_Key (s, ver), name, pos, goal_off, SOME thm, is_global) :: acc)
+        ((Theorem_Key s, thy_name), name, pos, goal_off, SOME thm, is_global) :: acc)
       best_thms []
 
     (* 5. Extract types, classes, and locales *)
     val type_entries = Theory_Structure.get_types_with_positions context
       |> map_filter (fn (name, pos) =>
           if is_infra_type name then NONE
-          else SOME (Type_Key (name, ver), name, pos))
+          else SOME ((Type_Key name, thy_name), name, pos))
 
     val class_entries = Theory_Structure.get_classes_with_positions context
       |> map_filter (fn (name, pos) =>
           if is_infra_class name then NONE
-          else SOME (Class_Key (name, ver), name, pos))
+          else SOME ((Class_Key name, thy_name), name, pos))
 
     val locale_entries = Theory_Structure.get_locales_with_positions context
       |> map_filter (fn (name, pos) =>
           if is_infra_locale name then NONE
-          else SOME (Locale_Key (name, ver), name, pos))
+          else SOME ((Locale_Key name, thy_name), name, pos))
 
     (* 6. Build entries list, sorted by source position. *)
     val ctxt = Context.cases Proof_Context.init_global I context
@@ -427,8 +408,8 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
 
     fun mk_prop_str (key, thm_opt) =
       case (key, thm_opt) of
-        (Theorem_Key _, SOME thm) => pp (Thm.prop_of thm)
-      | (Constant_Key (cname, _), _) =>
+        ((Theorem_Key _, _), SOME thm) => pp (Thm.prop_of thm)
+      | ((Constant_Key cname, _), _) =>
           (let val T = Consts.the_constraint (Sign.consts_of thy) cname
            in pp_typ T end
            handle TYPE _ => "" | ERROR _ => "")
@@ -493,10 +474,10 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
 
     (* 9. Store results *)
     val _ = Synchronized.change STORE_lock (fn () =>
-      (map2 (fn ((key, _, pos, _, is_global, _), pretty) => fn result_opt =>
+      (map2 (fn ((key, _, _, _, is_global, _), pretty) => fn result_opt =>
         case result_opt of
           SOME sem =>
-            let val e = {semantics = sem, pretty_printed = pretty, position = pos}
+            let val e = {semantics = sem, pretty_printed = pretty}
             in if is_global then EntryTab.update STORE (key, e)
                else (case context of
                        Context.Proof ctxt => EntryTab.update (get_local_store ctxt) (key, e)
@@ -509,19 +490,20 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
      (cum_input_tokens, cum_output_tokens, cum_cost_usd))
   end
 
-fun is_wip_key (Constant_Key (_, Ver_WIP)) = true
-  | is_wip_key (Theorem_Key (_, Ver_WIP)) = true
-  | is_wip_key (Type_Key (_, Ver_WIP)) = true
-  | is_wip_key (Class_Key (_, Ver_WIP)) = true
-  | is_wip_key (Locale_Key (_, Ver_WIP)) = true
-  | is_wip_key _ = false
-
 fun clean_wip () =
   Synchronized.change STORE_lock (fn () =>
-    (EntryTab.fold (fn (key, _) => fn keys =>
-        if is_wip_key key then key :: keys else keys) STORE []
-     |> List.app (fn key => EntryTab.delete_safe STORE key);
-     ()))
+    let val cache = Strhashtab.empty 32
+        fun is_loaded name =
+          case Strhashtab.lookup cache name of
+            SOME b => b
+          | NONE => let val b = Resources.loaded_theory name
+                    in Strhashtab.update cache (name, b); b end
+    in
+      EntryTab.fold (fn (key as (_, thy_name), _) => fn keys =>
+          if is_loaded thy_name then keys else key :: keys) STORE []
+      |> List.app (fn key => EntryTab.delete_safe STORE key);
+      ()
+    end)
 
 fun collect_uninterpreted thy =
   let
@@ -565,5 +547,82 @@ fun interpret (context : Context.generic) : unit =
   in
     ()
   end
+
+(* --- Save / Load --- *)
+
+local
+  open MessagePackBinIO.Pack MessagePackBinIO.Unpack
+  infix 3 >>
+
+  fun pack_store_entry (((key', thy_name), {semantics, pretty_printed}) : key * entry) =
+    let
+      fun pack_named tag name =
+        packPair (packInt, packTuple4 (packString, packString, packString, packString))
+          (tag, (name, thy_name, semantics, pretty_printed))
+    in
+      case key' of
+        Constant_Key name => pack_named 0 name
+      | Theorem_Key (lo, hi) =>
+          packPair (packInt, packTuple5 (packWord64, packWord64, packString, packString, packString))
+            (1, (lo, hi, thy_name, semantics, pretty_printed))
+      | Type_Key name => pack_named 2 name
+      | Class_Key name => pack_named 3 name
+      | Locale_Key name => pack_named 4 name
+    end
+
+  val unpack_store_entry : (key * entry) unpacker =
+    unpackPair_dep' unpackInt (fn tag =>
+      let fun mk mk_key' (name, thy_name, s, p) =
+            ((mk_key' name, thy_name), {semantics = s, pretty_printed = p})
+      in case tag of
+        1 => unpackTuple5 (unpackWord64, unpackWord64, unpackString, unpackString, unpackString)
+             >> (fn (lo, hi, thy_name, s, p) =>
+                   ((Theorem_Key (lo, hi), thy_name), {semantics = s, pretty_printed = p}))
+      | _ => unpackTuple4 (unpackString, unpackString, unpackString, unpackString)
+             >> (fn args => mk (case tag of
+                       0 => Constant_Key | 2 => Type_Key
+                     | 3 => Class_Key | 4 => Locale_Key
+                     | _ => raise Unpack) args)
+      end)
+in
+
+fun save_store path =
+  File_Stream.open_output (fn stream =>
+    let val cout = BinIO.getOutstream stream
+    in Synchronized.change STORE_lock (fn () =>
+      let
+        val entry_list = EntryTab.fold (fn (key, entry) => fn acc =>
+          (key, entry) :: acc) STORE []
+        val interpreted_names = Strhashtab.fold (fn (name, ()) => fn acc =>
+          name :: acc) INTERPRETED []
+      in
+        doPack (packPair (packList packString, packList pack_store_entry))
+          (interpreted_names, entry_list) cout;
+        tracing ("[Semantic_Store] saved " ^ Int.toString (length entry_list) ^
+                 " entries, " ^ Int.toString (length interpreted_names) ^
+                 " interpreted theories to " ^ Path.print path);
+        ()
+      end)
+    end) path
+
+fun load_store path =
+  let
+    val (interpreted_names, entries) = File_Stream.open_input (fn stream =>
+      let val cin = BinIO.getInstream stream
+          val (result, _) = doUnpack
+            (unpackPair (unpackList unpackString,
+                         unpackList unpack_store_entry)) cin
+      in result end) path
+  in
+    Synchronized.change STORE_lock (fn () =>
+      (List.app (fn (key, e) => EntryTab.update STORE (key, e)) entries;
+       List.app (fn name => Strhashtab.update INTERPRETED (name, ())) interpreted_names;
+       ()));
+    tracing ("[Semantic_Store] loaded " ^ Int.toString (length entries) ^
+             " entries, " ^ Int.toString (length interpreted_names) ^
+             " interpreted theories from " ^ Path.print path)
+  end
+
+end (*local save/load*)
 
 end

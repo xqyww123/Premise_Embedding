@@ -2,7 +2,7 @@ theory Semantic_Embedding
   imports Main Isabelle_RPC.Remote_Procedure_Calling
 begin
 
-(* declare [[ML_debugger]] *)
+(* declare [[ML_debugger]] *) 
 
 ML_file \<open>Tools/theory_structure.ML\<close>
 ML_file \<open>Tools/theory_hash.ML\<close>
@@ -13,13 +13,28 @@ ML_file \<open>Tools/Sledgehammer/sledgehammer_embedding_ctxt.ML\<close>
 ML_file \<open>Tools/infra_filter.ML\<close>
 ML_file \<open>Tools/semantic_store.ML\<close>
 
+(* 
+ML \<open>Semantic_Store.load_store (Path.explode "/tmp/xxx.mpl")\<close>
+ML \<open>Semantic_Store.interpret  (Context.Theory @{theory List})\<close>
+ML \<open>Semantic_Store.save_store (Path.explode "/tmp/xxx2.mpl")\<close>
+ *)
 
+(* ML \<open>Semantic_Store.interpret  (Context.Theory @{theory List})\<close> *)
 (*
+ML_file \<open>Tools/test_word64_to_bytes.ML\<close>
+
+ML \<open>Semantic_Store.save_store (Path.explode "/tmp/xxx2.mpl")\<close>
+
+
+ML \<open>Byte.stringToBytes\<close>
+ML \<open>Word.PackWord32Little\<close>
+
+
 ML \<open>map (Context.theory_name {long=true})
   [@{theory Pure}, @{theory Code_Generator}, @{theory Code_Evaluation}]\<close>
        
 ML \<open>Theory_Hash.hash_of @{theory String}\<close>
-ML \<open>Semantic_Store.interpret  (Context.Theory @{theory Main})\<close>
+ML \<open>Semantic_Store.interpret  (Context.Theory @{theory List})\<close>
 
 ML \<open> @{thm append1_eq_conv}
   |> Thm.derivation_id\<close>
