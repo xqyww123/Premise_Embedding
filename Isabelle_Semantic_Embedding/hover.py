@@ -5,7 +5,6 @@ Calls into Isabelle/ML which delegates to Scala. The Scala side tries the live
 PIDE runtime first, then falls back to session export databases.
 """
 
-import logging
 import os
 from typing import Any, Optional
 
@@ -14,8 +13,6 @@ from Isabelle_RPC_Host.position import AsciiPosition, UnicodePosition, IsabelleP
 from claude_agent_sdk import SdkMcpTool, tool
 
 from .base import ToolCall_ret, mk_ret as _mk_ret
-
-_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -107,63 +104,73 @@ def _resolve_thy_path(file: str) -> str:
 
 
 def mk_definition_tool(connection: Connection, unicode: bool = False) -> SdkMcpTool[Any]:
+    log = connection.server.logger.getChild("hover")
     @tool(
         "definition",
         "Go to the definition of the symbol at a given source position.",
         input_schema=_position_schema,
     )
     async def definition_tool(args: dict[str, Any]) -> ToolCall_ret:
-        _log.info("definition: %s:%d:%d", args.get("file"), args.get("line"), args.get("column"))
-        err = _validate_position_args(args)
-        if err is not None:
-            _log.warning("definition: validation error: %s", err)
-            return _mk_ret(err, is_error=True)
-        thy_path = _resolve_thy_path(args["file"])
-        if unicode:
-            isa_pos = UnicodePosition(args["line"], args["column"], thy_path).to_isabelle_position()
-        else:
-            isa_pos = AsciiPosition(args["line"], args["column"], thy_path).to_isabelle_position()
-        result = goto_definition(isa_pos, connection)
-        if result is None:
-            _log.info("definition: not found")
-            return _mk_ret("No definition found at this position.")
-        def_file, def_line, def_offset, def_end_offset = result
-        def_isa = IsabellePosition(def_line, def_offset, def_file)
-        if unicode:
-            from .theory_structure import mk_unicode_file
-            out = def_isa.to_unicode_position()
-            out_file = mk_unicode_file(out.file)
-        else:
-            out = def_isa.to_ascii_position()
-            out_file = out.file
-        ret = f"{out_file}:{out.line}:{out.column}"
-        _log.info("definition: -> %s", ret)
-        return _mk_ret(ret)
+        try:
+            log.debug("definition: %s:%d:%d", args.get("file"), args.get("line"), args.get("column"))
+            err = _validate_position_args(args)
+            if err is not None:
+                log.warning("definition: validation error: %s", err)
+                return _mk_ret(err, is_error=True)
+            thy_path = _resolve_thy_path(args["file"])
+            if unicode:
+                isa_pos = UnicodePosition(args["line"], args["column"], thy_path).to_isabelle_position()
+            else:
+                isa_pos = AsciiPosition(args["line"], args["column"], thy_path).to_isabelle_position()
+            result = goto_definition(isa_pos, connection)
+            if result is None:
+                log.debug("definition: not found")
+                return _mk_ret("No definition found at this position.")
+            def_file, def_line, def_offset, def_end_offset = result
+            def_isa = IsabellePosition(def_line, def_offset, def_file)
+            if unicode:
+                from .theory_structure import mk_unicode_file
+                out = def_isa.to_unicode_position()
+                out_file = mk_unicode_file(out.file)
+            else:
+                out = def_isa.to_ascii_position()
+                out_file = out.file
+            ret = f"{out_file}:{out.line}:{out.column}"
+            log.debug("definition: -> %s", ret)
+            return _mk_ret(ret)
+        except Exception:
+            log.exception("definition: error")
+            raise
     return definition_tool
 
 
 def mk_hover_tool(connection: Connection, unicode: bool = False) -> SdkMcpTool[Any]:
+    log = connection.server.logger.getChild("hover")
     @tool(
         "hover",
         "Get hover information for the symbol at a given source position.",
         input_schema=_position_schema,
     )
     async def hover_tool(args: dict[str, Any]) -> ToolCall_ret:
-        _log.info("hover: %s:%d:%d", args.get("file"), args.get("line"), args.get("column"))
-        err = _validate_position_args(args)
-        if err is not None:
-            _log.warning("hover: validation error: %s", err)
-            return _mk_ret(err, is_error=True)
-        thy_path = _resolve_thy_path(args["file"])
-        if unicode:
-            isa_pos = UnicodePosition(args["line"], args["column"], thy_path).to_isabelle_position()
-        else:
-            isa_pos = AsciiPosition(args["line"], args["column"], thy_path).to_isabelle_position()
-        result = hover_message(isa_pos, connection)
-        if result is None:
-            _log.info("hover: not found")
-            return _mk_ret("No hover information at this position.")
-        _log.info("hover: -> %s", result[:80])
-        return _mk_ret(result)
+        try:
+            log.debug("hover: %s:%d:%d", args.get("file"), args.get("line"), args.get("column"))
+            err = _validate_position_args(args)
+            if err is not None:
+                log.warning("hover: validation error: %s", err)
+                return _mk_ret(err, is_error=True)
+            thy_path = _resolve_thy_path(args["file"])
+            if unicode:
+                isa_pos = UnicodePosition(args["line"], args["column"], thy_path).to_isabelle_position()
+            else:
+                isa_pos = AsciiPosition(args["line"], args["column"], thy_path).to_isabelle_position()
+            result = hover_message(isa_pos, connection)
+            if result is None:
+                log.debug("hover: not found")
+                return _mk_ret("No hover information at this position.")
+            log.debug("hover: -> %s", result[:80])
+            return _mk_ret(result)
+        except Exception:
+            log.exception("hover: error")
+            raise
     return hover_tool
 

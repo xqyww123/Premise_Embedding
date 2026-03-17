@@ -91,17 +91,36 @@ class InterpretationTask:
             key = _cache_key(self.file_hash, self.orig_kinds[orig_idx], self.orig_names[orig_idx])
             self._db[key] = sem.encode("utf-8")
 
-    def write_cost(self) -> None:
-        """Write the total cost record to the RocksDB cache."""
+    def historical_cost(self) -> tuple[int, int, float]:
+        """Read cumulative cost from RocksDB (without modifying it)."""
+        import json
         if self._db is not None:
-            import json
+            raw = self._db.get(self.file_hash + b"\xff:cost")
+            if raw is not None:
+                prev = json.loads(raw.decode("utf-8"))
+                return (prev.get("input_tokens", 0),
+                        prev.get("output_tokens", 0),
+                        prev.get("cost_usd", 0.0))
+        return (0, 0, 0.0)
+
+    def write_cost(self) -> tuple[int, int, float]:
+        """Accumulate cost into the RocksDB cache. Returns updated cumulative totals."""
+        import json
+        prev_in, prev_out, prev_cost = self.historical_cost()
+        total = (prev_in + self.total_input_tokens,
+                 prev_out + self.total_output_tokens,
+                 prev_cost + self.total_cost_usd)
+        if self._db is not None:
             key = self.file_hash + b"\xff:cost"
-            value = json.dumps({
-                "input_tokens": self.total_input_tokens,
-                "output_tokens": self.total_output_tokens,
-                "cost_usd": self.total_cost_usd,
-            })
-            self._db[key] = value.encode("utf-8")
+            self._db[key] = json.dumps({
+                "input_tokens": total[0],
+                "output_tokens": total[1],
+                "cost_usd": total[2],
+            }).encode("utf-8")
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_cost_usd = 0.0
+        return total
 
     def advance_batch(self) -> str | None:
         self.current_batch += 1
@@ -127,16 +146,17 @@ class InterpretationTask:
         entries_text = self.format_entries(indices)
 
         if indices.start != 0:
-            return pretty_unicode(
+            return (
                 f"Continue to translate the following entities into concise plain English. "
                 f"State only what the entity defines or asserts. "
-                f"Do NOT explain how it is derived, why it is useful, or add any "
-                f"information beyond the formal statement.\n\n"
+                f"Do NOT explain how it is derived or why it is useful. "
+                f"The formal statement is already shown; describe its meaning rather than transcribing it. "
+                f"Prefer plain English over formulas. Wrap formulas in backticks (e.g., `x`, `x + 1`).\n\n"
                 f"Entries:\n{entries_text}\n\n"
                 f"Submit translations via `mcp__isabelle_semantics__answer`."
             )
 
-        return pretty_unicode(f"""\
+        return f"""\
 Informalize the following entities from Isabelle theory "{theory_longname}" (location: {file_path})
 
 Entries:
@@ -146,19 +166,25 @@ Line numbers in brackets (e.g. [line 42]) indicate where each entity appears in 
 
 For each entry, translate the formal statement into a concise plain-English description (1\u20133 sentences). \
 State only what the entity defines or asserts. \
-Do NOT explain how it is derived, why it is useful, or add any information beyond the formal statement.
+Do NOT explain how it is derived or why it is useful. \
+The formal statement is already shown; describe its meaning rather than transcribing it. \
+Prefer plain English over formulas. Wrap formulas in backticks (e.g., `x`, `x + 1`).
 
 Examples of good translations:
 - constant Nat.add: The addition function on natural numbers, taking two natural numbers and returning their sum.
-- lemma List.length_append: For any two lists xs and ys, the length of their concatenation equals the sum of their lengths \u2014 length (xs ++ ys) = length xs + length ys.
+- lemma List.length_append: The length of the concatenation of two lists equals the sum of their individual lengths.
+- lemma List.map_comp: Mapping `f` then `g` over a list is the same as mapping their composition `g \u2218 f`.
 - type Prod: The product type, consisting of a pair of two values of possibly different types.
+
+Translation hints:
+- Suc n \u2192 "the successor of n" or "n + 1"
 
 When you encounter an entity whose meaning is unclear, use `mcp__isabelle_semantics__query_by_name`, \
 `mcp__isabelle_semantics__query_by_position`, `mcp__isabelle_semantics__hover`, or \
 `mcp__isabelle_semantics__definition` to look it up before translating. \
 However, you cannot query entries you have been asked to translate \u2014 do it yourself.
 
-Submit all translations via `mcp__isabelle_semantics__answer` for each entry.""")
+Submit all translations via `mcp__isabelle_semantics__answer` for each entry."""
 
 class _LocalState(threading.local):
     task: InterpretationTask
@@ -206,7 +232,7 @@ _answer_schema = {
                 },
                 "required": ["type", "name", "translation"],
             },
-            "description": "List of semantic interpretations to submit.",
+            "description": "List of English translations to submit.",
         },
     },
     "required": ["interpretations"],
@@ -215,8 +241,9 @@ _answer_schema = {
 
 @tool(
     "answer",
-    "Submit semantic interpretations for one or more of the listed entries. "
-    "Each translation should be a concise plain-English description of what the entity defines or asserts.",
+    "Submit English translations for one or more of the listed entries. "
+    "Each translation should be a concise plain-English description of what the entity defines or asserts. "
+    "You may also resubmit an entry to correct a previous answer.",
     input_schema=_answer_schema,
 )
 async def _answer_tool(args: dict[str, Any]) -> ToolCall_ret:
@@ -236,16 +263,16 @@ async def _answer_tool(args: dict[str, Any]) -> ToolCall_ret:
     batch_remaining = sum(1 for i in task.batch_range if task.results[task._keys[i]] is None)
     cs = "" if count == 1 else "s"
     total_answered = sum(1 for v in task.results.values() if v is not None)
-    _log.info("answer: submitted %d, batch_remaining %d, %d/%d done, cost so far: $%.4f",
-               count, batch_remaining, total_answered, len(task.results), task.total_cost_usd)
+    _log.info("answer: submitted %d, batch_remaining %d, %d/%d done",
+               count, batch_remaining, total_answered, len(task.results))
     if batch_remaining == 0:
         next_prompt = task.advance_batch()
         if next_prompt is None:
             msg = "All done! Stop immediately without any further output."
         else:
-            msg = f"Good job! {next_prompt}"
+            msg = f"Good job! You can resubmit corrections later using the `mcp__isabelle_semantics__answer` tool if needed.\n\n{next_prompt}"
     else:
-        msg = f"Answered {count} interpretation{cs}, remaining {batch_remaining} in this batch."
+        msg = f"Answered {count} translation{cs}, remaining {batch_remaining} in this batch."
     if errors:
         msg += "\nErrors:\n" + "\n".join(errors)
     return _mk_ret(msg)
@@ -370,26 +397,29 @@ async def _run_agent(options: ClaudeAgentOptions) -> None:
 
 @isabelle_remote_procedure("Semantic_Store.interpret_file")
 def interpret_file(arg: Any, connection: Connection) -> list[str | None]:
-    if len(arg) == 5:
-        (file_path, theory_longname, deps_longname, raw_entries, context_info) = arg
-    else:
-        (file_path, theory_longname, deps_longname, raw_entries) = arg
-        context_info = ""
+    (file_path, theory_longname, thy_hash, deps_longname, raw_entries, context_info) = arg
+    file_hash = bytes(thy_hash)
     kinds = [kind for (kind, _, _, _) in raw_entries]
-    prop_strs = [prop for (_, _, prop, _) in raw_entries]
+    prop_strs = [pretty_unicode(prop) for (_, _, prop, _) in raw_entries]
     line_numbers = [lineno for (_, _, _, lineno) in raw_entries]
-    names = [name for (_, name, _, _) in raw_entries]
+    names = [pretty_unicode(name) for (_, name, _, _) in raw_entries]
     n = len(names)
+
+    # Build Unicode pretty-prints for all entries
+    pretty_prints = []
+    for i in range(n):
+        label = _KIND_PROMPT_LABELS.get(kinds[i], "unknown")
+        pp = f"{label} {names[i]}"
+        if prop_strs[i]:
+            pp += f": {prop_strs[i]}"
+        pretty_prints.append(pp)
+
     # Inherit RPC server's logging configuration (idempotent, no race)
     if not _log.handlers and connection.server.logger.handlers:
         for h in connection.server.logger.handlers:
             _log.addHandler(h)
         _log.setLevel(connection.server.logger.level)
     _log.info("interpret_file: %s (%s), %d entries", theory_longname, file_path, n)
-
-    # Compute file content hash
-    with open(file_path, "rb") as f:
-        file_hash = xxhash.xxh128(f.read()).digest()
 
     # Check cache
     results: dict[int, str] = {}
@@ -401,6 +431,12 @@ def interpret_file(arg: Any, connection: Connection) -> list[str | None]:
 
     uncached = [i for i in range(n) if i not in results]
     _log.info("interpret_file: %d cached, %d to interpret", len(results), len(uncached))
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_cost_usd = 0.0
+    cum_input_tokens = 0
+    cum_output_tokens = 0
+    cum_cost_usd = 0.0
 
     if uncached:
         from .hover import mk_definition_tool, mk_hover_tool
@@ -456,11 +492,28 @@ def interpret_file(arg: Any, connection: Connection) -> list[str | None]:
             answered = sum(1 for v in task.results.values() if v is not None)
             _log.info("interpret_file: agent finished, %d/%d interpreted",
                        answered, len(task.names))
-            task.write_cost()
+            cum_input, cum_output, cum_cost = task.write_cost()
+            total_input_tokens = task.total_input_tokens
+            total_output_tokens = task.total_output_tokens
+            total_cost_usd = task.total_cost_usd
+            cum_input_tokens = cum_input
+            cum_output_tokens = cum_output
+            cum_cost_usd = cum_cost
 
             # Remap agent results to original indices (cache already written incrementally)
             for i, sem in enumerate(task.results.values()):
                 if sem is not None:
                     results[uncached[i]] = sem
+    else:
+        # All cached — read cumulative cost from DB
+        with InterpretationTask(
+            connection, file_path,
+            names=[], kinds=[], prop_strs=[], line_numbers=[],
+            file_hash=file_hash, orig_names=names, orig_kinds=kinds, uncached=[],
+        ) as task:
+            cum_input_tokens, cum_output_tokens, cum_cost_usd = task.historical_cost()
 
-    return [results.get(i) for i in range(n)]
+    return ([results.get(i) for i in range(n)],
+            pretty_prints,
+            (total_input_tokens, total_output_tokens, total_cost_usd),
+            (cum_input_tokens, cum_output_tokens, cum_cost_usd))

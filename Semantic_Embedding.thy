@@ -1,10 +1,8 @@
 theory Semantic_Embedding
-  imports Isabelle_RPC.Remote_Procedure_Calling Performant_Isabelle_ML.Performant_Isabelle_ML
+  imports Main Isabelle_RPC.Remote_Procedure_Calling
 begin
 
-declare [[ML_debugger, ML_exception_debugger, ML_exception_trace, ML_print_depth=1000]]
-
-ML \<open>Context.theory_id @{theory}\<close>
+(* declare [[ML_debugger]] *)
 
 ML_file \<open>Tools/theory_structure.ML\<close>
 ML_file \<open>Tools/theory_hash.ML\<close>
@@ -14,10 +12,37 @@ ML_file \<open>Tools/Sledgehammer/sledgehammer_embedding_ctxt.ML\<close>
 (* ML_file \<open>Tools/term_serial_index.ML\<close> *)
 ML_file \<open>Tools/infra_filter.ML\<close>
 ML_file \<open>Tools/semantic_store.ML\<close>
-  
 
-ML \<open>Semantic_Store.interpret (Context.Theory @{theory List})\<close>
 
+(*
+ML \<open>map (Context.theory_name {long=true})
+  [@{theory Pure}, @{theory Code_Generator}, @{theory Code_Evaluation}]\<close>
+       
+ML \<open>Theory_Hash.hash_of @{theory String}\<close>
+ML \<open>Semantic_Store.interpret  (Context.Theory @{theory Main})\<close>
+
+ML \<open> @{thm append1_eq_conv}
+  |> Thm.derivation_id\<close>
+
+ML \<open>
+#query_class (Semantic_Store.make_query_functions (Context.Theory @{theory}) [] true)
+  "Groups.monoid_add" |> the |> tracing
+\<close>  
+ML \<open>
+#query_constant (Semantic_Store.make_query_functions (Context.Theory @{theory}) [] true)
+  "Cons" |> the |> tracing
+\<close>
+ML \<open> 
+#query_theorem (Semantic_Store.make_query_functions (Context.Theory @{theory}) [] true)
+  "Set.UNIV_I" |> the |> tracing
+\<close>
+term Nil
+thm append1_eq_conv
+typ "'a :: monoid_add"
+term Bit_Operations.semiring_modulo_trivial
+term Bit_Operations.semiring_modulo_trivial
+
+thm List.List.list.pred_True
 
 ML \<open>Thm.derivation_id\<close>
 ML \<open>Word.fromLargeWord\<close>
@@ -40,8 +65,6 @@ end
 ML \<open>\<close>
 
 
-
-(*
 ML \<open>Context.theory_id @{theory}\<close>
 
 term \<open>\<lambda>x'. x' \<and> True\<close>
@@ -104,6 +127,11 @@ text \<open>Tes t
 ML \<open>Symbol_Pos.explode ("\005\006asdsa\<alpha>", Position.none)\<close>
 
 
+ 
+ML \<open>val old_tracing = !Private_Output.tracing_fn\<close>
+ML \<open>Private_Output.tracing_fn := (fn x => old_tracing ("aaa" :: x))\<close>
+
+ML \<open>tracing "asd"\<close>
 
 
 ML "PIDE_State.get_session_databases ()"
