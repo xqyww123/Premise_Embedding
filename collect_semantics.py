@@ -36,7 +36,7 @@ time.sleep(1)
 import sys
 
 # Connect to pre-running Isa-REPL server
-c = Client(args.repl_addr, args.session, timeout=120)
+c = Client(args.repl_addr, args.session, timeout=None)
 print("Loading theories...", flush=True)
 fullnames = c.load_theory([args.theory, "Semantic_Embedding.Semantic_Collection_App"])
 print(f"Loaded: {fullnames}", flush=True)
@@ -48,7 +48,7 @@ mp.pack(args.theory, c.cout)
 c.cout.flush()
 
 # Read and print tracing messages until done
-c.sock.settimeout(600)  # 10 min timeout for interpretation
+#c.sock.settimeout(600)  # 10 min timeout for interpretation
 has_error = False
 try:
     while True:
