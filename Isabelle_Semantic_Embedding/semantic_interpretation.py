@@ -6,11 +6,11 @@ import asyncio
 import logging
 import os
 import threading
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
-import platformdirs
-import xxhash
+import lmdb
 from Isabelle_RPC_Host import Connection, isabelle_remote_procedure
+from Isabelle_RPC_Host.universal_key import universal_key
 from Isabelle_RPC_Host.unicode import pretty_unicode
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -26,17 +26,16 @@ from claude_agent_sdk.types import (
     PreToolUseHookInput,
     ResultMessage,
 )
-from rocksdict import Options, Rdict
 
 from .base import ToolCall_ret, mk_ret as _mk_ret
 
 # --- Thread-local state ---
 
-_KIND_CONSTANT = 0
-_KIND_THEOREM = 1
-_KIND_TYPE = 2
-_KIND_CLASS = 3
-_KIND_LOCALE = 4
+_KIND_CONSTANT = 1
+_KIND_THEOREM = 2
+_KIND_TYPE = 3
+_KIND_CLASS = 4
+_KIND_LOCALE = 5
 _KIND_PROMPT_LABELS = {
     _KIND_CONSTANT: "constant",
     _KIND_THEOREM: "lemma",
@@ -46,37 +45,64 @@ _KIND_PROMPT_LABELS = {
 }
 _BATCH_SIZE = 20
 
+
+def _pretty_print_entry(e: Entry) -> str:
+    label = _KIND_PROMPT_LABELS.get(e.kind, "unknown")
+    pp = f"{label} {e.name}"
+    if e.prop_str:
+        pp += f": {e.prop_str}"
+    return pp
+
+
+class Entry(NamedTuple):
+    """A single entity to interpret."""
+    kind: int            # _KIND_CONSTANT, _KIND_THEOREM, etc.
+    name: str            # fully qualified name (Unicode)
+    prop_str: str        # printed proposition / type signature (Unicode)
+    line_number: int     # source line (-1 if unavailable)
+    universal_key: universal_key
+
+
+class CostSummary(NamedTuple):
+    """Token usage and dollar cost for an interpretation run."""
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+
+
+class InterpretationResult(NamedTuple):
+    """Result of interpreting a theory file."""
+    interpretations: list[str | None]   # per-entry semantic interpretation (None if unanswered)
+    pretty_prints: list[str]            # per-entry Unicode pretty-print
+    current_cost: CostSummary           # cost incurred in this call
+    cumulative_cost: CostSummary        # total cost including historical
+
+
 class InterpretationTask:
     def __init__(self, connection: Connection, file_path: str,
-                 names: list[str], kinds: list[int],
-                 prop_strs: list[str], line_numbers: list[int],
-                 file_hash: bytes, orig_names: list[str],
-                 orig_kinds: list[int], uncached: list[int]):
+                 theory_longname: str, theory_key: universal_key,
+                 entries: list[Entry]):
         self.connection = connection
         self.file_path = file_path
-        self.names = names
-        self.kinds = kinds
-        self.prop_strs = prop_strs
-        self.line_numbers = line_numbers
-        self.file_hash = file_hash
-        self.orig_names = orig_names
-        self.orig_kinds = orig_kinds
-        self.uncached = uncached
+        self.theory_longname = theory_longname
+        self.theory_key = theory_key
+        self.entries = entries
         self.results: dict[str, str | None] = {
-            f"{_KIND_PROMPT_LABELS[kinds[i]]} {names[i]}": None
-            for i in range(len(names))
+            f"{_KIND_PROMPT_LABELS[e.kind]} {e.name}": None
+            for e in entries
         }
         self._keys = list(self.results.keys())
         self.batches: list[tuple[str, range]] = []
         self.current_batch: int = 0
         self.batch_range: range = range(0)
-        self._db: Rdict | None = None
+        self._db: lmdb.Environment | None = None
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.total_cost_usd = 0.0
 
     def __enter__(self) -> InterpretationTask:
-        self._db = _open_cache()
+        from .semantics import open_semantic_store
+        self._db = open_semantic_store()
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -85,38 +111,53 @@ class InterpretationTask:
             self._db = None
 
     def write_answer(self, task_idx: int, sem: str) -> None:
-        """Write a single answer to the RocksDB cache."""
+        """Write a single answer to the LMDB store."""
+        import msgpack
         if self._db is not None:
-            orig_idx = self.uncached[task_idx]
-            key = _cache_key(self.file_hash, self.orig_kinds[orig_idx], self.orig_names[orig_idx])
-            self._db[key] = sem.encode("utf-8")
+            entry = self.entries[task_idx]
+            pp = _pretty_print_entry(entry)
+            packed: bytes = msgpack.packb((pp, sem))  # type: ignore[assignment]
+            with self._db.begin(write=True) as txn:
+                txn.put(entry.universal_key, packed)
 
     def historical_cost(self) -> tuple[int, int, float]:
-        """Read cumulative cost from RocksDB (without modifying it)."""
-        import json
-        if self._db is not None:
-            raw = self._db.get(self.file_hash + b"\xff:cost")
-            if raw is not None:
-                prev = json.loads(raw.decode("utf-8"))
-                return (prev.get("input_tokens", 0),
-                        prev.get("output_tokens", 0),
-                        prev.get("cost_usd", 0.0))
-        return (0, 0, 0.0)
+        """Read cumulative cost from LMDB (without modifying it)."""
+        import msgpack
+        if self._db is None:
+            raise RuntimeError("InterpretationTask is not opened")
+        with self._db.begin() as txn:
+            raw = txn.get(self.theory_key)
+        if raw is None:
+            return (0, 0, 0.0)
+        prev = msgpack.unpackb(raw)
+        return (prev.get(b"input_tokens", 0),
+                prev.get(b"output_tokens", 0),
+                prev.get(b"cost_usd", 0.0))
 
     def write_cost(self) -> tuple[int, int, float]:
-        """Accumulate cost into the RocksDB cache. Returns updated cumulative totals."""
-        import json
-        prev_in, prev_out, prev_cost = self.historical_cost()
-        total = (prev_in + self.total_input_tokens,
-                 prev_out + self.total_output_tokens,
-                 prev_cost + self.total_cost_usd)
-        if self._db is not None:
-            key = self.file_hash + b"\xff:cost"
-            self._db[key] = json.dumps({
+        """Accumulate cost into the LMDB store. Returns updated cumulative totals."""
+        import msgpack
+        if self._db is None:
+            raise RuntimeError("InterpretationTask is not opened")
+        with self._db.begin(write=True) as txn:
+            raw = txn.get(self.theory_key)
+            prev_in, prev_out, prev_cost, finished = 0, 0, 0.0, False
+            if raw is not None:
+                prev = msgpack.unpackb(raw)
+                prev_in = prev.get(b"input_tokens", 0)
+                prev_out = prev.get(b"output_tokens", 0)
+                prev_cost = prev.get(b"cost_usd", 0.0)
+                finished = prev.get(b"finished", False)
+            total = (prev_in + self.total_input_tokens,
+                     prev_out + self.total_output_tokens,
+                     prev_cost + self.total_cost_usd)
+            packed: bytes = msgpack.packb({  # type: ignore[assignment]
                 "input_tokens": total[0],
                 "output_tokens": total[1],
                 "cost_usd": total[2],
-            }).encode("utf-8")
+                "finished": finished,
+            })
+            txn.put(self.theory_key, packed)
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.total_cost_usd = 0.0
@@ -132,17 +173,17 @@ class InterpretationTask:
     def format_entries(self, indices: range) -> str:
         lines = []
         for i in indices:
-            label = _KIND_PROMPT_LABELS.get(self.kinds[i], "unknown")
-            lineno = self.line_numbers[i]
-            line = (f"  [line {lineno}] " if lineno > 0 else "  ") + f"{label} {self.names[i]}"
-            if self.prop_strs[i]:
-                line += f": {self.prop_strs[i]}"
+            e = self.entries[i]
+            label = _KIND_PROMPT_LABELS.get(e.kind, "unknown")
+            line = (f"  [line {e.line_number}] " if e.line_number > 0 else "  ") + f"{label} {e.name}"
+            if e.prop_str:
+                line += f": {e.prop_str}"
             lines.append(line)
         return "\n".join(lines)
 
     def build_prompt(self, file_path: str, theory_longname: str, indices: range | None = None) -> str:
         if indices is None:
-            indices = range(len(self.names))
+            indices = range(len(self.entries))
         entries_text = self.format_entries(indices)
 
         if indices.start != 0:
@@ -190,18 +231,6 @@ class _LocalState(threading.local):
     task: InterpretationTask
 
 _local = _LocalState()
-
-
-# --- Persistent cache ---
-
-def _open_cache() -> Rdict:
-    cache_dir = platformdirs.user_cache_dir("Isabelle_Semantic_Embedding", "Qiyuan")
-    os.makedirs(cache_dir, exist_ok=True)
-    return Rdict(os.path.join(cache_dir, "semantics.db"),
-                 options=Options(raw_mode=True))
-
-def _cache_key(file_hash: bytes, kind: int, name: str) -> bytes:
-    return file_hash + kind.to_bytes(1, "little") + b":" + name.encode("utf-8")
 
 
 _log = logging.getLogger(__name__)
@@ -393,26 +422,36 @@ async def _run_agent(options: ClaudeAgentOptions) -> None:
                task.total_input_tokens, task.total_output_tokens, task.total_cost_usd)
 
 
-# --- RPC procedure ---
+# --- Public API ---
 
-@isabelle_remote_procedure("Semantic_Store.interpret_file")
-def interpret_file(arg: Any, connection: Connection) -> list[str | None]:
-    (file_path, theory_longname, thy_hash, deps_longname, raw_entries, context_info) = arg
-    file_hash = bytes(thy_hash)
-    kinds = [kind for (kind, _, _, _) in raw_entries]
-    prop_strs = [pretty_unicode(prop) for (_, _, prop, _) in raw_entries]
-    line_numbers = [lineno for (_, _, _, lineno) in raw_entries]
-    names = [pretty_unicode(name) for (_, name, _, _) in raw_entries]
-    n = len(names)
+def interpret_file(
+    connection: Connection,
+    file_path: str,
+    theory_longname: str,
+    theory_key: universal_key,
+    entries: list[Entry],
+) -> InterpretationResult:
+    """Interpret entities from an Isabelle theory file.
+
+    Looks up cached interpretations in LMDB. For uncached entries, launches
+    a Claude agent to generate plain-English translations.
+
+    Args:
+        connection: Active Isabelle RPC connection.
+        file_path: Path to the theory source file.
+        theory_longname: Fully qualified theory name (e.g. "HOL.List").
+        theory_key: Universal key for the theory (used for cost tracking).
+        entries: Entities to interpret, each with kind, name, prop_str,
+            line_number, and universal_key.
+
+    Returns:
+        InterpretationResult with per-entry interpretations, pretty-prints,
+        and cost summaries (current run + cumulative).
+    """
+    n = len(entries)
 
     # Build Unicode pretty-prints for all entries
-    pretty_prints = []
-    for i in range(n):
-        label = _KIND_PROMPT_LABELS.get(kinds[i], "unknown")
-        pp = f"{label} {names[i]}"
-        if prop_strs[i]:
-            pp += f": {prop_strs[i]}"
-        pretty_prints.append(pp)
+    pretty_prints = [_pretty_print_entry(e) for e in entries]
 
     # Inherit RPC server's logging configuration (idempotent, no race)
     if not _log.handlers and connection.server.logger.handlers:
@@ -421,16 +460,21 @@ def interpret_file(arg: Any, connection: Connection) -> list[str | None]:
         _log.setLevel(connection.server.logger.level)
     _log.info("interpret_file: %s (%s), %d entries", theory_longname, file_path, n)
 
-    # Check cache
-    results: dict[int, str] = {}
-    with _open_cache() as db:
-        for i, name in enumerate(names):
-            v = db.get(_cache_key(file_hash, kinds[i], name))
+    # Check LMDB cache
+    import msgpack
+    from .semantics import open_semantic_store
+    results: list[str | None] = [None] * n
+    env = open_semantic_store()
+    with env.begin() as txn:
+        for i, e in enumerate(entries):
+            v = txn.get(e.universal_key)
             if v is not None:
-                results[i] = v.decode("utf-8")
+                _, sem = msgpack.unpackb(v)
+                results[i] = sem.decode() if isinstance(sem, bytes) else sem
+    env.close()
 
-    uncached = [i for i in range(n) if i not in results]
-    _log.info("interpret_file: %d cached, %d to interpret", len(results), len(uncached))
+    uncached = [i for i, r in enumerate(results) if r is None]
+    _log.info("interpret_file: %d cached, %d to interpret", n - len(uncached), len(uncached))
     total_input_tokens = 0
     total_output_tokens = 0
     total_cost_usd = 0.0
@@ -446,18 +490,12 @@ def interpret_file(arg: Any, connection: Connection) -> list[str | None]:
         unicode_file_path = mk_unicode_file(file_path)
 
         with InterpretationTask(
-            connection, file_path,
-            names=[names[i] for i in uncached],
-            kinds=[kinds[i] for i in uncached],
-            prop_strs=[prop_strs[i] for i in uncached],
-            line_numbers=[line_numbers[i] for i in uncached],
-            file_hash=file_hash,
-            orig_names=names,
-            orig_kinds=kinds,
-            uncached=uncached,
+            connection, file_path, theory_longname, theory_key,
+            entries=[entries[i] for i in uncached],
         ) as task:
             _local.task = task
-            m = len(task.names)
+
+            m = len(task.entries)
 
             for start in range(0, m, _BATCH_SIZE):
                 batch_range = range(start, min(start + _BATCH_SIZE, m))
@@ -466,9 +504,11 @@ def interpret_file(arg: Any, connection: Connection) -> list[str | None]:
                     batch_range,
                 ))
 
-            query_by_name_tool = mk_query_by_name_tool(connection, task.names)
+            working_names = [e.name for e in task.entries]
+            query_by_name_tool = mk_query_by_name_tool(
+                connection, task._db, working_names) # type: ignore
             query_by_position_tool = mk_query_by_position_tool(
-                connection, task.names, unicode=True)
+                connection, task._db, working_names, unicode=True) # type: ignore
             definition_tool = mk_definition_tool(connection, unicode=True)
             hover_tool = mk_hover_tool(connection, unicode=True)
             mcp = create_sdk_mcp_server("isabelle_semantics", tools=[
@@ -491,7 +531,7 @@ def interpret_file(arg: Any, connection: Connection) -> list[str | None]:
             asyncio.run(_run_agent(options))
             answered = sum(1 for v in task.results.values() if v is not None)
             _log.info("interpret_file: agent finished, %d/%d interpreted",
-                       answered, len(task.names))
+                       answered, len(task.entries))
             cum_input, cum_output, cum_cost = task.write_cost()
             total_input_tokens = task.total_input_tokens
             total_output_tokens = task.total_output_tokens
@@ -507,13 +547,35 @@ def interpret_file(arg: Any, connection: Connection) -> list[str | None]:
     else:
         # All cached — read cumulative cost from DB
         with InterpretationTask(
-            connection, file_path,
-            names=[], kinds=[], prop_strs=[], line_numbers=[],
-            file_hash=file_hash, orig_names=names, orig_kinds=kinds, uncached=[],
+            connection, file_path, theory_longname, theory_key,
+            entries=[],
         ) as task:
             cum_input_tokens, cum_output_tokens, cum_cost_usd = task.historical_cost()
 
-    return ([results.get(i) for i in range(n)],
-            pretty_prints,
-            (total_input_tokens, total_output_tokens, total_cost_usd),
-            (cum_input_tokens, cum_output_tokens, cum_cost_usd))
+    return InterpretationResult(
+        results,
+        pretty_prints,
+        CostSummary(total_input_tokens, total_output_tokens, total_cost_usd),
+        CostSummary(cum_input_tokens, cum_output_tokens, cum_cost_usd),
+    )
+
+
+# --- RPC shim ---
+
+@isabelle_remote_procedure("Semantic_Store.interpret_file")
+def _interpret_file(arg: Any, connection: Connection) -> InterpretationResult:
+    (file_path, theory_longname, theory_key, raw_entries) = arg
+    entries = [
+        Entry(
+            kind=kind,
+            name=pretty_unicode(name),
+            prop_str=pretty_unicode(prop),
+            line_number=lineno,
+            universal_key=bytes(uk),
+        )
+        for kind, name, prop, lineno, uk in raw_entries
+    ]
+    return interpret_file(
+        connection, file_path, theory_longname, bytes(theory_key), entries
+    )
+

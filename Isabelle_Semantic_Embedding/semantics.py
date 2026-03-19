@@ -1,21 +1,32 @@
 """Semantic query tools for looking up interpretations from parent theories."""
 
+import os
 from typing import Any
 
-from Isabelle_RPC_Host import Connection
+import lmdb
+import platformdirs
+from Isabelle_RPC_Host import Connection, isabelle_remote_procedure
 from Isabelle_RPC_Host.position import AsciiPosition, UnicodePosition, IsabellePosition
+from Isabelle_RPC_Host.universal_key import EntityKind, universal_key, universal_key_of
 from claude_agent_sdk import SdkMcpTool, tool
 
 from .base import ToolCall_ret, mk_ret as _mk_ret
 from .hover import _position_schema, _validate_position_args, _resolve_thy_path
 
-_QUERY_TAGS = {"constant": 0, "lemma": 1, "type": 2, "typeclass": 3, "locale": 4}
+_QUERY_TAGS = {"constant": 1, "lemma": 2, "type": 3, "typeclass": 4, "locale": 5}
 
 # PIDE Markup.Entity kinds → Semantic_Store query tags
 _PIDE_KIND_TO_TAG = {
-    "const": 0, "type": 2, "thm": 1,
-    "class": 3, "locale": 4,
+    "const": 1, "type": 3, "thm": 2,
+    "class": 4, "locale": 5,
 }
+
+
+def open_semantic_store() -> lmdb.Environment:
+    """Open the shared LMDB semantic store."""
+    cache_dir = platformdirs.user_cache_dir("Isabelle_Semantic_Embedding", "Qiyuan")
+    os.makedirs(cache_dir, exist_ok=True)
+    return lmdb.open(os.path.join(cache_dir, "semantics.lmdb"), map_size=1 << 30)
 
 _PIDE_KIND_TO_LABEL = {
     "const": "constant", "type": "type", "thm": "lemma",
@@ -40,7 +51,9 @@ _query_by_name_schema = {
 }
 
 
-def mk_query_by_name_tool(connection: Connection, working_names: list[str]) -> SdkMcpTool[Any]:
+def mk_query_by_name_tool(
+    connection: Connection, lmdb_env: lmdb.Environment, working_names: list[str]
+) -> SdkMcpTool[Any]:
     log = connection.server.logger.getChild("semantics")
     @tool(
         "query_by_name",
@@ -65,10 +78,16 @@ def mk_query_by_name_tool(connection: Connection, working_names: list[str]) -> S
                     f"Cannot query \"{name}\" — it is or will be your task to interpret it from the source.",
                     is_error=True,
                 )
-            result = connection.callback("Semantic_Store.query", (tag, name))
-            if result is None:
+            import msgpack
+            key = universal_key_of(connection, EntityKind(tag), name)
+            with lmdb_env.begin() as txn:
+                val = txn.get(key)
+            if val is None:
                 return _mk_ret(f"{t} \"{name}\" has not been interpreted yet.")
-            return _mk_ret(result)
+            pp, sem = msgpack.unpackb(val)
+            if isinstance(sem, bytes):
+                sem = sem.decode()
+            return _mk_ret(sem)
         except Exception:
             log.exception("query_by_name: error")
             raise
@@ -76,7 +95,8 @@ def mk_query_by_name_tool(connection: Connection, working_names: list[str]) -> S
 
 
 def mk_query_by_position_tool(
-    connection: Connection, working_names: list[str], unicode: bool = False
+    connection: Connection, lmdb_env: lmdb.Environment,
+    working_names: list[str], unicode: bool = False
 ) -> SdkMcpTool[Any]:
     log = connection.server.logger.getChild("semantics")
     @tool(
@@ -113,12 +133,107 @@ def mk_query_by_position_tool(
                     f"Cannot query \"{name}\" — it is your task to interpret it from the source.",
                     is_error=True,
                 )
+            import msgpack
             label = _PIDE_KIND_TO_LABEL.get(kind, kind)
-            result = connection.callback("Semantic_Store.query", (tag, name))
-            if result is None:
+            key = universal_key_of(connection, EntityKind(tag), name)
+            with lmdb_env.begin() as txn:
+                val = txn.get(key)
+            if val is None:
                 return _mk_ret(f"{label} \"{name}\" has not been interpreted yet.")
-            return _mk_ret(result)
+            pp, sem = msgpack.unpackb(val)
+            if isinstance(sem, bytes):
+                sem = sem.decode()
+            return _mk_ret(sem)
         except Exception:
             log.exception("query_by_position: error")
             raise
     return query_by_position_tool
+
+
+# --- Store operations ---
+
+def query(key: universal_key, with_pretty: bool = False) -> str | None:
+    """Look up a semantic interpretation by universal key."""
+    import msgpack
+    env = open_semantic_store()
+    with env.begin() as txn:
+        val = txn.get(key)
+    env.close()
+    if val is None:
+        return None
+    pp, sem = msgpack.unpackb(val)
+    if isinstance(pp, bytes):
+        pp = pp.decode()
+    if isinstance(sem, bytes):
+        sem = sem.decode()
+    if with_pretty and pp:
+        return pp + "\n" + sem
+    return sem
+
+
+def is_interpreted(key: universal_key) -> bool:
+    """Check whether a theory has been fully interpreted."""
+    import msgpack
+    env = open_semantic_store()
+    with env.begin() as txn:
+        raw = txn.get(key)
+    env.close()
+    if raw is None:
+        return False
+    return msgpack.unpackb(raw).get(b"finished", False)
+
+
+def mark_interpreted(key: universal_key) -> None:
+    """Mark a theory as interpreted (finished) in the semantic store."""
+    import msgpack
+    env = open_semantic_store()
+    with env.begin(write=True) as txn:
+        raw = txn.get(key)
+        if raw is not None:
+            data = msgpack.unpackb(raw)
+            data[b"finished"] = True
+            txn.put(key, msgpack.packb(data))
+        else:
+            txn.put(key, msgpack.packb({
+                "input_tokens": 0, "output_tokens": 0,
+                "cost_usd": 0.0, "finished": True,
+            }))
+    env.close()
+
+
+def clean_wip() -> int:
+    """Remove all entries with non-persistent theory hashes."""
+    from Isabelle_RPC_Host.theory_hash import is_persistent
+    env = open_semantic_store()
+    deleted = 0
+    with env.begin(write=True) as txn:
+        cursor = txn.cursor()
+        for key, _ in cursor:
+            if not is_persistent(key):
+                cursor.delete()
+                deleted += 1
+    env.close()
+    return deleted
+
+
+# --- RPC wrappers ---
+
+@isabelle_remote_procedure("Semantic_Store.query")
+def _query(arg: Any, connection: Connection) -> str | None:
+    key, with_pretty = arg
+    return query(bytes(key), bool(with_pretty))
+
+
+@isabelle_remote_procedure("Semantic_Store.is_interpreted")
+def _is_interpreted(arg: Any, connection: Connection) -> bool:
+    return is_interpreted(bytes(arg))
+
+
+@isabelle_remote_procedure("Semantic_Store.mark_interpreted")
+def _mark_interpreted(arg: Any, connection: Connection) -> None:
+    mark_interpreted(bytes(arg))
+
+
+@isabelle_remote_procedure("Semantic_Store.clean_wip")
+def _clean_wip(arg: Any, connection: Connection) -> int:
+    return clean_wip()

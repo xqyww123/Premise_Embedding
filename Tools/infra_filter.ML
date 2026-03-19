@@ -135,7 +135,7 @@ fun gen_infra_filters (context : Context.generic)
       (let
         val thm' = Conv.fconv_rule (Object_Logic.atomize ctxt) thm
         val thm'' = Timeout.apply (Time.fromSeconds 5)
-          (Simplifier.asm_full_simplify hol_ss_ctxt) thm'
+            (Simplifier.asm_full_simplify hol_ss_ctxt) thm'
       in Envir.beta_eta_contract (Thm.prop_of thm'') aconv \<^prop>\<open>True\<close> end)
       handle THM _ => false | CTERM _ => false | TERM _ => false | TYPE _ => false
            | Timeout.TIMEOUT _ => false

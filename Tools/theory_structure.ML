@@ -15,8 +15,8 @@ structure Theory_Structure : THEORY_STRUCTURE = struct
 
 fun resolve_theory (context : Context.generic) (name : string) : theory =
   let
-    val thy = Context.cases I Proof_Context.theory_of context
-    val ctxt = Context.cases Proof_Context.init_global I context
+    val thy = Context.theory_of context
+    val ctxt = Context.proof_of context
     val thy_long = Context.theory_long_name thy
     val thy_short = Context.theory_base_name thy
   in
@@ -149,7 +149,9 @@ fun get_theorems_with_positions context =
           val n = length thms
           val global = is_global name
       in thms |> map_index (fn (idx, thm) =>
-          (name, if n = 1 then 0 else idx + 1, pos, Thm.transfer thy thm, global))
+          (name, if n = 1 then 0 else idx + 1, pos,
+           Thm.transfer thy thm,
+           global))
       end)
   end
 

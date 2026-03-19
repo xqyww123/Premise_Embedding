@@ -2,16 +2,54 @@ theory Semantic_Embedding
   imports Main Isabelle_RPC.Remote_Procedure_Calling
 begin
 
-(* declare [[ML_debugger]] *) 
-
-ML_file \<open>Tools/theory_structure.ML\<close>
-ML_file \<open>Tools/theory_hash.ML\<close>
-ML_file \<open>Tools/Hasher.ML\<close>
 ML_file \<open>Tools/pide_state.ML\<close>
+
 ML_file \<open>Tools/Sledgehammer/sledgehammer_embedding_ctxt.ML\<close>
 (* ML_file \<open>Tools/term_serial_index.ML\<close> *)
+ML_file \<open>Tools/theory_structure.ML\<close>
 ML_file \<open>Tools/infra_filter.ML\<close>
 ML_file \<open>Tools/semantic_store.ML\<close>
+
+
+(*
+ML \<open>Semantic_Store.interret (Context.Theory @{theory List})\<close> 
+ML \<open>Semantic_Store.query  (Context.Proof @{context})
+      (Universal_Key.Constant "HOL.False") false\<close>
+
+
+ML \<open>@{term "0::nat"}\<close> 
+ML \<open>Universal_Key.key_of_co nstant (Context.Proof \<^context>) "Groups.zero_class.zero"\<close>
+
+ML \<open>
+val facts = Proof_Context.facts_of \<^context>
+val fact_space = Facts.space_of facts
+val ns_entry = Name_Space.the_entry fact_space "AAA"
+\<close>
+
+ML \<open>Thm.derivation_id @{thm allI}\<close>
+
+ML \<open>type x = Proofterm.thm_id\<close>
+
+ML \<open>\<^try>\<open>xxxx catch e => xxx\<close>\<close>
+
+
+
+
+
+ML \<open>Thm.derivation_id\<close>
+
+ML \<open>  l et
+    val n = 400 * 1024 * 1024
+    val src = Word8Array.array (n, 0w42)
+    val dst = Word8Array.array (n, 0w0)
+    val (t, _) = Timing.timing (fn () =>
+      let val i = Unsynchronized.ref 0
+      in while !i < n do
+        (Word8Array.update (dst, !i, Word8Array.sub (src, !i)); i := !i + 1)
+      end) ()
+  in
+    tracing ("Copied " ^ Int.toString n ^ " bytes. Time: " ^ Timing.message t)
+  end\<close>
 
 (* 
 ML \<open>Semantic_Store.load_store (Path.explode "/tmp/xxx.mpl")\<close>
@@ -197,6 +235,6 @@ ML \<open>@{term \<open>OFCLASS('a, zero_class)\<close>}\<close>
 typ List.list.list_IITN_list
 
 thm List.List.list.map_cong
-*) *)
+*) *) *)
 
 end
