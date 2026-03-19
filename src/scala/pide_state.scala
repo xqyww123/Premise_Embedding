@@ -186,8 +186,6 @@ object DB_Snapshots {
             List.from[(String, String)],
             res => (res.string(Store.private_data.Sources.name),
                     res.string(Store.private_data.Sources.digest)))
-          Output.warning("DB_Snapshots.index_session: " + session_name +
-            " — " + thy_digests.length + " .thy files")
           for ((name, digest) <- thy_digests) {
             val base = Library.try_unsuffix(".thy", Path.explode(name).file_name).getOrElse("")
             if (base.nonEmpty) {
@@ -208,19 +206,13 @@ object DB_Snapshots {
     theory_name: String
   ): Option[Document.Snapshot] = synchronized {
     snapshot_cache.get(theory_name) match {
-      case some @ Some(_) =>
-        Output.warning("DB_Snapshots.load_snapshot: " + theory_name + " — cache hit")
-        some
+      case some @ Some(_) => some
       case None =>
-        Output.warning("DB_Snapshots.load_snapshot: " + theory_name + " — loading from DB")
         try {
           val result =
             using(Export.open_session_context0(store, session_name)) { session_context =>
               val theory_context = session_context.theory(theory_name)
-              val snapshot = Build.read_theory(theory_context)
-              Output.warning("DB_Snapshots.load_snapshot: Build.read_theory returned " +
-                (if (snapshot.isDefined) "Some(snapshot)" else "None"))
-              snapshot
+              Build.read_theory(theory_context)
             }
           result.foreach(snapshot => snapshot_cache += (theory_name -> snapshot))
           result
@@ -239,10 +231,6 @@ object DB_Snapshots {
     val current_session = session.resources.session_base.session_name
     val ancestors = sessions_structure.build_hierarchy(current_session)
 
-    Output.warning("DB_Snapshots.get_snapshot: file_path=" + quote(file_path) +
-      " current_session=" + quote(current_session) +
-      " ancestors=" + commas_quote(ancestors))
-
     // Index all ancestor sessions
     for (name <- ancestors) index_session(store, name)
 
@@ -253,10 +241,6 @@ object DB_Snapshots {
       return None
     }
     val digest = file_digest(file)
-
-    Output.warning("DB_Snapshots.get_snapshot: file digest=" + digest +
-      " digest_index size=" + digest_index.size +
-      " match=" + digest_index.get(digest))
 
     digest_index.get(digest) match {
       case Some((session_name, theory_name)) =>
@@ -392,17 +376,12 @@ object Goto_Definition extends Scala.Fun("pide_state.goto_definition", thread = 
     val state = session.get_state()
     val version = state.recent_finished.version.get_finished
 
-    Output.warning("Goto_Definition: file_path=" + quote(file_path) + " offset=" + offset)
-
     // Try live PIDE state first
     val live_result: (String, Int, Int, Int) =
       version.nodes.iterator.map(_._1).find(_.node == file_path) match {
         case Some(node_name) =>
-          Output.warning("Goto_Definition: found live node " + node_name)
           PIDE_Query.goto_definition(state.snapshot(node_name = node_name), offset)
-        case None =>
-          Output.warning("Goto_Definition: no live node, trying DB fallback")
-          ("", 0, 0, 0)
+        case None => ("", 0, 0, 0)
       }
 
     // Fall back to DB if live returns nothing
@@ -411,9 +390,7 @@ object Goto_Definition extends Scala.Fun("pide_state.goto_definition", thread = 
       else {
         DB_Snapshots.get_snapshot(session, file_path) match {
           case Some(snapshot) =>
-            val r = PIDE_Query.goto_definition(snapshot, offset)
-            Output.warning("Goto_Definition: DB query returned " + r)
-            r
+            PIDE_Query.goto_definition(snapshot, offset)
           case None =>
             Output.warning("Goto_Definition: no DB snapshot found")
             ("", 0, 0, 0)
