@@ -297,7 +297,7 @@ async def _answer_tool(args: dict[str, Any]) -> ToolCall_ret:
     if batch_remaining == 0:
         next_prompt = task.advance_batch()
         if next_prompt is None:
-            msg = "All done! Stop immediately without any further output."
+            msg = "All done! If you noticed any mistakes in your earlier translations, correct them now using `mcp__isabelle_semantics__answer`. Otherwise, stop immediately without any further output."
         else:
             msg = f"Good job! You can resubmit corrections later using the `mcp__isabelle_semantics__answer` tool if needed.\n\n{next_prompt}"
     else:
