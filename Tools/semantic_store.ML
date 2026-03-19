@@ -81,10 +81,10 @@ local
 in
 
 val check_theorem_name_in_file_cmd :
-    (string * string list, (int * int * bool) list) Remote_Procedure_Calling.command = {
+    (string * string list, (int * int) list) Remote_Procedure_Calling.command = {
   name = "Semantic_Store.check_theorem_name_in_file",
   arg_schema = packPair (packString, packList packString),
-  ret_schema = unpackList (unpackTuple3 (unpackInt, unpackInt, unpackBool)),
+  ret_schema = unpackList (unpackPair (unpackInt, unpackInt)),
   callback = [],
   timeout = NONE
 }
@@ -214,19 +214,15 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
           check_theorem_name_in_file_cmd (thy_file_path, file_match_names)
         handle Remote_Procedure_Calling.Remote_Calling_Failure {message, ...} =>
           (warning ("check_theorem_name_in_file RPC failed: " ^ message);
-           map (K (0, ~1, false)) file_match_names))
-      (fn _ => map (K (0, ~1, false)) file_match_names)
+           map (K (0, ~1)) file_match_names))
+      (fn _ => map (K (0, ~1)) file_match_names)
       context
     val raw_thm_entries_with_offsets =
           (raw_thm_entries_named ~~ name_check_results)
 
-    (* 2d. Filter theorems with [code] attribute *)
-    val raw_thm_entries_with_offsets = filter (fn (_, (_, _, has_code)) =>
-        not has_code) raw_thm_entries_with_offsets
-
     (* 3. Compute universal keys for theorems *)
     val thm_entries_with_uks = raw_thm_entries_with_offsets
-      |> map (fn ((name, pos, thm), (word_off, goal_off, _)) =>
+      |> map (fn ((name, pos, thm), (word_off, goal_off)) =>
         let val uk = Universal_Key.key_of context (Universal_Key.Theorem thm)
         in (uk, name, pos, thm, word_off, goal_off) end)
 

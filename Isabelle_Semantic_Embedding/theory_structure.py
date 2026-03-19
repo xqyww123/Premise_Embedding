@@ -45,19 +45,15 @@ _WORD_RE = re.compile(r"\b\w+(?:\.\w+)*\b")
 _GOAL_RE = re.compile(
     r"(?:" + "|".join(_GOAL_KEYWORDS) + r")\s+(\w+(?:\.\w+)*)\b"
 )
-_GOAL_CODE_RE = re.compile(
-    r"(?:" + "|".join(_GOAL_KEYWORDS) + r")\s+(\w+(?:\.\w+)*)\s*\[[^\]]*\bcode\b[^\]]*\]"
-)
-
 
 @isabelle_remote_procedure("Semantic_Store.check_theorem_name_in_file")
-def check_theorem_name_in_file(arg: Any, connection: "Connection") -> list[tuple[int, int, bool]]:
-    """Check each name against the file content and return a triple per name.
+def check_theorem_name_in_file(arg: Any, connection: "Connection") -> list[tuple[int, int]]:
+    """Check each name against the file content and return a pair per name.
 
     The file is preprocessed once into lookup structures, then each name is
     resolved via dict/set lookups (O(1) per name instead of O(file_size)).
 
-    Returns a list of (word_offset, goal_keyword_offset, has_code_attr) tuples:
+    Returns a list of (word_offset, goal_keyword_offset) tuples:
 
     - word_offset: byte offset of the first occurrence of the name as a whole word
       (using ``\\w+(?:\\.\\w+)*`` to capture dotted Isabelle names like ``foo.simps``),
@@ -68,10 +64,6 @@ def check_theorem_name_in_file(arg: Any, connection: "Connection") -> list[tuple
       (lemma, theorem, proposition, corollary, schematic_goal),
       or -1 if no such occurrence exists.  This distinguishes explicitly stated
       theorems from auto-generated ones (e.g. datatype .simps / .induct).
-
-    - has_code_attr: True if the name follows a goal keyword and is accompanied
-      by an attribute list containing the word ``code``, i.e. matches
-      ``(lemma|theorem|...)\\s+name\\s*\\[...code...]``.
 
     Names are short names with theory prefix stripped (e.g. ``append_def``, ``list.simps(2)``).
     Before lookup, only the ``(N)`` index suffix is stripped.
@@ -93,19 +85,13 @@ def check_theorem_name_in_file(arg: Any, connection: "Connection") -> list[tuple
         if name not in goal_offsets:
             goal_offsets[name] = m.start()
 
-    # 3. Build code_names: names following a goal keyword with [code] attribute
-    code_names: set[str] = set()
-    for m in _GOAL_CODE_RE.finditer(content):
-        code_names.add(m.group(1))
-
-    # 4. O(1) lookups per name.  Names have theory prefix stripped
+    # 3. O(1) lookups per name.  Names have theory prefix stripped
     #    (e.g. "append_def", "list.simps(2)").  Strip "(N)" index suffix for lookup.
-    results: list[tuple[int, int, bool]] = []
+    results: list[tuple[int, int]] = []
     for name in names:
         base = re.sub(r"\(\d+\)$", "", name.split(".")[-1])
         results.append((
             word_offsets.get(base, -1),
             goal_offsets.get(base, -1),
-            base in code_names,
         ))
     return results
