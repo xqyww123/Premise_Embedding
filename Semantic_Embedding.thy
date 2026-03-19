@@ -10,12 +10,16 @@ ML_file \<open>Tools/theory_structure.ML\<close>
 ML_file \<open>Tools/infra_filter.ML\<close>
 ML_file \<open>Tools/semantic_store.ML\<close>
 
-
 (*
-ML \<open>Semantic_Store.interret (Context.Theory @{theory List})\<close> 
-ML \<open>Semantic_Store.query  (Context.Proof @{context})
-      (Universal_Key.Constant "HOL.False") false\<close>
 
+ML \<open>Semantic_Store.int erpret (Context.Theory @{theory List})\<close> 
+ML \<open>Semantic_Store.query  (Context.Proof @{context})
+      (Universal_Key.Class "Orderings.partial_preordering") false\<close>
+
+ML \<open>Context.theory_long_name @{theory}\<close>
+ML \<open>Context.theory_base_name @{theory}\<close>
+
+thm HOL.conj_comms
 
 ML \<open>@{term "0::nat"}\<close> 
 ML \<open>Universal_Key.key_of_co nstant (Context.Proof \<^context>) "Groups.zero_class.zero"\<close>

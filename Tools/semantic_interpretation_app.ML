@@ -27,15 +27,37 @@ val _ = REPL_Server.register_app "Semantic_Store.collect" (fn (cin, cout, state)
       let
         val thy_name = read unpackString
         val thy = Thy_Info.get_theory thy_name
+        val _ = Theory_Hash.store_theory_hash thy
 
-        (* Hijack tracing to stream messages over the socket *)
+        (* Hijack output channels to stream messages over the socket *)
+        val old_writeln = !Private_Output.writeln_fn
+        val old_state = !Private_Output.state_fn
+        val old_information = !Private_Output.information_fn
         val old_tracing = !Private_Output.tracing_fn
-        val _ = Private_Output.tracing_fn :=
-          (fn msgs => List.app send msgs)
+        val old_warning = !Private_Output.warning_fn
+        val old_legacy = !Private_Output.legacy_fn
+        val old_error_message = !Private_Output.error_message_fn
+        fun set_channels out_fn =
+          (Private_Output.writeln_fn := out_fn;
+           Private_Output.state_fn := out_fn;
+           Private_Output.information_fn := out_fn;
+           Private_Output.tracing_fn := out_fn;
+           Private_Output.warning_fn := (fn msgs => List.app (fn m => send ("### " ^ m)) msgs);
+           Private_Output.legacy_fn := (fn msgs => List.app (fn m => send ("legacy: " ^ m)) msgs);
+           Private_Output.error_message_fn := (fn (_, msgs) => List.app (fn m => send ("*** " ^ m)) msgs))
+        fun restore_channels () =
+          (Private_Output.writeln_fn := old_writeln;
+           Private_Output.state_fn := old_state;
+           Private_Output.information_fn := old_information;
+           Private_Output.tracing_fn := old_tracing;
+           Private_Output.warning_fn := old_warning;
+           Private_Output.legacy_fn := old_legacy;
+           Private_Output.error_message_fn := old_error_message)
+        val _ = set_channels (fn msgs => List.app send msgs)
 
         val _ = \<^try>\<open>Semantic_Store.interpret (Context.Theory thy)
-          catch exn => (Private_Output.tracing_fn := old_tracing; Exn.reraise exn)\<close>
-        val _ = Private_Output.tracing_fn := old_tracing
+          catch exn => (restore_channels (); Exn.reraise exn)\<close>
+        val _ = restore_channels ()
         val _ = done ()
       in state end
     catch exn =>

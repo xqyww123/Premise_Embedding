@@ -279,7 +279,10 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
 
     fun mk_prop_str entity =
       case entity of
-        Universal_Key.Theorem thm => pp (Thm.prop_of thm)
+        Universal_Key.Theorem thm =>
+          (pp (Thm.prop_of thm)
+           handle ERROR msg =>
+             (warning ("mk_prop_str: Theorem pp failed: " ^ msg); raise ERROR msg))
       | Universal_Key.Constant cname =>
           (let val T = Consts.the_constraint (Sign.consts_of thy) cname
            in pp_typ T end
@@ -293,7 +296,6 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
       (const_entries @ deduped_thm_entries
        @ type_entries @ class_entries @ locale_entries)
       |> sort entry_ord
-
     val entries = all_entries_with_pos
       |> map (fn (entity, name, pos, uk) =>
         let val (_, _, _, prop_str) = mk_entry (entity, name, pos)

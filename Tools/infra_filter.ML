@@ -24,6 +24,8 @@ fun gen_infra_filters (context : Context.generic)
       (Context.cases Global_Theory.facts_of Proof_Context.facts_of context)
     val class_space = Context.cases Sign.class_space Proof_Context.class_space context
     val locale_space = Locale.locale_space (Context.theory_of context)
+    fun is_hidden space name =
+      Long_Name.is_hidden (Name_Space.intern space name)
     val local_type_names = Name_Space.get_names type_space
       |> filter (fn name =>
           #theory_long_name (Name_Space.the_entry type_space name) = thy_name)
@@ -64,6 +66,7 @@ fun gen_infra_filters (context : Context.generic)
 
     fun is_infra_const name =
       Name_Space.is_concealed const_space name
+      orelse is_hidden const_space name
       orelse exists (fn pfx => String.isPrefix pfx name) pre_prefixes
       orelse exists (fn infix_ => String.isSubstring infix_ name) inst_infixes
       orelse (exists (fn T => String.isPrefix (T ^ ".") name) local_type_names
@@ -143,17 +146,21 @@ fun gen_infra_filters (context : Context.generic)
     (* --- Combined theorem predicate --- *)
 
     fun is_infra_thm (full_name, thm) =
-      Name_Space.is_concealed fact_space full_name
-      orelse is_ADT_infra_thm full_name
-      orelse is_inductive_infra_thm full_name
-      orelse Term.exists_Const is_internal_constant (Thm.prop_of thm)
-      orelse is_internal_class (Thm.prop_of thm)
-      orelse is_trivial_thm thm
+        Name_Space.is_concealed fact_space full_name
+        orelse is_hidden fact_space full_name
+        orelse is_ADT_infra_thm full_name
+        orelse is_inductive_infra_thm full_name
+        orelse Term.exists_Const is_internal_constant (Thm.prop_of thm)
+        orelse is_internal_class (Thm.prop_of thm)
+        orelse is_trivial_thm thm
   in
     {is_infra_const = is_infra_const, is_infra_thm = is_infra_thm,
-     is_infra_type = Name_Space.is_concealed type_space,
-     is_infra_class = Name_Space.is_concealed class_space,
-     is_infra_locale = Name_Space.is_concealed locale_space}
+     is_infra_type = fn name => Name_Space.is_concealed type_space name
+                                orelse is_hidden type_space name,
+     is_infra_class = fn name => Name_Space.is_concealed class_space name
+                                 orelse is_hidden class_space name,
+     is_infra_locale = fn name => Name_Space.is_concealed locale_space name
+                                  orelse is_hidden locale_space name}
   end
 
 end
