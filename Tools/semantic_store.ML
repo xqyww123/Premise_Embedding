@@ -1,12 +1,60 @@
 signature SEMANTIC_STORE = sig
-  val query : Context.generic -> Universal_Key.entity -> bool -> string option
+  type semantics = string (*in English*)
+
+  (* Look up the English semantic interpretation of an entity.
+     If with_pretty is true, prepends the pretty-printed formal signature. *)
+  val query_semantics : Context.generic -> Universal_Key.entity -> bool -> semantics option
+
+  (* Interpret all uninterpreted ancestor theories of the current context,
+     plus the current proof context if applicable. Calls Python via RPC
+     to generate plain-English translations using a Claude agent. *)
   val interpret : Context.generic -> unit
+
+  (* Remove all LMDB entries whose theory hashes are non-persistent
+     (i.e., from non-loaded theories). Returns the number of entries deleted. *)
   val clean_wip : unit -> int
+
+  (* Create a callback that Python can invoke to interpret a list of theories
+     by name (short or long). Resolves names, skips already-interpreted ones. *)
+  val make_interpret_theory_callback : Context.generic -> Remote_Procedure_Calling.callback'
+
+  (* Config option: when true, Semantic_Vector_Store._auto_embed will
+     automatically trigger semantic interpretation for missing theories. *)
+  val auto_interpret_for_embedding : bool Config.T
+
+  (* Config option: embedding model name used by Semantic_Vector_Store.
+     Empty string means use the environment variable EMBEDDING_MODEL. *)
+  val embedding_model : string Config.T
+
+  (* Search k nearest entities by semantic similarity to a query string.
+     kinds filters entity types; NONE domain means all entities of those kinds.
+     Returns (score, entity) pairs sorted by similarity. *)
+  val query_knn : Context.generic -> semantics -> int ->
+    Universal_Key.entity_kind list -> Universal_Key.universal_key list option ->
+    (real * Universal_Key.entity) list
+
+  (* Embed semantic interpretations into vectors for the given theories
+     and all their unembedded ancestors, under the specified embedding model
+     (empty string = use default). *)
+  val embed_semantics : Context.generic -> theory list * string -> unit
+
+  (* Check whether a theory's entities are all embedded under the given model. *)
+  val is_thy_embedded : Context.generic -> string * string -> bool
 end
 
 structure Semantic_Store : SEMANTIC_STORE = struct
 
 type semantics = string (*in English*)
+
+val auto_interpret_for_embedding = Attrib.setup_config_bool
+  \<^binding>\<open>auto_interpret_for_embedding\<close> (K true)
+val _ = Config.register_rpc_option "auto_interpret_for_embedding"
+          (Config.bool_value auto_interpret_for_embedding)
+
+val embedding_model = Attrib.setup_config_string
+  \<^binding>\<open>embedding_model\<close> (K "")
+val _ = Config.register_rpc_option "Semantic_Embedding.embedding_model"
+          (Config.string_value embedding_model)
 
 structure Thm_Dedup = Hash_Table(struct
   type key = Universal_Key.universal_key
@@ -18,7 +66,7 @@ end)
 
 local open MessagePackBinIO.Pack MessagePackBinIO.Unpack in
 
-fun query (context : Context.generic) (entity : Universal_Key.entity)
+fun query_semantics (context : Context.generic) (entity : Universal_Key.entity)
     (with_pretty : bool) : string option =
   let
     val key = Universal_Key.key_of context entity
@@ -379,5 +427,119 @@ fun interpret (context : Context.generic) : unit =
   in
     ()
   end
+
+fun mk_interpret_theory (context : Context.generic) (names : string list) : unit =
+  let
+    val theories = map (Theory_Hash.resolve_theory context) names
+    val uninterpreted = filter (not o is_interpreted) theories
+    val contexts = map Context.Theory uninterpreted
+    val _ = if null contexts then () else
+      tracing ("[Semantic_Store] mk_interpret_theory: interpreting " ^
+               Int.toString (length contexts) ^ " theories")
+  in
+    List.app (fn ctx =>
+      let val _ = interpret' ctx
+          val _ = Context.cases mark_interpreted (K ()) ctx
+      in () end)
+    contexts
+  end
+
+fun make_interpret_theory_callback (context : Context.generic)
+    : Remote_Procedure_Calling.callback' =
+  Remote_Procedure_Calling.mk_callback {
+    name = "Semantic_Store.interpret_theories",
+    arg_schema = MessagePackBinIO.Unpack.unpackList MessagePackBinIO.Unpack.unpackString,
+    ret_schema = MessagePackBinIO.Pack.packUnit,
+    function = mk_interpret_theory context,
+    timeout = NONE
+  }
+
+local open MessagePackBinIO.Pack MessagePackBinIO.Unpack in
+
+fun query_knn (context : Context.generic) (query_text : semantics) (k : int)
+    (kinds : Universal_Key.entity_kind list)
+    (domain : Universal_Key.universal_key list option)
+    : (real * Universal_Key.entity) list =
+  let
+    val callbacks = [
+      make_constants_callback context,
+      make_theorems_callback context,
+      make_types_callback context,
+      make_classes_callback context,
+      make_locales_callback context,
+      make_interpret_theory_callback context,
+      make_theory_long_name_callback context,
+      Config.make_config_lookup_callback context
+    ]
+    val cmd : (string * int * Universal_Key.entity_kind list * Universal_Key.universal_key list option,
+               (real * Universal_Key.entity) list)
+              Remote_Procedure_Calling.command = {
+      name = "Semantic_Embedding.query_knn",
+      arg_schema = packTuple4 (packString, packInt,
+                     packList Universal_Key.pack_entity_kind',
+                     packOption (packList Universal_Key.pack_universal_key)),
+      ret_schema = unpackList (unpackPair (unpackReal, Universal_Key.unpack_entity)),
+      callback = callbacks,
+      timeout = NONE
+    }
+  in
+    Remote_Procedure_Calling.call_command cmd (query_text, k, kinds, domain)
+  end
+
+fun is_thy_embedded (context : Context.generic) (theory_name : string, model : string) : bool =
+  let
+    val cmd : (string * string, bool) Remote_Procedure_Calling.command = {
+      name = "Semantic_Embedding.is_thy_embedded",
+      arg_schema = packPair (packString, packString),
+      ret_schema = unpackBool,
+      callback = [Universal_Key.make_universal_key_callback context,
+                  Config.make_config_lookup_callback context],
+      timeout = NONE
+    }
+  in Remote_Procedure_Calling.call_command cmd (theory_name, model) end
+
+fun embed_semantics (context : Context.generic) (theories : theory list, model : string) : unit =
+  let
+    val seen = Inthashtab.empty 64
+    val _ = List.app (Inthashtab.update seen o rpair ()) base_theory_ids
+    fun collect thy acc =
+      let val id = Context.theory_identifier thy
+      in
+        if Inthashtab.defined seen id then acc
+        else
+          let val _ = Inthashtab.update seen (id, ())
+              val name = Context.theory_long_name thy
+              val acc' = fold collect (Theory.parents_of thy) acc
+          in if is_thy_embedded context (name, model) then acc'
+             else acc' @ [name]
+          end
+      end
+    val unembedded = fold collect theories []
+  in
+    if null unembedded then ()
+    else
+      let
+        val _ = tracing ("[Semantic_Store] embed_semantics: " ^
+                   Int.toString (length unembedded) ^ " theories to embed")
+        val callbacks = [
+          make_constants_callback context,
+          make_theorems_callback context,
+          make_types_callback context,
+          make_classes_callback context,
+          make_locales_callback context,
+          Universal_Key.make_universal_key_callback context,
+          Config.make_config_lookup_callback context
+        ]
+        val cmd : (string list * string, unit) Remote_Procedure_Calling.command = {
+          name = "Semantic_Embedding.embed_semantics",
+          arg_schema = packPair (packList packString, packString),
+          ret_schema = unpackUnit,
+          callback = callbacks,
+          timeout = NONE
+        }
+      in Remote_Procedure_Calling.call_command cmd (unembedded, model) end
+  end
+
+end (*local MessagePack*)
 
 end

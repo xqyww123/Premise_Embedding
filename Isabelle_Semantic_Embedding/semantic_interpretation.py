@@ -8,9 +8,8 @@ import os
 import threading
 from typing import Any, NamedTuple, cast
 
-import lmdb
 from Isabelle_RPC_Host import Connection, isabelle_remote_procedure
-from Isabelle_RPC_Host.universal_key import universal_key
+from Isabelle_RPC_Host.universal_key import EntityKind, universal_key
 from Isabelle_RPC_Host.unicode import pretty_unicode
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -28,6 +27,7 @@ from claude_agent_sdk.types import (
 )
 
 from .base import ToolCall_ret, mk_ret as _mk_ret
+from .semantics import Semantic_DB, SemanticRecord
 
 # --- Thread-local state ---
 
@@ -95,37 +95,27 @@ class InterpretationTask:
         self.batches: list[tuple[str, range]] = []
         self.current_batch: int = 0
         self.batch_range: range = range(0)
-        self._db: lmdb.Environment | None = None
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.total_cost_usd = 0.0
 
     def __enter__(self) -> InterpretationTask:
-        from .semantics import open_semantic_store
-        self._db = open_semantic_store()
         return self
 
     def __exit__(self, *exc: object) -> None:
-        if self._db is not None:
-            self._db.close()
-            self._db = None
+        pass
 
     def write_answer(self, task_idx: int, sem: str) -> None:
         """Write a single answer to the LMDB store."""
-        import msgpack
-        if self._db is not None:
-            entry = self.entries[task_idx]
-            pp = _pretty_print_entry(entry)
-            packed: bytes = msgpack.packb((pp, sem))  # type: ignore[assignment]
-            with self._db.begin(write=True) as txn:
-                txn.put(entry.universal_key, packed)
+        entry = self.entries[task_idx]
+        Semantic_DB[entry.universal_key] = SemanticRecord(
+            EntityKind(entry.kind), entry.name, entry.prop_str, sem)
 
     def historical_cost(self) -> tuple[int, int, float]:
         """Read cumulative cost from LMDB (without modifying it)."""
         import msgpack
-        if self._db is None:
-            raise RuntimeError("InterpretationTask is not opened")
-        with self._db.begin() as txn:
+        env = Semantic_DB._ensure_env()
+        with env.begin() as txn:
             raw = txn.get(self.theory_key)
         if raw is None:
             return (0, 0, 0.0)
@@ -137,9 +127,8 @@ class InterpretationTask:
     def write_cost(self) -> tuple[int, int, float]:
         """Accumulate cost into the LMDB store. Returns updated cumulative totals."""
         import msgpack
-        if self._db is None:
-            raise RuntimeError("InterpretationTask is not opened")
-        with self._db.begin(write=True) as txn:
+        env = Semantic_DB._ensure_env()
+        with env.begin(write=True) as txn:
             raw = txn.get(self.theory_key)
             prev_in, prev_out, prev_cost, finished = 0, 0, 0.0, False
             if raw is not None:
@@ -461,17 +450,11 @@ def interpret_file(
     _log.info("interpret_file: %s (%s), %d entries", theory_longname, file_path, n)
 
     # Check LMDB cache
-    import msgpack
-    from .semantics import open_semantic_store
     results: list[str | None] = [None] * n
-    env = open_semantic_store()
-    with env.begin() as txn:
-        for i, e in enumerate(entries):
-            v = txn.get(e.universal_key)
-            if v is not None:
-                _, sem = msgpack.unpackb(v)
-                results[i] = sem.decode() if isinstance(sem, bytes) else sem
-    env.close()
+    for i, e in enumerate(entries):
+        sem = Semantic_DB.query(e.universal_key)
+        if sem is not None:
+            results[i] = sem
 
     uncached = [i for i, r in enumerate(results) if r is None]
     _log.info("interpret_file: %d cached, %d to interpret", n - len(uncached), len(uncached))
@@ -506,16 +489,16 @@ def interpret_file(
 
             working_names = [e.name for e in task.entries]
             query_by_name_tool = mk_query_by_name_tool(
-                connection, task._db, working_names) # type: ignore
+                connection, working_names)
             query_by_position_tool = mk_query_by_position_tool(
-                connection, task._db, working_names, unicode=True) # type: ignore
+                connection, working_names, unicode=True)
             definition_tool = mk_definition_tool(connection, unicode=True)
             hover_tool = mk_hover_tool(connection, unicode=True)
             mcp = create_sdk_mcp_server("isabelle_semantics", tools=[
                 query_by_name_tool, query_by_position_tool,
                 definition_tool, hover_tool, _answer_tool])
             options = ClaudeAgentOptions(
-                model="claude-sonnet-4-6",
+                model="claude-opus-4-6",
                 cwd=os.path.dirname(unicode_file_path),
                 permission_mode="default",
                 allowed_tools=list(_TOOL_WHITELIST),

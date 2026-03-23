@@ -10,6 +10,29 @@ ML_file \<open>Tools/theory_structure.ML\<close>
 ML_file \<open>Tools/infra_filter.ML\<close>
 ML_file \<open>Tools/semantic_store.ML\<close>
 
+
+declare [[auto_interpret_for_embedding = false]]
+
+ML \<open>Semantic_Store.is_thy_embedded (Context.Proof \<^context>) ("HOL.HOL", "oai.text-embedding-3-small")\<close>
+ML \<open>Semantic_Store.embed_semantics (Context.Proof \<^context>) ([@{theory HOL}], "oai.text-embedding-3-small")\<close>
+
+(*
+ML \<open>Semantic_Store.query_semantics   (Context.Proof @{context})
+      (Universal_Key.Constant "HOL.implies") false\<close>
+*)
+ 
+ML \<open>Semantic_Store.query_knn (Context.Proof @{context})
+      "logical or" 10 [Universal_Key.ConstantK] NONE\<close>
+
+term HOL.simp_implies
+
+term Orderings.partial_preordering
+
+ML \<open>@{theory Lazy_Sequence}\<close>
+ML \<open>@{theory Predicate}\<close>
+
+
+
 (*
 
 ML \<open>Semantic_Store.int erpret (Context.Theory @{theory List})\<close> 
