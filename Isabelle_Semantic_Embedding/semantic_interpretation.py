@@ -204,7 +204,7 @@ Line numbers in brackets (e.g. [line 42]) indicate where each entity appears in 
 For each entry, translate the formal statement into a concise plain-English description (1\u20133 sentences). \
 State only what the entity defines or asserts. \
 Do NOT explain how it is derived or why it is useful. \
-The formal statement is already shown; describe its meaning rather than transcribing it. \
+The formal statement is already shown; describe its meaning **rather than** transcribing it. \
 Prefer plain English over formulas. Wrap formulas in backticks (e.g., `x`, `x + 1`). \
 When a lemma/rule/term has a well-known name (e.g., proof by contradiction), you MUST mention it explicitly in the translation.
 

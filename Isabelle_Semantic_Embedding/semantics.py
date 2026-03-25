@@ -9,8 +9,9 @@ import msgpack
 import numpy as np
 import platformdirs
 from Isabelle_RPC_Host import Connection, isabelle_remote_procedure
+from Isabelle_RPC_Host.rpc import IsabelleError
 from Isabelle_RPC_Host.position import AsciiPosition, UnicodePosition, IsabellePosition
-from Isabelle_RPC_Host.universal_key import EntityKind, universal_key, universal_key_of, destruct_key, is_WIP
+from Isabelle_RPC_Host.universal_key import EntityKind, UndefinedEntity, universal_key, universal_key_of, destruct_key, is_WIP
 from claude_agent_sdk import SdkMcpTool, tool
 
 from .semantic_embedding import Vector_Store, Embedding_Provider, embedding_provider, key
@@ -204,6 +205,9 @@ def mk_query_by_name_tool(
             if sem is None:
                 return _mk_ret(f"{t} \"{name}\" has not been interpreted yet.")
             return _mk_ret(sem)
+        except (IsabelleError, UndefinedEntity) as e:
+            log.warning("%s: %s", type(e).__name__, e)
+            return _mk_ret(str(e), is_error=True)
         except Exception:
             log.exception("query_by_name: error")
             raise
@@ -253,6 +257,9 @@ def mk_query_by_position_tool(
             if sem is None:
                 return _mk_ret(f"{tag.label} \"{name}\" has not been interpreted yet.")
             return _mk_ret(sem)
+        except (IsabelleError, UndefinedEntity) as e:
+            log.warning("%s: %s", type(e).__name__, e)
+            return _mk_ret(str(e), is_error=True)
         except Exception:
             log.exception("query_by_position: error")
             raise
@@ -494,7 +501,12 @@ class Semantic_Vector_Store(Vector_Store):
         for thy in theories:
             if isinstance(thy, str):
                 thy_name = thy
-                thy_key = universal_key_of(self.connection, EntityKind.THEORY, thy)
+                try:
+                    thy_key = universal_key_of(self.connection, EntityKind.THEORY, thy)
+                except UndefinedEntity:
+                    self.connection.warning(
+                        f"[Semantic_Embedding] skipping unknown theory {thy!r}")
+                    continue
             else:
                 thy_key = bytes(thy)
                 thy_name = self.connection.callback("Theory_Hash.theory_name_of", thy_key)
@@ -625,5 +637,8 @@ def _embed_semantics(arg: Any, connection: Connection) -> None:
 def _is_thy_embedded_rpc(arg: Any, connection: Connection) -> bool:
     theory_name, model_name = arg
     store = connection.semantic_vector_store(model_name)  # type: ignore
-    thy_key = universal_key_of(connection, EntityKind.THEORY, theory_name)
+    try:
+        thy_key = universal_key_of(connection, EntityKind.THEORY, theory_name)
+    except UndefinedEntity:
+        return False
     return store.is_thy_embedded(thy_key)
