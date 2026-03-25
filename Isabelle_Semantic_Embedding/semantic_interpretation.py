@@ -528,7 +528,7 @@ def interpret_file(
                 permission_mode="default",
                 allowed_tools=list(_TOOL_WHITELIST),
                 mcp_servers={"isabelle_semantics": mcp},
-                thinking=ThinkingConfigAdaptive(),
+                thinking=ThinkingConfigAdaptive(type="adaptive"),
                 effort="high",
                 hooks={
                     "PreToolUse": [

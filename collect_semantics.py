@@ -85,6 +85,7 @@ try:
 except Exception as e:
     print(f"Connection error: {e}", file=sys.stderr, flush=True)
     has_error = True
+    raise
 
 if has_error:
     print("Failed.", file=sys.stderr)

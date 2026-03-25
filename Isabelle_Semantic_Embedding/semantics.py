@@ -171,7 +171,7 @@ _query_by_name_schema = {
 
 
 def mk_query_by_name_tool(
-    connection: Connection, working_names: list[str], with_pretty: bool = False
+    connection: Connection, working_names: list[str], with_pretty: bool = True
 ) -> SdkMcpTool[Any]:
     log = connection.server.logger.getChild("semantics")
     @tool(
@@ -194,6 +194,7 @@ def mk_query_by_name_tool(
             if not name:
                 return _mk_ret("Invalid name: must be a non-empty string.", is_error=True)
             if name in working_names:
+                log.debug("Entity name %r is in working_names; cannot query entities assigned for interpretation.", name)
                 return _mk_ret(
                     f"Cannot query \"{name}\" — it is or will be your task to interpret it from the source.",
                     is_error=True,
@@ -211,7 +212,7 @@ def mk_query_by_name_tool(
 
 def mk_query_by_position_tool(
     connection: Connection, working_names: list[str],
-    unicode: bool = False, with_pretty: bool = False
+    unicode: bool = False, with_pretty: bool = True
 ) -> SdkMcpTool[Any]:
     log = connection.server.logger.getChild("semantics")
     @tool(

@@ -10,7 +10,6 @@ ML_file \<open>Tools/theory_structure.ML\<close>
 ML_file \<open>Tools/infra_filter.ML\<close>
 ML_file \<open>Tools/semantic_store.ML\<close>
 
-
 (*
 
 ML \<open>Theory_Structure.get_introduction_rules_with_positions (Context.Theory @{theory Set})\<close>
@@ -36,14 +35,9 @@ ML \<open>Semantic_Store.query_semantics   (Context.Proof @{context})
   
 ML \<open>Semantic_Store.query_knn (Context.Proof @{context})
       "proof by contradiction" 10 [Universal_Key.IntroductionRuleK] NONE\<close>
-   
-ML \<open>xx_counter ()\<close>
-ML \<open>xx_counter ()\<close>
 
 ML \<open>Semantic_Store.query_knn (Context.Proof @{context})
       "all the possible elements of a list are finite" 10 [Universal_Key.TheoremK] NONE\<close>
-
-ML \<open>xx_counter ()\<close>
 
 ML \<open>Semantic_Store.query_knn (Context.Proof @{context})
       "The length of a concatenated list equals the sum of the lengths of each of its parts" 10 [Universal_Key.TheoremK] NONE\<close>
