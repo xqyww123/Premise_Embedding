@@ -22,6 +22,8 @@ parser.add_argument("theory", help="Theory name to interpret (e.g., HOL.List)")
 parser.add_argument("--repl-addr", default="127.0.0.1:6666", help="Isa-REPL server address")
 parser.add_argument("--rpc-addr", default="127.0.0.1:27182", help="RPC host address")
 parser.add_argument("--session", default="HOL", help="Session qualifier for theory name resolution")
+parser.add_argument("--embed-models", default="",
+    help="Comma-separated embedding model names (e.g., 'fw.qwen3-embedding-8b,codestral-embed')")
 args = parser.parse_args()
 
 logger = Isabelle_RPC_Host.mk_logger_(args.rpc_addr, None)
@@ -45,6 +47,8 @@ print(f"Loaded: {fullnames}", flush=True)
 print("Running app...", flush=True)
 c.run_app("Semantic_Store.collect")
 mp.pack(args.theory, c.cout)
+models = [m.strip() for m in args.embed_models.split(",") if m.strip()] if args.embed_models else []
+mp.pack(models, c.cout)
 c.cout.flush()
 
 # Read and print tracing messages until done

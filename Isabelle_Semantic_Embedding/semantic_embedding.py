@@ -17,7 +17,6 @@ import diskcache
 import platformdirs
 
 _EMBED_CACHE_TTL = 3 * 86400  # 3 days
-_EMBED_SHORT_QUERY_LIMIT = 512  # max total chars to cache
 
 
 class EmbedResult(NamedTuple):
@@ -30,6 +29,9 @@ class Embedding_Provider(ABC):
     type name = str
     dimension : int
     model : str
+    max_request_size: int = 2048
+    supports_batch: bool = False
+    normalize: bool = False  # L2-normalize returned vectors
     PROVIDERS: dict[name, type['Embedding_Provider']] = {}
     _cache: diskcache.Cache | None = None
 
@@ -56,12 +58,12 @@ class Embedding_Provider(ABC):
             os.makedirs(cache_dir, exist_ok=True)
             Embedding_Provider._cache = diskcache.Cache(
                 os.path.join(cache_dir, "embed_cache"),
-                size_limit=100 * 1024 * 1024)
+                size_limit=2 * 1024 * 1024 * 1024)
         return Embedding_Provider._cache
 
     def _embed_cached(self, text: list[str],
                       backend: 'Callable[[list[str]], EmbedResult]') -> EmbedResult:
-        """Per-string cache lookup, call backend for misses, store results."""
+        """Per-string cache lookup, chunk misses, call backend with retry, cache incrementally."""
         cache = self._get_cache()
         results: list[np.ndarray | None] = [None] * len(text)
         misses: list[tuple[int, str]] = []
@@ -71,14 +73,45 @@ class Embedding_Provider(ABC):
                 results[i] = np.frombuffer(bytes(cached), dtype=np.float32)
             else:
                 misses.append((i, t))
-        cost = 0
-        if misses:
-            embed_result = backend([t for _, t in misses])
-            cost = embed_result.total_tokens
-            for (i, t), vec in zip(misses, embed_result.vectors):
+        hits = len(text) - len(misses)
+        if not misses:
+            self._log(f"[Embedding Cache] {self.model}: all {hits} texts cached")
+            return EmbedResult(np.stack(results), 0)  # type: ignore
+        if hits > 0:
+            self._log(f"[Embedding Cache] {self.model}: {hits} hits, {len(misses)} misses")
+        total_tokens = 0
+        chunk_size = self.max_request_size
+        total_chunks = (len(misses) + chunk_size - 1) // chunk_size
+        for ci in range(0, len(misses), chunk_size):
+            chunk = misses[ci:ci + chunk_size]
+            chunk_texts = [t for _, t in chunk]
+            if total_chunks > 1:
+                self._log(f"[Embedding] {self.model}: chunk {ci // chunk_size + 1}/{total_chunks} "
+                          f"({len(chunk)} texts)")
+            last_err: Exception | None = None
+            for attempt in range(10):
+                try:
+                    embed_result = backend(chunk_texts)
+                    break
+                except Exception as e:
+                    last_err = e
+                    self._log(f"[Embedding] {self.model}: chunk {ci // chunk_size + 1}/{total_chunks} "
+                              f"attempt {attempt + 1}/10 failed: {e}")
+                    time.sleep(2 ** attempt)
+            else:
+                raise RuntimeError(
+                    f"Embedding chunk {ci // chunk_size + 1}/{total_chunks} "
+                    f"failed after 10 retries") from last_err
+            total_tokens += embed_result.total_tokens
+            for (i, t), vec in zip(chunk, embed_result.vectors):
                 cache.set((self.model, t), vec.tobytes(), expire=_EMBED_CACHE_TTL)
                 results[i] = vec
-        return EmbedResult(np.stack(results), cost)  # type: ignore
+        return EmbedResult(np.stack(results), total_tokens)  # type: ignore
+
+    def _normalize(self, result: EmbedResult) -> EmbedResult:
+        if self.normalize:
+            faiss.normalize_L2(result.vectors)
+        return result
 
     def _log(self, msg: str) -> None:
         from Isabelle_RPC_Host.rpc import Connection
@@ -87,24 +120,26 @@ class Embedding_Provider(ABC):
             conn.tracing(msg)
 
     def embed(self, text: list[str]) -> EmbedResult:
-        """Embed texts, using cache for short queries."""
+        """Embed texts, always using cache."""
         total_chars = sum(len(t) for t in text)
         self._log(f"[Embedding] {self.model}: embedding {len(text)} texts, {total_chars} chars")
-        total_len = total_chars
-        if total_len > _EMBED_SHORT_QUERY_LIMIT:
-            result = self._embed(text)
-        else:
-            result = self._embed_cached(text, self._embed)
+        result = self._embed_cached(text, self._embed)
         self._log(f"[Embedding] {self.model}: done, total_tokens={result.total_tokens}")
-        return result
+        return self._normalize(result)
+
+    def _embed_batch_or_fallback(self, text: list[str]) -> EmbedResult:
+        """Route to _embed_batch if supported, otherwise fall back to _embed."""
+        if self.supports_batch:
+            return self._embed_batch(text)
+        return self._embed(text)
 
     def embed_batch(self, text: list[str]) -> EmbedResult:
         """Embed a large batch of texts, always using cache."""
         total_chars = sum(len(t) for t in text)
         self._log(f"[Embedding Batch] {self.model}: embedding {len(text)} texts, {total_chars} chars")
-        result = self._embed_cached(text, self._embed_batch)
+        result = self._embed_cached(text, self._embed_batch_or_fallback)
         self._log(f"[Embedding Batch] {self.model}: done, total_tokens={result.total_tokens}")
-        return result
+        return self._normalize(result)
 
 def register_embedding_provider(name: str):
     """Class decorator to register an Embedding_Provider subclass by name."""
@@ -133,6 +168,32 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
     api_key: str | None = os.getenv("OPENAI_API_KEY")
     model: str
     max_batch_size: int = 50000
+    supports_batch: bool = True
+
+    # --- Batch API hooks (override for Mistral, etc.) ---
+
+    _batch_endpoint: str = "/v1/batches"
+    _batch_completed_status: str = "completed"
+    _batch_failed_statuses: set[str] = {"failed", "expired", "cancelled"}
+    _batch_output_file_key: str = "output_file_id"
+
+    def _format_batch_line(self, i: int, text: str) -> dict:
+        """One JSONL line for the batch input file."""
+        return {"custom_id": str(i), "method": "POST",
+                "url": "/v1/embeddings",
+                "body": {"model": self.model, "input": text,
+                         "encoding_format": "float"}}
+
+    def _create_batch_request(self, file_id: str) -> dict:
+        """JSON body for the create-batch POST."""
+        return {"input_file_id": file_id,
+                "endpoint": "/v1/embeddings",
+                "completion_window": "24h"}
+
+    def _batch_progress(self, data: dict) -> tuple[int, int]:
+        """Extract (completed, total) from poll response."""
+        counts = data.get("request_counts", {})
+        return counts.get("completed", 0), counts.get("total", 0)
 
     def _embed(self, text: list[str]) -> EmbedResult:
         url = self.base_url.rstrip("/") + "/v1/embeddings"
@@ -165,10 +226,7 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
         """Write JSONL, upload, create batch. Returns batch_id."""
         with tempfile.NamedTemporaryFile(mode='w+b', suffix='.jsonl') as f:
             for i, t in enumerate(texts):
-                f.write(json.dumps({"custom_id": str(i), "method": "POST",
-                           "url": "/v1/embeddings",
-                           "body": {"model": self.model, "input": t,
-                                    "encoding_format": "float"}}).encode())
+                f.write(json.dumps(self._format_batch_line(i, t)).encode())
                 f.write(b'\n')
             f.seek(0)
             resp = session.post(f"{url_base}/v1/files",
@@ -176,11 +234,9 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
                 files={"file": f}, data={"purpose": "batch"})
         resp.raise_for_status()
         file_id = resp.json()["id"]
-        resp = session.post(f"{url_base}/v1/batches",
+        resp = session.post(f"{url_base}{self._batch_endpoint}",
             headers={"Content-Type": "application/json", **auth_headers},
-            json={"input_file_id": file_id,
-                  "endpoint": "/v1/embeddings",
-                  "completion_window": "24h"})
+            json=self._create_batch_request(file_id))
         resp.raise_for_status()
         return resp.json()["id"]
 
@@ -189,24 +245,24 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
                            conn: Connection | None) -> tuple[np.ndarray, int]:
         """Poll until batch completes, download results. Returns (vectors, total_tokens)."""
         while True:
-            resp = session.get(f"{url_base}/v1/batches/{batch_id}",
+            resp = session.get(f"{url_base}{self._batch_endpoint}/{batch_id}",
                 headers=auth_headers)
             resp.raise_for_status()
             batch_data = resp.json()
             status = batch_data["status"]
-            if status == "completed":
-                output_file_id = batch_data["output_file_id"]
+            if status == self._batch_completed_status:
+                output_file_id = batch_data[self._batch_output_file_key]
                 if conn is not None:
                     conn.tracing(
                         f"[Embedding Batch] batch {batch_id} completed, downloading results")
                 break
-            elif status in ("failed", "expired", "cancelled"):
+            elif status in self._batch_failed_statuses:
                 raise RuntimeError(f"Batch {batch_id} {status}: {batch_data}")
             if conn is not None:
-                counts = batch_data.get("request_counts", {})
+                completed, total = self._batch_progress(batch_data)
                 conn.tracing(
                     f"[Embedding Batch] batch {batch_id}: status={status}, "
-                    f"completed={counts.get('completed', '?')}/{counts.get('total', '?')}, "
+                    f"completed={completed}/{total}, "
                     f"waiting...")
             time.sleep(10)
 
@@ -224,7 +280,7 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
         return np.asarray(results, dtype=np.float32), total_tokens
 
     def _embed_batch(self, text: list[str]) -> EmbedResult:
-        """Embed via OpenAI Batch API (async, 50% cost). Splits into sub-batches if needed."""
+        """Embed via Batch API (async, 50% cost). Splits into sub-batches if needed."""
         from Isabelle_RPC_Host.rpc import Connection
         conn = Connection.current()
         url_base = self.base_url.rstrip("/")
@@ -277,12 +333,50 @@ class Text_Embedding_3_Small(OpenAI_Embedding_Provider):
     model = "text-embedding-3-small"
     dimension = 1536
 
-@register_embedding_provider("mistral.codestral-embed")
+@register_embedding_provider("codestral-embed")
 class Codestral_Embed(OpenAI_Embedding_Provider):
     base_url = "https://api.mistral.ai"
     api_key: str | None = os.getenv("MISTRAL_API_KEY")
     model = "codestral-embed"
     dimension = 1536
+    max_request_size = 50
+    max_batch_size = 1000000
+    supports_batch = False
+
+    _batch_endpoint = "/v1/batch/jobs"
+    _batch_completed_status = "SUCCESS"
+    _batch_failed_statuses = {"FAILED", "TIMEOUT_EXCEEDED", "CANCELLED"}
+    _batch_output_file_key = "output_file"
+
+    def _format_batch_line(self, i: int, text: str) -> dict:
+        return {"custom_id": str(i),
+                "body": {"input": text, "encoding_format": "float"}}
+
+    def _create_batch_request(self, file_id: str) -> dict:
+        return {"input_files": [file_id], "model": self.model,
+                "endpoint": "/v1/embeddings", "timeout_hours": 24}
+
+    def _batch_progress(self, data: dict) -> tuple[int, int]:
+        return data.get("completed_requests", 0), data.get("total_requests", 0)
+
+@register_embedding_provider("aliyun.text-embedding-v4")
+class Qwen3_Embedding_by_Aliyun(OpenAI_Embedding_Provider):
+    base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode"
+    api_key: str | None = os.getenv("ALIYUN_API_KEY")
+    model = "text-embedding-v4"
+    dimension = 1024
+    max_request_size = 10
+    supports_batch = False
+
+@register_embedding_provider("fw.qwen3-embedding-8b")
+class Qwen3_Embedding_8B_by_Fireworks(OpenAI_Embedding_Provider):
+    base_url = "https://api.fireworks.ai/inference"
+    api_key: str | None = os.getenv("FIREWORKS_API_KEY")
+    model = "fireworks/qwen3-embedding-8b"
+    dimension = 4096
+    max_request_size = 2048
+    supports_batch = False
+    normalize = True
 
 type key = bytes
 

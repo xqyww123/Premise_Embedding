@@ -119,7 +119,8 @@ fun gen_infra_filters (context : Context.generic)
 
     (* --- Proposition content check --- *)
 
-    val internal_prefixes = ["Lifting.", "BNF_Def.", "Transfer.", "BNF_Cardinal_Order_Relation.", "HOL.equal"]
+    val internal_prefixes = ["Lifting.", "BNF_Def.", "Transfer.", "BNF_Cardinal_Order_Relation.",
+          "HOL.equal", "ATP."]
     fun is_internal_class (Const(name1, _) $ Const(\<^const_name>\<open>Pure.type\<close>, _)) =
           String.isSuffix "_class" name1
       | is_internal_class (Const(\<^const_name>\<open>Pure.eq\<close>, _) $ A $ B) =
@@ -152,7 +153,7 @@ fun gen_infra_filters (context : Context.generic)
         orelse is_inductive_infra_thm full_name
         orelse Term.exists_Const is_internal_constant (Thm.prop_of thm)
         orelse is_internal_class (Thm.prop_of thm)
-        orelse is_trivial_thm thm
+      (* orelse is_trivial_thm thm *)
   in
     {is_infra_const = is_infra_const, is_infra_thm = is_infra_thm,
      is_infra_type = fn name => Name_Space.is_concealed type_space name

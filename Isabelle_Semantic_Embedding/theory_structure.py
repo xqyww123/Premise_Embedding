@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 def theory_info(connection: "Connection", theory_name: str) -> tuple[str, str]:
     """Resolve a theory name to (long_name, file_path) via Isabelle callback."""
-    return tuple(connection.callback("Theory_Structure.theory_info", theory_name))
+    return tuple(connection.callback("Context.theory_long_name_and_path", theory_name))
 
 
 def get_session_databases(connection: "Connection") -> list[tuple[str, str]]:

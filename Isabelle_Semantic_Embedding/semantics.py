@@ -156,7 +156,8 @@ _query_by_name_schema = {
     "properties": {
         "type": {
             "type": "string",
-            "enum": ["constant", "lemma", "type", "typeclass", "locale"],
+            "enum": ["constant", "lemma", "type", "typeclass", "locale",
+                    "introduction rule", "elimination rule"],
             "description": "The kind of entity to query.",
         },
         "name": {

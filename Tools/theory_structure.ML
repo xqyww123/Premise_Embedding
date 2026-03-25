@@ -8,7 +8,8 @@ signature THEORY_STRUCTURE = sig
   val get_classes_with_positions : Context.generic -> (string * Position.T) list
   val get_locales_with_positions : Context.generic -> (string * Position.T) list
   val parse_thm_name : string -> string * int option
-  val make_theory_info_callback : Context.generic -> Remote_Procedure_Calling.callback'
+  val get_introduction_rules_with_positions : Context.generic -> (string * Position.T * thm) list
+  val get_elimination_rules_with_positions  : Context.generic -> (string * Position.T * thm) list
 end
 
 structure Theory_Structure : THEORY_STRUCTURE = struct
@@ -155,22 +156,38 @@ fun get_theorems_with_positions context =
       end)
   end
 
-fun make_theory_info_callback (context : Context.generic)
-    : Remote_Procedure_Calling.callback' =
+(* Get introduction/elimination rules from the classical reasoner (local only).
+   Uses Thm.derivation_name for names; rules with empty names are skipped. *)
+local
+fun get_rules_with_positions selector context =
   let
-    fun theory_info name =
-      let val t = resolve_theory context name
-          val file_path = get_theory_file_path t
-      in (Context.theory_long_name t, file_path) end
+    val thy = Context.theory_of context
+    val thy_base = Context.theory_base_name thy
+    val thy_prefix = thy_base ^ "."
+    val cs = Classical.rep_cs (Classical.get_cs context)
+    val rules = selector cs
+    val ctxt = Context.cases Proof_Context.init_global I context
+    val fact_space = Facts.space_of (Proof_Context.facts_of ctxt)
+    val seen : unit Strhashtab.table = Strhashtab.empty 128
   in
-    Remote_Procedure_Calling.mk_callback {
-      name = "Theory_Structure.theory_info",
-      arg_schema = MessagePackBinIO.Unpack.unpackString,
-      ret_schema = MessagePackBinIO.Pack.packPair
-                     (MessagePackBinIO.Pack.packString, MessagePackBinIO.Pack.packString),
-      function = theory_info,
-      timeout = NONE
-    }
+    map_filter (fn (thm, _, _) =>
+      let val thm = Thm.transfer thy thm
+          val name = Thm.derivation_name thm
+      in if name = "" orelse Strhashtab.defined seen name then NONE
+         else if not (String.isPrefix thy_prefix name) then NONE
+         else (Strhashtab.update seen (name, ());
+               let val pos = case try (Name_Space.the_entry fact_space) name of
+                     SOME entry => #pos entry | NONE => Position.none
+               in SOME (name, pos, thm) end)
+      end) rules
   end
+in
+val get_introduction_rules_with_positions =
+  get_rules_with_positions (fn cs =>
+    Item_Net.content (#safeIs cs) @ Item_Net.content (#unsafeIs cs))
+val get_elimination_rules_with_positions =
+  get_rules_with_positions (fn cs =>
+    Item_Net.content (#safeEs cs) @ Item_Net.content (#unsafeEs cs))
+end
 
 end

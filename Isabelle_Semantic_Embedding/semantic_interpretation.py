@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 import threading
 from typing import Any, NamedTuple, cast
 
@@ -15,6 +16,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookMatcher,
+    ThinkingConfigAdaptive,
     create_sdk_mcp_server,
     tool,
 )
@@ -36,12 +38,16 @@ _KIND_THEOREM = 2
 _KIND_TYPE = 3
 _KIND_CLASS = 4
 _KIND_LOCALE = 5
+_KIND_INTRODUCTION_RULE = 0x12
+_KIND_ELIMINATION_RULE = 0x22
 _KIND_PROMPT_LABELS = {
     _KIND_CONSTANT: "constant",
     _KIND_THEOREM: "lemma",
     _KIND_TYPE: "type",
     _KIND_CLASS: "typeclass",
     _KIND_LOCALE: "locale",
+    _KIND_INTRODUCTION_RULE: "introduction rule",
+    _KIND_ELIMINATION_RULE: "elimination rule",
 }
 _BATCH_SIZE = 20
 
@@ -187,6 +193,7 @@ class InterpretationTask:
             )
 
         return f"""\
+Load the skill `isabelle-intro-elim-rules`.
 Informalize the following entities from Isabelle theory "{theory_longname}" (location: {file_path})
 
 Entries:
@@ -198,13 +205,15 @@ For each entry, translate the formal statement into a concise plain-English desc
 State only what the entity defines or asserts. \
 Do NOT explain how it is derived or why it is useful. \
 The formal statement is already shown; describe its meaning rather than transcribing it. \
-Prefer plain English over formulas. Wrap formulas in backticks (e.g., `x`, `x + 1`).
+Prefer plain English over formulas. Wrap formulas in backticks (e.g., `x`, `x + 1`). \
+When a lemma/rule/term has a well-known name (e.g., proof by contradiction), you MUST mention it explicitly in the translation.
 
 Examples of good translations:
-- constant Nat.add: The addition function on natural numbers, taking two natural numbers and returning their sum.
+- constant Nat.add: The addition operator on natural numbers, taking two natural numbers and returning their sum.
 - lemma List.length_append: The length of the concatenation of two lists equals the sum of their individual lengths.
 - lemma List.map_comp: Mapping `f` then `g` over a list is the same as mapping their composition `g \u2218 f`.
 - type Prod: The product type, consisting of a pair of two values of possibly different types.
+- introduction rule notI `(P \u27f9 False) \u27f9 \u00acP`: The rule of proof by contradiction \u2014 to prove `\u00acP`, assume `P` and derive `False`.
 
 Translation hints:
 - Suc n \u2192 "the successor of n" or "n + 1"
@@ -237,7 +246,8 @@ _answer_schema = {
                 "properties": {
                     "type": {
                         "type": "string",
-                        "enum": ["constant", "lemma", "type", "typeclass", "locale"]
+                        "enum": ["constant", "lemma", "type", "typeclass", "locale",
+                                 "introduction rule", "elimination rule"]
                     },
                     "name": {
                         "type": "string",
@@ -369,36 +379,25 @@ async def _list_tools(client: ClaudeSDKClient) -> None:
         _log_message(message)
 
 
+class ReachLimitError(Exception):
+    pass
+
 async def _run_agent(options: ClaudeAgentOptions) -> None:
     task = _local.task
     first_prompt, task.batch_range = task.batches[0]
-    async with ClaudeSDKClient(options=options) as client:
-        _log.info("agent: starting batch 0 (%d–%d)",
-                   task.batch_range.start, task.batch_range.stop - 1)
-        await client.query(first_prompt)
-        async for message in client.receive_response():
-            _log_message(message)
-            if isinstance(message, ResultMessage):
-                if message.usage:
-                    task.total_input_tokens += message.usage.get("input_tokens", 0)
-                    task.total_output_tokens += message.usage.get("output_tokens", 0)
-                if message.total_cost_usd:
-                    task.total_cost_usd += message.total_cost_usd
-                _log.info("round usage: %s, cost: $%.4f",
-                           message.usage, message.total_cost_usd or 0)
-        # Retry any globally missing entries
-        while True:
-            missing = [k for k, v in task.results.items() if v is None]
-            if not missing:
-                break
-            _log.info("agent: retrying %d missing entries", len(missing))
-            missing_lines = "\n".join(f"  {k}" for k in missing)
-            await client.query(
-                f"You still have {len(missing)} unanswered entries. "
-                f"Use the `mcp__isabelle_semantics__answer` tool to submit interpretations for:\n{missing_lines}"
-            )
+    try:
+        async with ClaudeSDKClient(options=options) as client:
+            _log.info("agent: starting batch 0 (%d–%d)",
+                    task.batch_range.start, task.batch_range.stop - 1)
+            await client.query(first_prompt)
             async for message in client.receive_response():
                 _log_message(message)
+                content = getattr(message, "content", None)
+                if content is not None and isinstance(content, list) and content:
+                    block = content[0]
+                    text = getattr(block, "text", None)
+                    if isinstance(text, str) and text.startswith("You've hit your limit"):
+                        raise ReachLimitError()
                 if isinstance(message, ResultMessage):
                     if message.usage:
                         task.total_input_tokens += message.usage.get("input_tokens", 0)
@@ -406,9 +405,34 @@ async def _run_agent(options: ClaudeAgentOptions) -> None:
                     if message.total_cost_usd:
                         task.total_cost_usd += message.total_cost_usd
                     _log.info("round usage: %s, cost: $%.4f",
-                               message.usage, message.total_cost_usd or 0)
-    _log.info("total usage: input=%d output=%d tokens, cost=$%.4f",
-               task.total_input_tokens, task.total_output_tokens, task.total_cost_usd)
+                            message.usage, message.total_cost_usd or 0)
+            # Retry any globally missing entries
+            while True:
+                missing = [k for k, v in task.results.items() if v is None]
+                if not missing:
+                    break
+                _log.info("agent: retrying %d missing entries", len(missing))
+                missing_lines = "\n".join(f"  {k}" for k in missing)
+                await client.query(
+                    f"You still have {len(missing)} unanswered entries. "
+                    f"Use the `mcp__isabelle_semantics__answer` tool to submit interpretations for:\n{missing_lines}"
+                )
+                async for message in client.receive_response():
+                    _log_message(message)
+                    if isinstance(message, ResultMessage):
+                        if message.usage:
+                            task.total_input_tokens += message.usage.get("input_tokens", 0)
+                            task.total_output_tokens += message.usage.get("output_tokens", 0)
+                        if message.total_cost_usd:
+                            task.total_cost_usd += message.total_cost_usd
+                        _log.info("round usage: %s, cost: $%.4f",
+                                message.usage, message.total_cost_usd or 0)
+        _log.info("total usage: input=%d output=%d tokens, cost=$%.4f",
+                task.total_input_tokens, task.total_output_tokens, task.total_cost_usd)
+    except ReachLimitError:
+        _log.info("agent: reached limit, waiting for 20min to retry")
+        await asyncio.sleep(1200)
+        return await _run_agent(options)
 
 
 # --- Public API ---
@@ -499,10 +523,13 @@ def interpret_file(
                 definition_tool, hover_tool, _answer_tool])
             options = ClaudeAgentOptions(
                 model="claude-opus-4-6",
-                cwd=os.path.dirname(unicode_file_path),
+                cwd=str(Path(__file__).parent / "Agent_Interpretation_Dir"),
+                setting_sources=["project"],
                 permission_mode="default",
                 allowed_tools=list(_TOOL_WHITELIST),
                 mcp_servers={"isabelle_semantics": mcp},
+                thinking=ThinkingConfigAdaptive(),
+                effort="high",
                 hooks={
                     "PreToolUse": [
                         HookMatcher(matcher="*", hooks=[_permission_control]),

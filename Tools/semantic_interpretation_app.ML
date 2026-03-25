@@ -1,12 +1,11 @@
 (*
-  Isa-REPL App for collecting semantic interpretations.
-
-  Reads a theory name from the socket, calls Semantic_Store.interpret,
-  and streams tracing messages back to the client in real-time.
+  Isa-REPL App for collecting semantic interpretations and optionally
+  embedding them into vectors.
 
   Protocol:
     Client sends: theory_name (msgpack string)
-    Server streams: packString messages during interpretation (from tracing)
+                  models (msgpack string list, may be empty)
+    Server streams: packString messages during interpretation/embedding (from tracing)
     Server sends:   packUnit when done successfully
     On error:       sends packString "ERROR: ..." then packUnit
 *)
@@ -26,6 +25,7 @@ val _ = REPL_Server.register_app "Semantic_Store.collect" (fn (cin, cout, state)
     \<^try>\<open>
       let
         val thy_name = read unpackString
+        val models = read (unpackList unpackString)
         val thy = Thy_Info.get_theory thy_name
         val _ = Theory_Hash.store_theory_hash thy
 
@@ -55,8 +55,14 @@ val _ = REPL_Server.register_app "Semantic_Store.collect" (fn (cin, cout, state)
            Private_Output.error_message_fn := old_error_message)
         val _ = set_channels (fn msgs => List.app send msgs)
 
-        val _ = \<^try>\<open>Semantic_Store.interpret (Context.Theory thy)
+        val context = Context.Theory thy
+        val theories = thy :: Theory.ancestors_of thy
+        val _ = \<^try>\<open>Semantic_Store.interpret context
           catch exn => (restore_channels (); Exn.reraise exn)\<close>
+        val _ = List.app (fn model =>
+          (send ("[Embedding] model: " ^ model);
+           \<^try>\<open>Semantic_Store.embed_semantics context (theories, model)
+             catch exn => (restore_channels (); Exn.reraise exn)\<close>)) models
         val _ = restore_channels ()
         val _ = done ()
       in state end

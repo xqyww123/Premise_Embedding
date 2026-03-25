@@ -214,6 +214,10 @@ local
     | entity_kind_rank (Locale _) = 1
     | entity_kind_rank (Type _) = 2
     | entity_kind_rank (Constant _) = 3
+    | entity_kind_rank (Introduction_Rule _) = 5
+    | entity_kind_rank (Named_Introduction_Rule _) = 5
+    | entity_kind_rank (Elimination_Rule _) = 6
+    | entity_kind_rank (Named_Elimination_Rule _) = 6
     | entity_kind_rank _ = 4
 in
 fun key_kind_ord (k1, k2) = int_ord (entity_kind_rank k1, entity_kind_rank k2)
@@ -320,6 +324,21 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
                in SOME (entity, name, pos,
                     Universal_Key.key_of context entity) end)
 
+    (* 5b. Extract introduction and elimination rules *)
+    val intro_entries = Theory_Structure.get_introduction_rules_with_positions context
+      |> map_filter (fn (name, pos, thm) =>
+          if is_infra_thm (name, thm) then NONE
+          else let val entity = Universal_Key.Introduction_Rule thm
+               in SOME (entity, name, pos,
+                    Universal_Key.key_of context entity) end)
+
+    val elim_entries = Theory_Structure.get_elimination_rules_with_positions context
+      |> map_filter (fn (name, pos, thm) =>
+          if is_infra_thm (name, thm) then NONE
+          else let val entity = Universal_Key.Elimination_Rule thm
+               in SOME (entity, name, pos,
+                    Universal_Key.key_of context entity) end)
+
     (* 6. Build entries list, sorted by source position. *)
     val ctxt = Context.cases Proof_Context.init_global I context
     val pp = string_of_term ctxt
@@ -331,6 +350,14 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
           (pp (Thm.prop_of thm)
            handle ERROR msg =>
              (warning ("mk_prop_str: Theorem pp failed: " ^ msg); raise ERROR msg))
+      | Universal_Key.Introduction_Rule thm =>
+          (pp (Thm.prop_of thm)
+           handle ERROR msg =>
+             (warning ("mk_prop_str: Introduction_Rule pp failed: " ^ msg); raise ERROR msg))
+      | Universal_Key.Elimination_Rule thm =>
+          (pp (Thm.prop_of thm)
+           handle ERROR msg =>
+             (warning ("mk_prop_str: Elimination_Rule pp failed: " ^ msg); raise ERROR msg))
       | Universal_Key.Constant cname =>
           (let val T = Consts.the_constraint (Sign.consts_of thy) cname
            in pp_typ T end
@@ -342,7 +369,8 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
 
     val all_entries_with_pos =
       (const_entries @ deduped_thm_entries
-       @ type_entries @ class_entries @ locale_entries)
+       @ type_entries @ class_entries @ locale_entries
+       @ intro_entries @ elim_entries)
       |> sort entry_ord
     val entries = all_entries_with_pos
       |> map (fn (entity, name, pos, uk) =>
@@ -351,7 +379,7 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
 
     (* 7. Build callbacks capturing context *)
     val uk_cb = Universal_Key.make_universal_key_callback context
-    val theory_info_cb = Theory_Structure.make_theory_info_callback context
+    val theory_info_cb = Context_Callbacks.make_theory_long_name_and_path_callback context
     val cmd = make_interpret_file_cmd [uk_cb, theory_info_cb]
 
     (* 8. Call RPC command *)
@@ -454,6 +482,14 @@ fun make_interpret_theory_callback (context : Context.generic)
     timeout = NONE
   }
 
+fun extract_intro_rules ctx =
+  let val cs = Classical.rep_cs (Classical.get_cs ctx)
+  in map #1 (Item_Net.content (#safeIs cs) @ Item_Net.content (#unsafeIs cs)) end
+
+fun extract_elim_rules ctx =
+  let val cs = Classical.rep_cs (Classical.get_cs ctx)
+  in map #1 (Item_Net.content (#safeEs cs) @ Item_Net.content (#unsafeEs cs)) end
+
 local open MessagePackBinIO.Pack MessagePackBinIO.Unpack in
 
 fun query_knn (context : Context.generic) (query_text : semantics) (k : int)
@@ -461,16 +497,22 @@ fun query_knn (context : Context.generic) (query_text : semantics) (k : int)
     (domain : Universal_Key.universal_key list option)
     : (real * Universal_Key.entity) list =
   let
+    val t0 = Time.now ()
+    val {is_infra_const, is_infra_thm, is_infra_type, is_infra_class, is_infra_locale} =
+      Infra_Filter.gen_infra_filters context
     val callbacks = [
-      make_constants_callback context,
-      make_theorems_callback context,
-      make_types_callback context,
-      make_classes_callback context,
-      make_locales_callback context,
+      Context_Callbacks.make_constants_callback (SOME (not o is_infra_const)) context,
+      Context_Callbacks.make_theorems_callback (SOME (not o is_infra_thm)) context,
+      Context_Callbacks.make_types_callback (SOME (not o is_infra_type)) context,
+      Context_Callbacks.make_classes_callback (SOME (not o is_infra_class)) context,
+      Context_Callbacks.make_locales_callback (SOME (not o is_infra_locale)) context,
+      Context_Callbacks.make_introduction_rules_callback extract_intro_rules (SOME (not o is_infra_thm)) context,
+      Context_Callbacks.make_elimination_rules_callback extract_elim_rules (SOME (not o is_infra_thm)) context,
       make_interpret_theory_callback context,
-      make_theory_long_name_callback context,
+      Context_Callbacks.make_theory_long_name_callback context,
       Config.make_config_lookup_callback context
     ]
+    val t1 = Time.now ()
     val cmd : (string * int * Universal_Key.entity_kind list * Universal_Key.universal_key list option,
                (real * Universal_Key.entity) list)
               Remote_Procedure_Calling.command = {
@@ -482,9 +524,11 @@ fun query_knn (context : Context.generic) (query_text : semantics) (k : int)
       callback = callbacks,
       timeout = NONE
     }
-  in
-    Remote_Procedure_Calling.call_command cmd (query_text, k, kinds, domain)
-  end
+    val result = Remote_Procedure_Calling.call_command cmd (query_text, k, kinds, domain)
+    val t2 = Time.now ()
+    val _ = tracing ("[query_knn ML] setup=" ^ Time.toString (t1 - t0) ^
+              "s  rpc=" ^ Time.toString (t2 - t1) ^ "s")
+  in result end
 
 fun is_thy_embedded (context : Context.generic) (theory_name : string, model : string) : bool =
   let
@@ -521,12 +565,16 @@ fun embed_semantics (context : Context.generic) (theories : theory list, model :
       let
         val _ = tracing ("[Semantic_Store] embed_semantics: " ^
                    Int.toString (length unembedded) ^ " theories to embed")
+        val {is_infra_const, is_infra_thm, is_infra_type, is_infra_class, is_infra_locale} =
+          Infra_Filter.gen_infra_filters context
         val callbacks = [
-          make_constants_callback context,
-          make_theorems_callback context,
-          make_types_callback context,
-          make_classes_callback context,
-          make_locales_callback context,
+          Context_Callbacks.make_constants_callback (SOME (not o is_infra_const)) context,
+          Context_Callbacks.make_theorems_callback (SOME (not o is_infra_thm)) context,
+          Context_Callbacks.make_types_callback (SOME (not o is_infra_type)) context,
+          Context_Callbacks.make_classes_callback (SOME (not o is_infra_class)) context,
+          Context_Callbacks.make_locales_callback (SOME (not o is_infra_locale)) context,
+          Context_Callbacks.make_introduction_rules_callback extract_intro_rules (SOME (not o is_infra_thm)) context,
+          Context_Callbacks.make_elimination_rules_callback extract_elim_rules (SOME (not o is_infra_thm)) context,
           Universal_Key.make_universal_key_callback context,
           Config.make_config_lookup_callback context
         ]
