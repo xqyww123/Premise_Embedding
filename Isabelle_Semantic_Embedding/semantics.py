@@ -152,34 +152,43 @@ def clean_wip() -> int:
 
 # --- MCP tool factories ---
 
-_query_by_name_schema = {
-    "type": "object",
-    "properties": {
-        "type": {
-            "type": "string",
-            "enum": ["constant", "lemma", "type", "typeclass", "locale",
-                    "introduction rule", "elimination rule"],
-            "description": "The kind of entity to query.",
+_NAME_DESCRIPTION_BASE = "The short or full name of the entity to look up."
+_NAME_DESCRIPTION_INTERP = (
+    _NAME_DESCRIPTION_BASE +
+    " For multi-variant theorems, include a '(idx)' suffix (e.g. 'conjI(2)').")
+
+def _mk_query_by_name_schema(working_names: list[str]) -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": ["constant", "lemma", "type", "typeclass", "locale",
+                        "introduction rule", "elimination rule"],
+                "description": "The kind of entity to query.",
+            },
+            "name": {
+                "type": "string",
+                "description": _NAME_DESCRIPTION_INTERP if working_names else _NAME_DESCRIPTION_BASE,
+            },
         },
-        "name": {
-            "type": "string",
-            "description": "The name of the entity to look up. "
-            "For multi-variant theorems, include a '(idx)' suffix (e.g. 'conjI(2)').",
-        },
-    },
-    "required": ["type", "name"],
-}
+        "required": ["type", "name"],
+    }
 
 
 def mk_query_by_name_tool(
     connection: Connection, working_names: list[str], with_pretty: bool = True
 ) -> SdkMcpTool[Any]:
     log = connection.server.logger.getChild("semantics")
+    description = "Look up the English translation of a dependency from parent theories."
+    if working_names:
+        description += (
+            " Do not query entries you have been asked to interpret"
+            " — interpret those from the source file yourself.")
     @tool(
         "query_by_name",
-        "Look up the semantic interpretation of a dependency from parent theories. "
-        "Do not query entries you have been asked to interpret — interpret those from the source file yourself.",
-        input_schema=_query_by_name_schema,
+        description,
+        input_schema=_mk_query_by_name_schema(working_names),
     )
     async def query_by_name_tool(args: dict[str, Any]) -> ToolCall_ret:
         try:
@@ -194,7 +203,7 @@ def mk_query_by_name_tool(
                 return _mk_ret(f"Invalid type: {t!r}. Must be one of {[k.label for k in EntityKind if k != EntityKind.THEORY]}.", is_error=True)
             if not name:
                 return _mk_ret("Invalid name: must be a non-empty string.", is_error=True)
-            if name in working_names:
+            if working_names and name in working_names:
                 log.debug("Entity name %r is in working_names; cannot query entities assigned for interpretation.", name)
                 return _mk_ret(
                     f"Cannot query \"{name}\" — it is or will be your task to interpret it from the source.",
@@ -219,9 +228,14 @@ def mk_query_by_position_tool(
     unicode: bool = False, with_pretty: bool = True
 ) -> SdkMcpTool[Any]:
     log = connection.server.logger.getChild("semantics")
+    description = "Look up the semantic interpretation of the entity at a given source position."
+    if working_names:
+        description += (
+            " Do not query entries you have been asked to interpret"
+            " — interpret those from the source file yourself.")
     @tool(
         "query_by_position",
-        "Look up the semantic interpretation of the entity at a given source position.",
+        description,
         input_schema=_position_schema,
     )
     async def query_by_position_tool(args: dict[str, Any]) -> ToolCall_ret:
@@ -247,7 +261,7 @@ def mk_query_by_position_tool(
             tag = _PIDE_KIND_TO_TAG.get(kind)
             if tag is None:
                 return _mk_ret(f"Entity kind \"{kind}\" ({name}) is not queryable.")
-            if name in working_names:
+            if working_names and name in working_names:
                 return _mk_ret(
                     f"Cannot query \"{name}\" — it is your task to interpret it from the source.",
                     is_error=True,
