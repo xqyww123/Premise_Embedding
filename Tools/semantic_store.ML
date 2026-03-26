@@ -218,7 +218,7 @@ local
     | entity_kind_rank (Named_Introduction_Rule _) = 5
     | entity_kind_rank (Elimination_Rule _) = 6
     | entity_kind_rank (Named_Elimination_Rule _) = 6
-    | entity_kind_rank _ = 4
+    | entity_kind_rank _ = 10
 in
 fun key_kind_ord (k1, k2) = int_ord (entity_kind_rank k1, entity_kind_rank k2)
 end

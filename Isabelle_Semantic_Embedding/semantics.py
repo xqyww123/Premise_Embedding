@@ -214,7 +214,19 @@ def mk_query_by_name_tool(
             if sem is None:
                 return _mk_ret(f"{t} \"{name}\" has not been interpreted yet.")
             return _mk_ret(sem)
-        except (IsabelleError, UndefinedEntity) as e:
+        except UndefinedEntity as e:
+            if "." in name:
+                short = name.rsplit(".", 1)[1]
+                try:
+                    uk = universal_key_of(connection, tag, short)
+                    sem = Semantic_DB.query(uk, with_pretty=with_pretty)
+                    if sem is not None:
+                        return _mk_ret(f"The {name} is undefined, but we find:\n{sem}")
+                except (IsabelleError, UndefinedEntity):
+                    pass
+            log.warning("%s: %s", type(e).__name__, e)
+            return _mk_ret(str(e), is_error=True)
+        except IsabelleError as e:
             log.warning("%s: %s", type(e).__name__, e)
             return _mk_ret(str(e), is_error=True)
         except Exception:
