@@ -156,21 +156,34 @@ fun get_theorems_with_positions context =
       end)
   end
 
-(* Get introduction/elimination rules from the classical reasoner (local only).
+(* Get introduction/elimination rules.
+   Combines two sources:
+   1. Classical reasoner rules (safeIs/unsafeIs or safeEs/unsafeEs)
+   2. Name-based heuristic: facts whose base name ends with I (intro) or E (elim),
+      where the preceding character is not an uppercase letter.
    Uses Thm.derivation_name for names; rules with empty names are skipped. *)
 local
-fun get_rules_with_positions selector context =
+
+fun has_rule_suffix suffix name =
+  let val base = Long_Name.base_name name
+      val len = size base
+  in len >= 2
+     andalso String.sub (base, len - 1) = suffix
+     andalso not (Char.isUpper (String.sub (base, len - 2)))
+  end
+
+fun get_rules_with_positions selector suffix context =
   let
     val thy = Context.theory_of context
     val thy_base = Context.theory_base_name thy
     val thy_prefix = thy_base ^ "."
-    val cs = Classical.rep_cs (Classical.get_cs context)
-    val rules = selector cs
     val ctxt = Context.cases Proof_Context.init_global I context
     val fact_space = Facts.space_of (Proof_Context.facts_of ctxt)
     val seen : unit Strhashtab.table = Strhashtab.empty 128
-  in
-    map_filter (fn (thm, _, _) =>
+
+    (* Source 1: classical reasoner *)
+    val cs = Classical.rep_cs (Classical.get_cs context)
+    val cs_results = map_filter (fn (thm, _, _) =>
       let val thm = Thm.transfer thy thm
           val name = Thm.derivation_name thm
       in if name = "" orelse Strhashtab.defined seen name then NONE
@@ -179,15 +192,35 @@ fun get_rules_with_positions selector context =
                let val pos = case try (Name_Space.the_entry fact_space) name of
                      SOME entry => #pos entry | NONE => Position.none
                in SOME (name, pos, thm) end)
-      end) rules
-  end
+      end) (selector cs)
+
+    (* Source 2: name-based heuristic from facts *)
+    val (parent_facts, facts) = Context.cases
+      (fn thy => (map Global_Theory.facts_of (Theory.parents_of thy), Global_Theory.facts_of thy))
+      (fn ctxt => ([Global_Theory.facts_of (Proof_Context.theory_of ctxt)], Proof_Context.facts_of ctxt))
+      context
+    val facts_list = Facts.dest_static false parent_facts facts
+    val name_results = maps (fn (name, thms) =>
+      if not (has_rule_suffix suffix name) then []
+      else map_filter (fn thm =>
+        let val thm = Thm.transfer thy thm
+            val dname = Thm.derivation_name thm
+            val key = if dname = "" then name else dname
+        in if Strhashtab.defined seen key then NONE
+           else (Strhashtab.update seen (key, ());
+                 let val pos = case try (Name_Space.the_entry fact_space) name of
+                       SOME entry => #pos entry | NONE => Position.none
+                 in SOME (name, pos, thm) end)
+        end) thms) facts_list
+  in cs_results @ name_results end
+
 in
 val get_introduction_rules_with_positions =
   get_rules_with_positions (fn cs =>
-    Item_Net.content (#safeIs cs) @ Item_Net.content (#unsafeIs cs))
+    Item_Net.content (#safeIs cs) @ Item_Net.content (#unsafeIs cs)) #"I"
 val get_elimination_rules_with_positions =
   get_rules_with_positions (fn cs =>
-    Item_Net.content (#safeEs cs) @ Item_Net.content (#unsafeEs cs))
+    Item_Net.content (#safeEs cs) @ Item_Net.content (#unsafeEs cs)) #"E"
 end
 
 end

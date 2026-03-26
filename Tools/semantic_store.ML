@@ -29,8 +29,8 @@ signature SEMANTIC_STORE = sig
   (* Search k nearest entities by semantic similarity to a query string.
      kinds filters entity types; NONE domain means all entities of those kinds.
      Returns (score, entity) pairs sorted by similarity. *)
-  val query_knn : Context.generic -> semantics -> int ->
-    Universal_Key.entity_kind list -> Universal_Key.universal_key list option ->
+  val query_knn : Context.generic ->
+    semantics * int * Universal_Key.entity_kind list * Universal_Key.universal_key list option ->
     (real * Universal_Key.entity) list
 
   (* Embed semantic interpretations into vectors for the given theories
@@ -492,12 +492,8 @@ fun extract_elim_rules ctx =
 
 local open MessagePackBinIO.Pack MessagePackBinIO.Unpack in
 
-fun query_knn (context : Context.generic) (query_text : semantics) (k : int)
-    (kinds : Universal_Key.entity_kind list)
-    (domain : Universal_Key.universal_key list option)
-    : (real * Universal_Key.entity) list =
+fun query_knn (context : Context.generic) =
   let
-    val t0 = Time.now ()
     val {is_infra_const, is_infra_thm, is_infra_type, is_infra_class, is_infra_locale} =
       Infra_Filter.gen_infra_filters context
     val callbacks = [
@@ -512,7 +508,6 @@ fun query_knn (context : Context.generic) (query_text : semantics) (k : int)
       Context_Callbacks.make_theory_long_name_callback context,
       Config.make_config_lookup_callback context
     ]
-    val t1 = Time.now ()
     val cmd : (string * int * Universal_Key.entity_kind list * Universal_Key.universal_key list option,
                (real * Universal_Key.entity) list)
               Remote_Procedure_Calling.command = {
@@ -524,11 +519,10 @@ fun query_knn (context : Context.generic) (query_text : semantics) (k : int)
       callback = callbacks,
       timeout = NONE
     }
-    val result = Remote_Procedure_Calling.call_command cmd (query_text, k, kinds, domain)
-    val t2 = Time.now ()
-    val _ = tracing ("[query_knn ML] setup=" ^ Time.toString (t1 - t0) ^
-              "s  rpc=" ^ Time.toString (t2 - t1) ^ "s")
-  in result end
+  in
+    fn (query_text, k, kinds, domain) =>
+      Remote_Procedure_Calling.call_command cmd (query_text, k, kinds, domain)
+  end
 
 fun is_thy_embedded (context : Context.generic) (theory_name : string, model : string) : bool =
   let

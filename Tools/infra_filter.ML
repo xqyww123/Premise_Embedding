@@ -9,26 +9,25 @@ end
 
 structure Infra_Filter : INFRA_FILTER = struct
 
-val hol_simpset =
-  Raw_Simplifier.simpset_of (Proof_Context.init_global \<^theory>\<open>HOL\<close>)
-
 fun gen_infra_filters (context : Context.generic)
     : {is_infra_const: string -> bool, is_infra_thm: string * thm -> bool,
        is_infra_type: string -> bool, is_infra_class: string -> bool,
        is_infra_locale: string -> bool} =
   let
-    val thy_name = Context.theory_long_name (Context.theory_of context)
     val type_space = Context.cases Sign.type_space Proof_Context.type_space context
-    val const_space = Consts.space_of (Context.cases Sign.consts_of Proof_Context.consts_of context)
+    val consts = Context.cases Sign.consts_of Proof_Context.consts_of context
+    val const_space = Consts.space_of consts
     val fact_space = Facts.space_of
       (Context.cases Global_Theory.facts_of Proof_Context.facts_of context)
     val class_space = Context.cases Sign.class_space Proof_Context.class_space context
     val locale_space = Locale.locale_space (Context.theory_of context)
     fun is_hidden space name =
       Long_Name.is_hidden (Name_Space.intern space name)
-    val local_type_names = Name_Space.get_names type_space
+    val type_names = Name_Space.get_names type_space
       |> filter (fn name =>
-          #theory_long_name (Name_Space.the_entry type_space name) = thy_name)
+          name <> "fun"
+          andalso not (Name_Space.is_concealed type_space name)
+          andalso not (Long_Name.is_hidden (Name_Space.intern type_space name)))
 
     (* --- ADT infrastructure constants --- *)
 
@@ -50,7 +49,7 @@ fun gen_infra_filters (context : Context.generic)
            const_name (BNF_Def.rel_of_bnf bnf)]
           @ map const_name (BNF_Def.sets_of_bnf bnf)
     val preserved_set = Strhashtab.make_set
-      (maps (fn T => ctr_sugar_names T @ bnf_names T) local_type_names)
+      (maps (fn T => ctr_sugar_names T @ bnf_names T) type_names)
 
     (* Pre-BNF intermediate constant prefixes *)
     val pre_prefixes = map_filter (fn T =>
@@ -59,17 +58,17 @@ fun gen_infra_filters (context : Context.generic)
       | SOME fp =>
           let val map_name = fst (Term.dest_Const (BNF_Def.map_of_bnf (#pre_bnf fp)))
           in SOME (Long_Name.qualifier map_name ^ ".") end)
-      local_type_names
+      type_names
 
     (* Class instance constant infixes *)
-    val inst_infixes = map (fn T => "_" ^ Long_Name.base_name T ^ "_inst.") local_type_names
+    val inst_infixes = map (fn T => "_" ^ Long_Name.base_name T ^ "_inst.") type_names
 
     fun is_infra_const name =
       Name_Space.is_concealed const_space name
       orelse is_hidden const_space name
       orelse exists (fn pfx => String.isPrefix pfx name) pre_prefixes
       orelse exists (fn infix_ => String.isSubstring infix_ name) inst_infixes
-      orelse (exists (fn T => String.isPrefix (T ^ ".") name) local_type_names
+      orelse (exists (fn T => String.isPrefix (T ^ ".") name) type_names
               andalso not (Strhashtab.defined preserved_set name))
 
     (* --- ADT infrastructure theorem names --- *)
@@ -81,30 +80,35 @@ fun gen_infra_filters (context : Context.generic)
                 in String.isSuffix "_def" suffix
                  (* orelse suffix = "splits" orelse suffix = "split"
                    orelse String.isPrefix "split_" suffix *) end)
-        local_type_names
+        type_names
 
     (* --- Inductive infrastructure theorem names --- *)
 
     val ctxt = Context.proof_of context
-    val hol_ss_ctxt = put_simpset hol_simpset ctxt
-    val local_const_names = Theory_Structure.get_constants_with_positions context |> map #1
-    val consts = Context.cases Sign.consts_of Proof_Context.consts_of context
-    val inductive_names =
-      local_const_names
-      |> map_filter (fn name =>
-          let val t = Const (name, Consts.the_constraint consts name)
-          in (Inductive.the_inductive ctxt t; SOME name)
-          end
-          handle ERROR _ => NONE | Match => NONE | Empty => NONE
-               | List.Empty => NONE | TYPE _ => NONE)
-      |> Symtab.make_set
-
     (* Check if name or its predicate form (name ^ "p") is inductive.
        inductive_set registers the inductive info under the predicate form
-       (e.g. "listsp"), not the set form ("lists"). *)
+       (e.g. "listsp"), not the set form ("lists").
+       the_inductive_global stores locale names (e.g. "ccpo.iteratesp") but
+       fact names use class names (e.g. "ccpo_class.iteratesp").
+       We strip "_class" from qualifier segments to recover the locale name. *)
+    val is_inductive = can (Inductive.the_inductive_global ctxt)
+    fun declass name =
+      let val segs = Long_Name.explode name
+      in case segs of
+           [] => NONE
+         | _ => let val segs' = map (fn s =>
+                      if String.isSuffix "_class" s
+                      then String.substring (s, 0, size s - 6)
+                      else s) segs
+                    val name' = Long_Name.implode segs'
+                in if name' = name then NONE else SOME name' end
+      end
     fun check_inductive name =
-      Symtab.defined inductive_names name
-      orelse Symtab.defined inductive_names (name ^ "p")
+      is_inductive name orelse is_inductive (name ^ "p")
+      orelse (String.isSubstring "_class." name
+              andalso case declass name of
+                SOME name' => is_inductive name' orelse is_inductive (name' ^ "p")
+              | NONE => false)
 
     fun is_inductive_infra_thm full_name =
       let val base = Long_Name.base_name full_name
@@ -133,19 +137,6 @@ fun gen_infra_filters (context : Context.generic)
       exists (fn pfx => String.isPrefix pfx name) internal_prefixes
       orelse is_infra_const name
 
-    (* --- Trivial theorem check --- *)
-
-    fun is_trivial_thm thm =
-      (let
-        val thm' = Conv.fconv_rule (Object_Logic.atomize ctxt) thm
-        val thm'' = Timeout.apply (Time.fromSeconds 5)
-            (Simplifier.asm_full_simplify hol_ss_ctxt) thm'
-      in Envir.beta_eta_contract (Thm.prop_of thm'') aconv \<^prop>\<open>True\<close> end)
-      handle THM _ => false | CTERM _ => false | TERM _ => false | TYPE _ => false
-           | Timeout.TIMEOUT _ => false
-
-    (* --- Combined theorem predicate --- *)
-
     fun is_infra_thm (full_name, thm) =
         Name_Space.is_concealed fact_space full_name
         orelse is_hidden fact_space full_name
@@ -153,7 +144,6 @@ fun gen_infra_filters (context : Context.generic)
         orelse is_inductive_infra_thm full_name
         orelse Term.exists_Const is_internal_constant (Thm.prop_of thm)
         orelse is_internal_class (Thm.prop_of thm)
-      (* orelse is_trivial_thm thm *)
   in
     {is_infra_const = is_infra_const, is_infra_thm = is_infra_thm,
      is_infra_type = fn name => Name_Space.is_concealed type_space name

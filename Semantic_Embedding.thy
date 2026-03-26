@@ -2,6 +2,8 @@ theory Semantic_Embedding
   imports Main Isabelle_RPC.Remote_Procedure_Calling
 begin
 
+(* declare [[ML_debugger, ML_exception_debugger]] *)
+
 ML_file \<open>Tools/pide_state.ML\<close>
 
 ML_file \<open>Tools/Sledgehammer/sledgehammer_embedding_ctxt.ML\<close>
@@ -12,52 +14,37 @@ ML_file \<open>Tools/semantic_store.ML\<close>
 
 (*
 
-ML \<open>Theory_Structure.get_introduction_rules_with_positions (Context.Theory @{theory Set})\<close>
-ML \<open>Theory_Structure.get_elimination_rules_with_positions (Context.Theory @{theory Set})\<close>
-        
-ML \<open>Semantic_Store.interpret (Context.Theory @{theory List})\<close>
-
- 
-declare [[auto_interpret_for_embedding = false]] 
-declare [[embedding_model="fw.qwen3-embedding-8b"]]
-      
-ML \<open>Semantic_Store.is_thy_embedded (Context.Proof \<^context>) ("HOL.HOL", "fw.qwen3-embedding-8b")\<close>
-ML \<open>Semantic_Store.embed_semantics  (Context.Proof \<^context> )  ([@{theory List}], "codestral-embed")\<close>
-
-
-  
-   
- 
- 
-ML \<open>Semantic_Store.query_semantics   (Context.Proof @{context})
+ML \<open>Semantic_Store.query_semantics   (Context.Theory @{theory List})
       (Universal_Key.Named_Introduction_Rule "HOL.notI") false\<close>
-  
-  
-ML \<open>Semantic_Store.query_knn (Context.Proof @{context})
-      "proof by contradiction" 10 [Universal_Key.IntroductionRuleK] NONE\<close>
 
-ML \<open>Semantic_Store.query_knn (Context.Proof @{context})
-      "all the possible elements of a list are finite" 10 [Universal_Key.TheoremK] NONE\<close>
+ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
+      ("proof by contradiction", 10, [Universal_Key.IntroductionRuleK], NONE)\<close>
+ 
+ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
+      ("all the possible elements of a list are finite", 10, [Universal_Key.TheoremK], NONE)\<close>
 
-ML \<open>Semantic_Store.query_knn (Context.Proof @{context})
-      "The length of a concatenated list equals the sum of the lengths of each of its parts" 10 [Universal_Key.TheoremK] NONE\<close>
+ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
+      ("The length of a concatenated list equals the sum of the lengths of each of its parts", 10, [Universal_Key.TheoremK], NONE)\<close>
 
-ML \<open>Semantic_Store.query_knn (Context.Proof @{context})
-      "an element belongs to a set different A - B if it belongs to A but not B" 10 [Universal_Key.IntroductionRuleK] NONE\<close>
+ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
+      ("an element belongs to a set different A - B if it belongs to A but not B", 10, [Universal_Key.IntroductionRuleK], NONE)\<close>
 
-ML \<open>Semantic_Store.query_knn (Context.Proof @{context})
-      "a in insert b A means either a is b or a belongs A" 10 [Universal_Key.EliminationRuleK] NONE\<close>
+ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
+      ("a in insert b A means either a is b or a belongs A", 10, [Universal_Key.EliminationRuleK], NONE)\<close>
 
-ML \<open>Semantic_Store.query_knn (Context.Proof @{context})
-      "The reversal of the reversal of a list is itself" 10 [Universal_Key.TheoremK] NONE\<close>
+ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
+      ("The reversal of the reversal of a list is itself", 10, [Universal_Key.TheoremK], NONE)\<close>
 
-ML \<open>Semantic_Store.query_knn (Context.Proof @{context})
-      "De Morgan's Law" 10 [Universal_Key.TheoremK] NONE\<close>
+ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
+      ("De Morgan's Law", 10, [Universal_Key.TheoremK], NONE)\<close>
 
-ML \<open>Semantic_Store.query_knn (Context.Proof @{context})
-      "The commutativity of the conjunction operator" 10 [Universal_Key.TheoremK] NONE\<close>
+ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
+      ("The commutativity of the conjunction operator", 10, [Universal_Key.TheoremK], NONE)\<close>
 
-text \<open>The commutativity of the conjunction operator\<close>
+ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
+      ("The length of a list", 10, [Universal_Key.ConstantK], NONE)\<close>
+
+text \<open>The length of a list\<close>
 
 thm Set.UNIV_I
 thm Lattices.conj.commute

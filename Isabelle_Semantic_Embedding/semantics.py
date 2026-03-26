@@ -191,18 +191,18 @@ def mk_query_by_name_tool(
         input_schema=_mk_query_by_name_schema(working_names),
     )
     async def query_by_name_tool(args: dict[str, Any]) -> ToolCall_ret:
+        t = args.get("type", "")
+        name = args.get("name", "")
+        log.debug("query_by_name: type=%r name=%r", t, name)
+        if not isinstance(t, str) or not isinstance(name, str):
+            return _mk_ret("Invalid arguments: 'type' and 'name' must be strings.", is_error=True)
         try:
-            t = args.get("type", "")
-            name = args.get("name", "")
-            log.debug("query_by_name: type=%r name=%r", t, name)
-            if not isinstance(t, str) or not isinstance(name, str):
-                return _mk_ret("Invalid arguments: 'type' and 'name' must be strings.", is_error=True)
-            try:
-                tag = EntityKind.from_label(t)
-            except KeyError:
-                return _mk_ret(f"Invalid type: {t!r}. Must be one of {[k.label for k in EntityKind if k != EntityKind.THEORY]}.", is_error=True)
-            if not name:
-                return _mk_ret("Invalid name: must be a non-empty string.", is_error=True)
+            tag = EntityKind.from_label(t)
+        except KeyError:
+            return _mk_ret(f"Invalid type: {t!r}. Must be one of {[k.label for k in EntityKind if k != EntityKind.THEORY]}.", is_error=True)
+        if not name:
+            return _mk_ret("Invalid name: must be a non-empty string.", is_error=True)
+        try:
             if working_names and name in working_names:
                 log.debug("Entity name %r is in working_names; cannot query entities assigned for interpretation.", name)
                 return _mk_ret(
@@ -414,6 +414,13 @@ class Semantic_Vector_Store(Vector_Store):
         self.connection.tracing(
             f"[Semantic_Embedding] {len(missing)} entities missing embeddings, "
             f"spanning {len(theory_hashes)} un-embedded theories")
+        # # DEBUG: show missing entities (requires debug_key_name from context.py)
+        # from Isabelle_RPC_Host.context import debug_key_name
+        # for k in missing[:50]:
+        #     readable = debug_key_name(k) or f"<unknown {k.hex()[:16]}…>"
+        #     self.connection.tracing(f"  MISSING: {readable}")
+        # if len(missing) > 50:
+        #     self.connection.tracing(f"  ... and {len(missing) - 50} more")
         # Filter to uninterpreted theories, excluding the current theory and skipped theories
         from Isabelle_RPC_Host.context import theory_long_name
         current_thy = theory_long_name(self.connection)
@@ -542,7 +549,7 @@ class Semantic_Vector_Store(Vector_Store):
                         f"the theory may not be loaded")
             if self.is_thy_embedded(thy_key):
                 continue
-            keys = entities_of(self.connection, EntityKind.ALL,
+            keys = entities_of(self.connection, EntityKind.ALL, # type: ignore
                                theory=thy_name, the_theory_only=True)
             missing = [k for k in keys if k not in self]
             wip = is_WIP(thy_key)
@@ -603,7 +610,7 @@ def _resolve_embedding_model(connection: Connection | None, emb_provider: str | 
                 return name
         except Exception:
             pass
-    return os.getenv("EMBEDDING_MODEL", "oai.text-embedding-3-small")
+    return os.getenv("EMBEDDING_MODEL", "fw.qwen3-embedding-8b")
 
 
 def _conn_semantic_vector_store(self: Connection, embedding_model: str | None = None) -> Semantic_Vector_Store:
