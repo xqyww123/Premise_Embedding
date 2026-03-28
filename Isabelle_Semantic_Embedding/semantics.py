@@ -83,6 +83,15 @@ class _Semantic_DB:
         kind, name, expr, sem = msgpack.unpackb(raw)
         return _Semantic_DB.Record(EntityKind(kind), self._dec(name), self._dec(expr), self._dec(sem))
 
+    def __contains__(self, key: universal_key) -> bool:
+        with self._ensure_env().begin() as txn:
+            return txn.get(key) is not None
+
+    def contains(self, keys: list[universal_key]) -> list[bool]:
+        """Check existence for a batch of keys in a single transaction."""
+        with self._ensure_env().begin() as txn:
+            return [txn.get(k) is not None for k in keys]
+
     def __setitem__(self, key: universal_key, record: 'Record') -> None:
         with self._ensure_env().begin(write=True) as txn:
             txn.put(key, msgpack.packb(tuple(record))) # type: ignore
@@ -302,6 +311,24 @@ def interpret_theories_by_names(connection: Connection, names: list[str]) -> Non
 
 
 class Semantic_Vector_Store(Vector_Store):
+
+    class Domain:
+        """Domain of entities to search over in lookup."""
+        pass
+
+    class Restricted(Domain):
+        """Search only within the given keys."""
+        def __init__(self, keys: list[universal_key]):
+            self.keys = keys
+
+    class ContextAll(Domain):
+        """All available entities at the connection's context."""
+        pass
+
+    class ContextExtended(Domain):
+        """All available entities at the connection's context, plus additional keys."""
+        def __init__(self, extra: list[universal_key]):
+            self.extra = extra
     @staticmethod
     def clean_all_wip_in_created_dbs() -> None:
         """Remove all WIP (non-persistent) entries from every vector store on disk."""
@@ -488,33 +515,83 @@ class Semantic_Vector_Store(Vector_Store):
         query: np.ndarray | str,
         k: int,
         kinds: list[EntityKind],
-        domain: list[universal_key] | None = None,
+        domain: 'Semantic_Vector_Store.Domain | None' = None,
     ) -> list[tuple[float, 'SemanticRecord']]:
         """Search the k closest entities to query, filtered by kinds and domain.
         Returns (score, record) pairs sorted by similarity.
-        If domain is None, uses all entities of the given kinds from the context.
-        If both kinds and domain are provided, takes their intersection."""
+        Domain controls the search scope:
+          None or ContextAll: all context entities of the given kinds
+          ContextExtended(extra): context entities + additional keys
+          Restricted(keys): only the given keys, filtered by kinds
+        """
         if not kinds:
             return []
-        if domain is None:
+        if domain is None or isinstance(domain, Semantic_Vector_Store.ContextAll):
             if self.connection is None:
                 return []
             from Isabelle_RPC_Host.context import entities_of
             candidates = entities_of(self.connection, kinds,
                                      theories_not_include=_SKIP_THEORY_LONG_NAMES)
-        else:
+        elif isinstance(domain, Semantic_Vector_Store.ContextExtended):
+            if self.connection is None:
+                return []
+            from Isabelle_RPC_Host.context import entities_of
+            candidates = entities_of(self.connection, kinds,
+                                     theories_not_include=_SKIP_THEORY_LONG_NAMES)
+            seen = set(candidates)
             kind_set = set(kinds)
-            candidates = [dk for dk in domain if destruct_key(dk).kind in kind_set]
+            for ek in domain.extra:
+                if ek not in seen and destruct_key(ek).kind in kind_set:
+                    candidates.append(ek)
+                    seen.add(ek)
+        elif isinstance(domain, Semantic_Vector_Store.Restricted):
+            kind_set = set(kinds)
+            candidates = [dk for dk in domain.keys if destruct_key(dk).kind in kind_set]
+        else:
+            raise TypeError(f"Unknown domain type: {type(domain)}")
         if not candidates:
             return []
         top = self.topk(query, candidates, k)
         return [(score, rec) for uk, score in top if (rec := Semantic_DB[uk]) is not None]
 
-    def embed_theories(self, theories: list[str | universal_key]) -> None:
+    def _embed_keys(self, keys: list[universal_key]) -> int:
+        """Embed the given keys that are missing from the vector store.
+        Looks up semantic texts from Semantic_DB, embeds them, and stores vectors.
+        Returns the number of entities actually embedded."""
+        # Filter to keys not already in the store
+        exists = self.contains(keys)
+        missing = [k for k, ex in zip(keys, exists) if not ex]
+        if not missing:
+            return 0
+        # Collect semantic texts
+        texts: list[str] = []
+        text_keys: list[universal_key] = []
+        for k in missing:
+            sem = Semantic_DB.query(k, with_pretty=True)
+            if sem is not None:
+                texts.append(sem)
+                text_keys.append(k)
+        if not texts:
+            return 0
+        # Embed and store
+        if self.connection is not None:
+            self.connection.tracing(
+                f"[Semantic_Embedding] embedding {len(texts)} entities ({sum(len(t) for t in texts)} chars)")
+        result = self.emb_provider.embed(texts)
+        with self._env.begin(write=True) as txn:
+            for k, vec in zip(text_keys, result.vectors):
+                txn.put(k, vec.astype(np.float32).tobytes())
+        return len(text_keys)
+
+    def embed_entities(self, keys: list[universal_key]) -> None:
+        """Embed the given entity keys, skipping those already embedded."""
+        self._embed_keys(keys)
+
+    def embed_all_entities_in_theories(self, theories: list[str | universal_key]) -> None:
         """Embed semantic interpretations into vectors for the given theories.
 
-        Collects all missing entities across all theories and embeds them
-        in a single batch call.
+        For each theory, collects all entity keys, embeds missing ones,
+        and marks the theory as fully embedded.
 
         Args:
             theories: Long theory names (str) or universal keys to embed.
@@ -524,13 +601,9 @@ class Semantic_Vector_Store(Vector_Store):
             ValueError: If a universal key is not found in the active Isabelle runtime.
         """
         if self.connection is None:
-            raise RuntimeError("embed_theories requires an active connection")
+            raise RuntimeError("embed_all_entities_in_theories requires an active connection")
         from Isabelle_RPC_Host.context import entities_of
 
-        # Phase 1: collect all missing texts across all theories
-        theory_jobs: list[tuple[universal_key, str, bool, int, int]] = []
-        all_texts: list[str] = []
-        all_text_keys: list[key] = []
         for thy in theories:
             if isinstance(thy, str):
                 thy_name = thy
@@ -551,49 +624,10 @@ class Semantic_Vector_Store(Vector_Store):
                 continue
             keys = entities_of(self.connection, EntityKind.ALL, # type: ignore
                                theory=thy_name, the_theory_only=True)
-            missing = [k for k in keys if k not in self]
             wip = is_WIP(thy_key)
-            if not missing:
-                if not wip:
-                    self.mark_thy_embedded(thy_key)
-                continue
-            texts: list[str] = []
-            text_keys: list[key] = []
-            for k in missing:
-                sem = Semantic_DB.query(k, with_pretty=True)
-                if sem is not None:
-                    texts.append(sem)
-                    text_keys.append(k)
-            if not texts:
-                if not wip:
-                    self.mark_thy_embedded(thy_key)
-                continue
-            start = len(all_texts)
-            all_texts.extend(texts)
-            all_text_keys.extend(text_keys)
-            theory_jobs.append((thy_key, thy_name, wip, start, start + len(texts)))
-
-        if not all_texts:
-            return
-
-        # Phase 2: one batch embed call
-        self.connection.tracing(
-            f"[Semantic_Embedding] embed_theories: embedding {len(all_texts)} entities "
-            f"from {len(theory_jobs)} theories in one batch")
-        result = self.emb_provider.embed_batch(all_texts)
-
-        # Phase 3: store vectors
-        with self._env.begin(write=True) as txn:
-            for k, vec in zip(all_text_keys, result.vectors):
-                txn.put(k, vec.astype(np.float32).tobytes())
-
-        # Phase 4: mark theories, distributing token count proportionally
-        total = len(all_texts)
-        for thy_key, thy_name, wip, start, end in theory_jobs:
+            self._embed_keys(keys)
             if not wip:
-                n = end - start
-                tokens = result.total_tokens * n // total if total > 0 else 0
-                self.mark_thy_embedded(thy_key, tokens)
+                self.mark_thy_embedded(thy_key)
 
 
 _svs_lock = threading.Lock()
@@ -648,22 +682,42 @@ def _clean_wip(arg: Any, connection: Connection) -> int:
     return clean_wip()
 
 
+@isabelle_remote_procedure("Semantic_Store.contains")
+def _contains(arg: Any, connection: Connection) -> list[bool]:
+    keys = [bytes(k) for k in arg]
+    return Semantic_DB.contains(keys)
+
+
 @isabelle_remote_procedure("Semantic_Embedding.query_knn")
 def _query_knn(arg: Any, connection: Connection) -> list[tuple[float, tuple[int, str]]]:
     query_str, k, kind_ints, domain_raw = arg
     kinds = [EntityKind(ki) for ki in kind_ints]
-    domain = [bytes(uk) for uk in domain_raw] if domain_raw is not None else None
+    domain = Semantic_Vector_Store.Restricted([bytes(uk) for uk in domain_raw]) if domain_raw is not None else None
     store = connection.semantic_vector_store()  # type: ignore
     results = store.lookup(query_str, k, kinds, domain)
     return [(score, (int(rec.kind), rec.name))
             for score, rec in results]
 
 
-@isabelle_remote_procedure("Semantic_Embedding.embed_semantics")
-def _embed_semantics(arg: Any, connection: Connection) -> None:
+@isabelle_remote_procedure("Semantic_Embedding.embed_all_entities_in_theories")
+def _embed_all_entities_in_theories(arg: Any, connection: Connection) -> None:
     theory_names, model_name = arg
     store = connection.semantic_vector_store(model_name or None)  # type: ignore
-    store.embed_theories(theory_names)
+    store.embed_all_entities_in_theories(theory_names)
+
+
+@isabelle_remote_procedure("Semantic_Embedding.embed_entities")
+def _embed_entities(arg: Any, connection: Connection) -> None:
+    keys = [bytes(k) for k in arg]
+    store = connection.semantic_vector_store()  # type: ignore
+    store.embed_entities(keys)
+
+
+@isabelle_remote_procedure("Semantic_Embedding.contains")
+def _embedding_contains(arg: Any, connection: Connection) -> list[bool]:
+    keys = [bytes(k) for k in arg]
+    store = connection.semantic_vector_store()  # type: ignore
+    return store.contains(keys)
 
 
 @isabelle_remote_procedure("Semantic_Embedding.is_thy_embedded")

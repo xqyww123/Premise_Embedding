@@ -36,10 +36,16 @@ signature SEMANTIC_STORE = sig
   (* Embed semantic interpretations into vectors for the given theories
      and all their unembedded ancestors, under the specified embedding model
      (empty string = use default). *)
-  val embed_semantics : Context.generic -> theory list * string -> unit
+  val embed_all_entities_in_theories : Context.generic -> theory list * string -> unit
+
+  (* Embed a list of entities, skipping those already embedded. *)
+  val embed_entities : Context.generic -> Universal_Key.entity list -> unit
 
   (* Check whether a theory's entities are all embedded under the given model. *)
   val is_thy_embedded : Context.generic -> string * string -> bool
+
+  (* Interpret a list of entities, skipping those already interpreted. *)
+  val interpret_entities : Context.generic -> Universal_Key.entity list -> unit
 end
 
 structure Semantic_Store : SEMANTIC_STORE = struct
@@ -69,7 +75,7 @@ local open MessagePackBinIO.Pack MessagePackBinIO.Unpack in
 fun query_semantics (context : Context.generic) (entity : Universal_Key.entity)
     (with_pretty : bool) : string option =
   let
-    val key = Universal_Key.key_of context entity
+    val key = Universal_Key.key_of NONE context entity
   in
     Remote_Procedure_Calling.call_command
       {name = "Semantic_Store.query",
@@ -223,12 +229,55 @@ in
 fun key_kind_ord (k1, k2) = int_ord (entity_kind_rank k1, entity_kind_rank k2)
 end
 fun entry_ord (e1, e2) =
-  (case int_ord (the_default 0 (Position.line_of (#3 e1)),
-                 the_default 0 (Position.line_of (#3 e2))) of
+  (case int_ord (the_default 999999999 (Position.line_of (#3 e1)),
+                 the_default 999999999 (Position.line_of (#3 e2))) of
     EQUAL => (case key_kind_ord (#1 e1, #1 e2) of
       EQUAL => string_ord (#2 e1, #2 e2)
     | ord => ord)
   | ord => ord)
+
+val contains_cmd
+    : (Universal_Key.universal_key list, bool list) Remote_Procedure_Calling.command = {
+  name = "Semantic_Store.contains",
+  arg_schema = MessagePackBinIO.Pack.packList Universal_Key.pack_universal_key,
+  ret_schema = MessagePackBinIO.Unpack.unpackList MessagePackBinIO.Unpack.unpackBool,
+  callback = [],
+  timeout = NONE
+}
+
+(* Build (entity, name, prop_str, line, uk) entries from (entity, name, pos, uk) tuples.
+   Shared by interpret' and interpret_entities. *)
+fun build_entries (context : Context.generic)
+    (raw : (Universal_Key.entity * string * Position.T * Universal_Key.universal_key) list)
+    : (Universal_Key.entity * string * string * int * Universal_Key.universal_key) list =
+  let
+    val thy = Context.theory_of context
+    val ctxt = Context.cases Proof_Context.init_global I context
+    val pp = string_of_term ctxt
+    val pp_typ = string_of_typ ctxt
+    fun mk_prop_str entity =
+      case entity of
+        Universal_Key.Theorem thm =>
+          (pp (Thm.prop_of thm)
+           handle ERROR msg =>
+             (warning ("mk_prop_str: Theorem pp failed: " ^ msg); raise ERROR msg))
+      | Universal_Key.Introduction_Rule thm =>
+          (pp (Thm.prop_of thm)
+           handle ERROR msg =>
+             (warning ("mk_prop_str: Introduction_Rule pp failed: " ^ msg); raise ERROR msg))
+      | Universal_Key.Elimination_Rule thm =>
+          (pp (Thm.prop_of thm)
+           handle ERROR msg =>
+             (warning ("mk_prop_str: Elimination_Rule pp failed: " ^ msg); raise ERROR msg))
+      | Universal_Key.Constant cname =>
+          (let val T = Consts.the_constraint (Sign.consts_of thy) cname
+           in pp_typ T end
+           handle TYPE _ => "" | ERROR _ => "")
+      | _ => ""
+  in
+    raw |> map (fn (entity, name, pos, uk) =>
+      (entity, name, mk_prop_str entity, the_default 999999999 (Position.line_of pos), uk))
+  end
 
 (* Returns ((current input, output, cost), (historical input, output, cost)) *)
 fun interpret' (context : Context.generic) : (int * int * real) * (int * int * real) =
@@ -246,7 +295,7 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
           if is_infra_const name then NONE
           else let val entity = Universal_Key.Constant name
                in SOME (entity, name, pos,
-                    Universal_Key.key_of context entity) end)
+                    Universal_Key.key_of NONE context entity) end)
 
     val raw_thm_entries = Theory_Structure.get_theorems_with_positions context
       |> filter (fn (name, _, _, thm, _) => not (is_infra_thm (name, thm)))
@@ -275,7 +324,7 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
     (* 3. Compute universal keys for theorems *)
     val thm_entries_with_uks = raw_thm_entries_with_offsets
       |> map (fn ((name, pos, thm), (word_off, goal_off)) =>
-        let val uk = Universal_Key.key_of context (Universal_Key.Theorem thm)
+        let val uk = Universal_Key.key_of NONE context (Universal_Key.Theorem thm)
         in (uk, name, pos, thm, word_off, goal_off) end)
 
     (* 4. Deduplicate theorems by universal key *)
@@ -308,21 +357,21 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
           if is_infra_type name then NONE
           else let val entity = Universal_Key.Type name
                in SOME (entity, name, pos,
-                    Universal_Key.key_of context entity) end)
+                    Universal_Key.key_of NONE context entity) end)
 
     val class_entries = Theory_Structure.get_classes_with_positions context
       |> map_filter (fn (name, pos) =>
           if is_infra_class name then NONE
           else let val entity = Universal_Key.Class name
                in SOME (entity, name, pos,
-                    Universal_Key.key_of context entity) end)
+                    Universal_Key.key_of NONE context entity) end)
 
     val locale_entries = Theory_Structure.get_locales_with_positions context
       |> map_filter (fn (name, pos) =>
           if is_infra_locale name then NONE
           else let val entity = Universal_Key.Locale name
                in SOME (entity, name, pos,
-                    Universal_Key.key_of context entity) end)
+                    Universal_Key.key_of NONE context entity) end)
 
     (* 5b. Extract introduction and elimination rules *)
     val intro_entries = Theory_Structure.get_introduction_rules_with_positions context
@@ -330,52 +379,22 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
           if is_infra_thm (name, thm) then NONE
           else let val entity = Universal_Key.Introduction_Rule thm
                in SOME (entity, name, pos,
-                    Universal_Key.key_of context entity) end)
+                    Universal_Key.key_of NONE context entity) end)
 
     val elim_entries = Theory_Structure.get_elimination_rules_with_positions context
       |> map_filter (fn (name, pos, thm) =>
           if is_infra_thm (name, thm) then NONE
           else let val entity = Universal_Key.Elimination_Rule thm
                in SOME (entity, name, pos,
-                    Universal_Key.key_of context entity) end)
+                    Universal_Key.key_of NONE context entity) end)
 
     (* 6. Build entries list, sorted by source position. *)
-    val ctxt = Context.cases Proof_Context.init_global I context
-    val pp = string_of_term ctxt
-    val pp_typ = string_of_typ ctxt
-
-    fun mk_prop_str entity =
-      case entity of
-        Universal_Key.Theorem thm =>
-          (pp (Thm.prop_of thm)
-           handle ERROR msg =>
-             (warning ("mk_prop_str: Theorem pp failed: " ^ msg); raise ERROR msg))
-      | Universal_Key.Introduction_Rule thm =>
-          (pp (Thm.prop_of thm)
-           handle ERROR msg =>
-             (warning ("mk_prop_str: Introduction_Rule pp failed: " ^ msg); raise ERROR msg))
-      | Universal_Key.Elimination_Rule thm =>
-          (pp (Thm.prop_of thm)
-           handle ERROR msg =>
-             (warning ("mk_prop_str: Elimination_Rule pp failed: " ^ msg); raise ERROR msg))
-      | Universal_Key.Constant cname =>
-          (let val T = Consts.the_constraint (Sign.consts_of thy) cname
-           in pp_typ T end
-           handle TYPE _ => "" | ERROR _ => "")
-      | _ => ""
-
-    fun mk_entry (entity, name, pos) =
-      (entity, name, pos, mk_prop_str entity)
-
     val all_entries_with_pos =
       (const_entries @ deduped_thm_entries
        @ type_entries @ class_entries @ locale_entries
        @ intro_entries @ elim_entries)
       |> sort entry_ord
-    val entries = all_entries_with_pos
-      |> map (fn (entity, name, pos, uk) =>
-        let val (_, _, _, prop_str) = mk_entry (entity, name, pos)
-        in (entity, name, prop_str, the_default ~1 (Position.line_of pos), uk) end)
+    val entries = build_entries context all_entries_with_pos
 
     (* 7. Build callbacks capturing context *)
     val uk_cb = Universal_Key.make_universal_key_callback context
@@ -482,6 +501,47 @@ fun make_interpret_theory_callback (context : Context.generic)
     timeout = NONE
   }
 
+fun interpret_entities (context : Context.generic) (entities : Universal_Key.entity list) : unit =
+  let
+    (* 1. Compute universal keys *)
+    val keyed = map (fn e => (e, Universal_Key.key_of NONE context e)) entities
+    val keys = map #2 keyed
+
+    (* 2. Batch check which are already interpreted *)
+    val exists = Remote_Procedure_Calling.call_command contains_cmd keys
+    val missing = map_filter (fn ((e, uk), ex) =>
+      if ex then NONE else SOME (e, uk)) (keyed ~~ exists)
+  in
+    if null missing then ()
+    else
+      let
+        val _ = tracing ("[Semantic_Store] interpret_entities: " ^
+                  Int.toString (length missing) ^ " of " ^
+                  Int.toString (length entities) ^ " entities need interpretation")
+        (* 3. Get names and positions *)
+        val names_pos = Theory_Structure.get_entities_with_positions context (map #1 missing)
+        val raw_entries = map2 (fn (entity, uk) => fn (name, pos) =>
+          (entity, name, pos, uk)) missing names_pos
+
+        (* 4. Build entries and call interpret RPC *)
+        val entries = build_entries context raw_entries
+        val thy = Context.theory_of context
+        val thy_name = Context.theory_long_name thy
+        val thy_file_path = Theory_Structure.get_theory_file_path thy
+        val uk_cb = Universal_Key.make_universal_key_callback context
+        val theory_info_cb = Context_Callbacks.make_theory_long_name_and_path_callback context
+        val cmd = make_interpret_file_cmd [uk_cb, theory_info_cb]
+        val thy_key = Universal_Key.key_of_theory' thy
+        val rpc_arg = {
+          file_path = thy_file_path,
+          theory_longname = thy_name,
+          theory_key = thy_key,
+          entries = entries
+        }
+        val _ = Remote_Procedure_Calling.call_command cmd rpc_arg
+      in () end
+  end
+
 fun extract_intro_rules ctx =
   let val cs = Classical.rep_cs (Classical.get_cs ctx)
   in map #1 (Item_Net.content (#safeIs cs) @ Item_Net.content (#unsafeIs cs)) end
@@ -536,7 +596,7 @@ fun is_thy_embedded (context : Context.generic) (theory_name : string, model : s
     }
   in Remote_Procedure_Calling.call_command cmd (theory_name, model) end
 
-fun embed_semantics (context : Context.generic) (theories : theory list, model : string) : unit =
+fun embed_all_entities_in_theories (context : Context.generic) (theories : theory list, model : string) : unit =
   let
     val seen = Inthashtab.empty 64
     val _ = List.app (Inthashtab.update seen o rpair ()) base_theory_ids
@@ -557,7 +617,7 @@ fun embed_semantics (context : Context.generic) (theories : theory list, model :
     if null unembedded then ()
     else
       let
-        val _ = tracing ("[Semantic_Store] embed_semantics: " ^
+        val _ = tracing ("[Semantic_Store] embed_all_entities_in_theories: " ^
                    Int.toString (length unembedded) ^ " theories to embed")
         val {is_infra_const, is_infra_thm, is_infra_type, is_infra_class, is_infra_locale} =
           Infra_Filter.gen_infra_filters context
@@ -573,7 +633,7 @@ fun embed_semantics (context : Context.generic) (theories : theory list, model :
           Config.make_config_lookup_callback context
         ]
         val cmd : (string list * string, unit) Remote_Procedure_Calling.command = {
-          name = "Semantic_Embedding.embed_semantics",
+          name = "Semantic_Embedding.embed_all_entities_in_theories",
           arg_schema = packPair (packList packString, packString),
           ret_schema = unpackUnit,
           callback = callbacks,
@@ -581,6 +641,18 @@ fun embed_semantics (context : Context.generic) (theories : theory list, model :
         }
       in Remote_Procedure_Calling.call_command cmd (unembedded, model) end
   end
+
+fun embed_entities (context : Context.generic) (entities : Universal_Key.entity list) : unit =
+  let
+    val keys = map (Universal_Key.key_of NONE context) entities
+    val cmd : (Universal_Key.universal_key list, unit) Remote_Procedure_Calling.command = {
+      name = "Semantic_Embedding.embed_entities",
+      arg_schema = packList Universal_Key.pack_universal_key,
+      ret_schema = unpackUnit,
+      callback = [Config.make_config_lookup_callback context],
+      timeout = NONE
+    }
+  in Remote_Procedure_Calling.call_command cmd keys end
 
 end (*local MessagePack*)
 

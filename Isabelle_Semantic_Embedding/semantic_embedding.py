@@ -433,10 +433,20 @@ class Vector_Store(ABC):
         with self._env.begin() as txn:
             return txn.cursor().set_key(k)
 
-    def put(self, k: key, vector: np.ndarray) -> None:
+    def __setitem__(self, k: key, vector: np.ndarray) -> None:
         """Store a vector for key k."""
         with self._env.begin(write=True) as txn:
             txn.put(k, vector.astype(np.float32).tobytes())
+
+    def put(self, k: key, vector: np.ndarray) -> None:
+        """Store a vector for key k. Alias for __setitem__."""
+        self[k] = vector
+
+    def contains(self, keys: list[key]) -> list[bool]:
+        """Check existence for a batch of keys in a single transaction."""
+        with self._env.begin() as txn:
+            cursor = txn.cursor()
+            return [cursor.set_key(k) for k in keys]
 
     def embed(self, kv_pairs: list[tuple[key, str]]) -> int:
         """Embed texts via emb_provider and store the resulting vectors. Returns total tokens used."""

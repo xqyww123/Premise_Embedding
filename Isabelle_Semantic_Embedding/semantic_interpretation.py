@@ -380,6 +380,11 @@ async def _list_tools(client: ClaudeSDKClient) -> None:
 
 
 class ReachLimitError(Exception):
+    """Usage cap hit (e.g. 'You've hit your limit')."""
+    pass
+
+class RateLimitError(Exception):
+    """API rate limit (429)."""
     pass
 
 async def _run_agent(options: ClaudeAgentOptions) -> None:
@@ -396,8 +401,11 @@ async def _run_agent(options: ClaudeAgentOptions) -> None:
                 if content is not None and isinstance(content, list) and content:
                     block = content[0]
                     text = getattr(block, "text", None)
-                    if isinstance(text, str) and text.startswith("You've hit your limit"):
-                        raise ReachLimitError()
+                    if isinstance(text, str):
+                        if text.startswith("You've hit your limit"):
+                            raise ReachLimitError()
+                        if "Rate limit" in text:
+                            raise RateLimitError()
                 if isinstance(message, ResultMessage):
                     if message.usage:
                         task.total_input_tokens += message.usage.get("input_tokens", 0)
@@ -430,8 +438,12 @@ async def _run_agent(options: ClaudeAgentOptions) -> None:
         _log.info("total usage: input=%d output=%d tokens, cost=$%.4f",
                 task.total_input_tokens, task.total_output_tokens, task.total_cost_usd)
     except ReachLimitError:
-        _log.info("agent: reached limit, waiting for 20min to retry")
+        _log.info("agent: reached usage limit, waiting 20min to retry")
         await asyncio.sleep(1200)
+        return await _run_agent(options)
+    except RateLimitError:
+        _log.info("agent: API rate limit, waiting 2s to retry")
+        await asyncio.sleep(2)
         return await _run_agent(options)
 
 

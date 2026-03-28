@@ -61,7 +61,7 @@ val _ = REPL_Server.register_app "Semantic_Store.collect" (fn (cin, cout, state)
           catch exn => (restore_channels (); Exn.reraise exn)\<close>
         val _ = List.app (fn model =>
           (send ("[Embedding] model: " ^ model);
-           \<^try>\<open>Semantic_Store.embed_semantics context (theories, model)
+           \<^try>\<open>Semantic_Store.embed_all_entities_in_theories context (theories, model)
              catch exn => (restore_channels (); Exn.reraise exn)\<close>)) models
         val _ = restore_channels ()
         val _ = done ()

@@ -10,6 +10,10 @@ signature THEORY_STRUCTURE = sig
   val parse_thm_name : string -> string * int option
   val get_introduction_rules_with_positions : Context.generic -> (string * Position.T * thm) list
   val get_elimination_rules_with_positions  : Context.generic -> (string * Position.T * thm) list
+  val get_entities_with_positions : Context.generic -> Universal_Key.entity list ->
+    (string * Position.T) list
+  val get_theorems_with_positions_of : Context.generic -> Universal_Key.entity list ->
+    (string * int * Position.T * thm * bool) list
 end
 
 structure Theory_Structure : THEORY_STRUCTURE = struct
@@ -222,5 +226,77 @@ val get_elimination_rules_with_positions =
   get_rules_with_positions (fn cs =>
     Item_Net.content (#safeEs cs) @ Item_Net.content (#unsafeEs cs)) #"E"
 end
+
+(* Look up name and position for a list of entities *)
+fun get_entities_with_positions context entities =
+  let
+    val thy = Context.theory_of context
+    val const_space = Consts.space_of (Context.cases Sign.consts_of Proof_Context.consts_of context)
+    val type_space = Context.cases Sign.type_space Proof_Context.type_space context
+    val class_space = Context.cases Sign.class_space Proof_Context.class_space context
+    val locale_space = Locale.locale_space thy
+    val fact_space = Facts.space_of
+      (Context.cases Global_Theory.facts_of Proof_Context.facts_of context)
+    fun pos_of space name =
+      case try (Name_Space.the_entry space) name of
+        SOME entry => #pos entry | NONE => Position.none
+    fun fact_pos name =
+      let val (base, _) = parse_thm_name name
+      in pos_of fact_space base end
+    fun thm_name_pos thm =
+      let val name = Thm.derivation_name thm
+      in if name = "" then error "Anonymous theorem (empty derivation_name)"
+         else (name, fact_pos name)
+      end
+  in
+    map (fn Universal_Key.Constant name => (name, pos_of const_space name)
+          | Universal_Key.Type name => (name, pos_of type_space name)
+          | Universal_Key.Class name => (name, pos_of class_space name)
+          | Universal_Key.Locale name => (name, pos_of locale_space name)
+          | Universal_Key.Named_Theorem name => (name, fact_pos name)
+          | Universal_Key.Named_Introduction_Rule name => (name, fact_pos name)
+          | Universal_Key.Named_Elimination_Rule name => (name, fact_pos name)
+          | Universal_Key.Theorem thm => thm_name_pos thm
+          | Universal_Key.Introduction_Rule thm => thm_name_pos thm
+          | Universal_Key.Elimination_Rule thm => thm_name_pos thm
+          | Universal_Key.Theorem_ID _ => error "Theorem_ID not supported in get_entities_with_positions"
+        ) entities
+  end
+
+(* Look up full theorem details for a list of entities.
+   Only processes theorem-like entities; others are skipped. *)
+fun get_theorems_with_positions_of context entities =
+  let
+    val thy = Context.theory_of context
+    val facts = Context.cases Global_Theory.facts_of Proof_Context.facts_of context
+    val global_facts = Global_Theory.facts_of thy
+    val is_global = Facts.defined global_facts
+    val fact_space = Facts.space_of facts
+    fun pos_of name =
+      case try (Name_Space.the_entry fact_space) name of
+        SOME entry => #pos entry | NONE => Position.none
+    fun from_thm thm =
+      let val thm = Thm.transfer thy thm
+          val name = Thm.derivation_name thm
+      in if name = "" then error "Anonymous theorem (empty derivation_name)"
+         else [(name, 0, pos_of name, thm, is_global name)]
+      end
+    fun from_name name =
+      case Facts.lookup context facts name of
+        NONE => error ("Unknown fact: " ^ quote name)
+      | SOME {thms, ...} =>
+          let val pos = pos_of name
+              val n = length thms
+              val global = is_global name
+          in map_index (fn (idx, thm) =>
+              (name, if n = 1 then 0 else idx + 1, pos,
+               Thm.transfer thy thm, global)) thms
+          end
+  in
+    maps (fn Universal_Key.Theorem thm => from_thm thm
+           | Universal_Key.Named_Theorem name => from_name name
+           | Universal_Key.Theorem_ID _ => error "Theorem_ID not supported in get_theorems_with_positions_of"
+           | _ => []) entities
+  end
 
 end

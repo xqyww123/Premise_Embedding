@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from Isabelle_RPC_Host import Connection
 from Isabelle_RPC_Host.position import AsciiPosition, UnicodePosition, IsabellePosition
+from Isabelle_RPC_Host.unicode import pretty_unicode
 from claude_agent_sdk import SdkMcpTool, tool
 
 from .base import ToolCall_ret, mk_ret as _mk_ret
@@ -164,10 +165,12 @@ def mk_hover_tool(connection: Connection, unicode: bool = False) -> SdkMcpTool[A
             else:
                 isa_pos = AsciiPosition(args["line"], args["column"], thy_path).to_isabelle_position()
             result = hover_message(isa_pos, connection)
+            if unicode:
+                result = pretty_unicode(result)
             if result is None:
                 log.debug("hover: not found")
                 return _mk_ret("No hover information at this position.")
-            log.debug("hover: -> %s", result[:80])
+            log.debug("hover: -> %s", result)
             return _mk_ret(result)
         except Exception:
             log.exception("hover: error")
