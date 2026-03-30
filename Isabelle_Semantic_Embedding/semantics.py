@@ -126,8 +126,9 @@ class _Semantic_DB:
                 txn.put(key, msgpack.packb(data))  # type: ignore
             else:
                 txn.put(key, msgpack.packb({
-                    "input_tokens": 0, "output_tokens": 0,
-                    "finished": True,
+                    "input_tokens": 0, "cache_creation_tokens": 0,
+                    "cache_read_tokens": 0, "output_tokens": 0,
+                    "cost_usd": 0.0, "finished": True,
                 }))  # type: ignore
 
     def clean_wip(self) -> int:
@@ -321,9 +322,10 @@ class Semantic_Vector_Store(Vector_Store):
         def __init__(self, keys: list[universal_key]):
             self.keys = keys
 
-    class ContextAll(Domain):
-        """All available entities at the connection's context."""
+    class _ContextAll(Domain):
+        """All available entities at the connection's context. Singleton."""
         pass
+    ContextAll = _ContextAll()  # singleton instance
 
     class ContextExtended(Domain):
         """All available entities at the connection's context, plus additional keys."""
@@ -515,18 +517,18 @@ class Semantic_Vector_Store(Vector_Store):
         query: np.ndarray | str,
         k: int,
         kinds: list[EntityKind],
-        domain: 'Semantic_Vector_Store.Domain | None' = None,
+        domain: 'Semantic_Vector_Store.Domain' = ContextAll,
     ) -> list[tuple[float, 'SemanticRecord']]:
         """Search the k closest entities to query, filtered by kinds and domain.
         Returns (score, record) pairs sorted by similarity.
         Domain controls the search scope:
-          None or ContextAll: all context entities of the given kinds
+          ContextAll (default): all context entities of the given kinds
           ContextExtended(extra): context entities + additional keys
           Restricted(keys): only the given keys, filtered by kinds
         """
         if not kinds:
             return []
-        if domain is None or isinstance(domain, Semantic_Vector_Store.ContextAll):
+        if domain is Semantic_Vector_Store.ContextAll:
             if self.connection is None:
                 return []
             from Isabelle_RPC_Host.context import entities_of
@@ -692,7 +694,7 @@ def _contains(arg: Any, connection: Connection) -> list[bool]:
 def _query_knn(arg: Any, connection: Connection) -> list[tuple[float, tuple[int, str]]]:
     query_str, k, kind_ints, domain_raw = arg
     kinds = [EntityKind(ki) for ki in kind_ints]
-    domain = Semantic_Vector_Store.Restricted([bytes(uk) for uk in domain_raw]) if domain_raw is not None else None
+    domain = Semantic_Vector_Store.Restricted([bytes(uk) for uk in domain_raw]) if domain_raw is not None else Semantic_Vector_Store.ContextAll
     store = connection.semantic_vector_store()  # type: ignore
     results = store.lookup(query_str, k, kinds, domain)
     return [(score, (int(rec.kind), rec.name))

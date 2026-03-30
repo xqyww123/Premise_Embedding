@@ -1,5 +1,8 @@
 signature SEMANTIC_STORE = sig
   type semantics = string (*in English*)
+  type usage = {input: int, cache_write: int, cache_read: int, output: int, cost: real}
+  val zero_usage : usage
+  val add_usage : usage * usage -> usage
 
   (* Look up the English semantic interpretation of an entity.
      If with_pretty is true, prepends the pretty-printed formal signature. *)
@@ -46,11 +49,31 @@ signature SEMANTIC_STORE = sig
 
   (* Interpret a list of entities, skipping those already interpreted. *)
   val interpret_entities : Context.generic -> Universal_Key.entity list -> unit
+
+  (* Context callbacks for introduction and elimination rules.
+     These are here (not in Context_Callbacks) because they require Classical from HOL. *)
+  val make_introduction_rules_callback :
+    (string * thm -> bool) option -> Context.generic -> Remote_Procedure_Calling.callback'
+  val make_elimination_rules_callback :
+    (string * thm -> bool) option -> Context.generic -> Remote_Procedure_Calling.callback'
 end
 
 structure Semantic_Store : SEMANTIC_STORE = struct
 
 type semantics = string (*in English*)
+type usage = {input: int, cache_write: int, cache_read: int, output: int, cost: real}
+val zero_usage : usage = {input=0, cache_write=0, cache_read=0, output=0, cost=0.0}
+fun add_usage (a : usage, b : usage) : usage =
+  {input = #input a + #input b, cache_write = #cache_write a + #cache_write b,
+   cache_read = #cache_read a + #cache_read b, output = #output a + #output b,
+   cost = #cost a + #cost b}
+fun fmt_usage ({input, cache_write, cache_read, output, cost} : usage) =
+  String.concat [
+    "input=", Int.toString input,
+    " cache_write=", Int.toString cache_write,
+    " cache_read=", Int.toString cache_read,
+    " output=", Int.toString output,
+    " cost=$", Real.fmt (StringCvt.FIX (SOME 4)) cost]
 
 val auto_interpret_for_embedding = Attrib.setup_config_bool
   \<^binding>\<open>auto_interpret_for_embedding\<close> (K true)
@@ -132,6 +155,10 @@ local
       (packString, packString, packBytes,
        packList (packTuple5 (pack_entry_kind, packString, packString, packInt, packBytes)))
       (file_path, theory_longname, theory_key, entries)
+
+  fun unpackUsage src =
+    let val ((i, cw, cr, o_, c), src') = unpackTuple5 (unpackInt, unpackInt, unpackInt, unpackInt, unpackReal) src
+    in ({input = i, cache_write = cw, cache_read = cr, output = o_, cost = c} : usage, src') end
 in
 
 val check_theorem_name_in_file_cmd :
@@ -146,14 +173,13 @@ val check_theorem_name_in_file_cmd :
 fun make_interpret_file_cmd callbacks :
     ({file_path: string, theory_longname: string, theory_key: Universal_Key.universal_key,
       entries: (Universal_Key.entity * string * string * int * Word8Vector.vector) list},
-     semantics option list * string list * (int * int * real) * (int * int * real))
+     semantics option list * string list * usage * usage)
     Remote_Procedure_Calling.command = {
   name = "Semantic_Store.interpret_file",
   arg_schema = pack_arg,
   ret_schema = unpackTuple4 (unpackList (unpackOption unpackString),
                              unpackList unpackString,
-                             unpackTuple3 (unpackInt, unpackInt, unpackReal),
-                             unpackTuple3 (unpackInt, unpackInt, unpackReal)),
+                             unpackUsage, unpackUsage),
   callback = callbacks,
   timeout = NONE
 }
@@ -279,8 +305,7 @@ fun build_entries (context : Context.generic)
       (entity, name, mk_prop_str entity, the_default 999999999 (Position.line_of pos), uk))
   end
 
-(* Returns ((current input, output, cost), (historical input, output, cost)) *)
-fun interpret' (context : Context.generic) : (int * int * real) * (int * int * real) =
+fun interpret' (context : Context.generic) : usage * usage =
   let
     (* 1. Get theory information *)
     val thy = Context.theory_of context
@@ -395,37 +420,32 @@ fun interpret' (context : Context.generic) : (int * int * real) * (int * int * r
        @ intro_entries @ elim_entries)
       |> sort entry_ord
     val entries = build_entries context all_entries_with_pos
-
-    (* 7. Build callbacks capturing context *)
-    val uk_cb = Universal_Key.make_universal_key_callback context
-    val theory_info_cb = Context_Callbacks.make_theory_long_name_and_path_callback context
-    val cmd = make_interpret_file_cmd [uk_cb, theory_info_cb]
-
-    (* 8. Call RPC command *)
-    val thy_key = Universal_Key.key_of_theory' thy
-    val rpc_arg = {
-      file_path = thy_file_path,
-      theory_longname = thy_name,
-      theory_key = thy_key,
-      entries = entries
-    }
-    val (_, _, (input_tokens, output_tokens, cost_usd),
-                (cum_input_tokens, cum_output_tokens, cum_cost_usd)) =
-      Remote_Procedure_Calling.call_command cmd rpc_arg
-        handle Remote_Procedure_Calling.Remote_Calling_Failure {message, ...} =>
-          error (String.concat ["Semantic interpretation RPC failed: ", message])
-    val fmt_cost = Real.fmt (StringCvt.FIX (SOME 4))
-    val _ = tracing (String.concat [
-      "[Semantic_Store] ", thy_name,
-      ": input=", Int.toString input_tokens,
-      " output=", Int.toString output_tokens,
-      " cost=$", fmt_cost cost_usd,
-      " (historical: input=", Int.toString cum_input_tokens,
-      " output=", Int.toString cum_output_tokens,
-      " cost=$", fmt_cost cum_cost_usd, ")"])
   in
-    ((input_tokens, output_tokens, cost_usd),
-     (cum_input_tokens, cum_output_tokens, cum_cost_usd))
+    if null entries then (zero_usage, zero_usage)
+    else let
+      (* 7. Build callbacks capturing context *)
+      val uk_cb = Universal_Key.make_universal_key_callback context
+      val theory_info_cb = Context_Callbacks.make_theory_long_name_and_path_callback context
+      val cmd = make_interpret_file_cmd [uk_cb, theory_info_cb]
+
+      (* 8. Call RPC command *)
+      val thy_key = Universal_Key.key_of_theory' thy
+      val rpc_arg = {
+        file_path = thy_file_path,
+        theory_longname = thy_name,
+        theory_key = thy_key,
+        entries = entries
+      }
+      val (_, _, current, cumulative) =
+        Remote_Procedure_Calling.call_command cmd rpc_arg
+          handle Remote_Procedure_Calling.Remote_Calling_Failure {message, ...} =>
+            error (String.concat ["Semantic interpretation RPC failed: ", message])
+      val _ = tracing (String.concat [
+        "[Semantic_Store] ", thy_name, ": ", fmt_usage current,
+        " (historical: ", fmt_usage cumulative, ")"])
+    in
+      (current, cumulative)
+    end
   end
 
 fun collect_uninterpreted thy =
@@ -454,23 +474,16 @@ fun interpret (context : Context.generic) : unit =
       tracing ("[Semantic_Store] interpreting " ^
                Int.toString (length contexts) ^ " theories")
 
-    val ((total_in, total_out, total_cost), (hist_in, hist_out, hist_cost)) =
-      fold (fn ctx => fn ((acc_in, acc_out, acc_cost), (hacc_in, hacc_out, hacc_cost)) =>
-        let
-          val ((i, o_, c), (hi, ho, hc)) = interpret' ctx
-          val _ = Context.cases mark_interpreted (K ()) ctx
-        in ((acc_in + i, acc_out + o_, acc_cost + c),
-            (hacc_in + hi, hacc_out + ho, hacc_cost + hc)) end)
-      contexts ((0, 0, 0.0), (0, 0, 0.0))
+    val (total, hist) =
+      fold (fn ctx => fn (acc, hacc) =>
+        let val (cur, cum) = interpret' ctx
+            val _ = Context.cases mark_interpreted (K ()) ctx
+        in (add_usage (acc, cur), add_usage (hacc, cum)) end)
+      contexts (zero_usage, zero_usage)
 
-    val fmt_cost = Real.fmt (StringCvt.FIX (SOME 4))
     val _ = tracing (String.concat [
-        "[Semantic_Store] total: input=", Int.toString total_in,
-        " output=", Int.toString total_out,
-        " cost=$", fmt_cost total_cost,
-        " (historical: input=", Int.toString hist_in,
-        " output=", Int.toString hist_out,
-        " cost=$", fmt_cost hist_cost, ")"])
+        "[Semantic_Store] total: ", fmt_usage total,
+        " (historical: ", fmt_usage hist, ")"])
   in
     ()
   end
@@ -549,6 +562,12 @@ fun extract_intro_rules ctx =
 fun extract_elim_rules ctx =
   let val cs = Classical.rep_cs (Classical.get_cs ctx)
   in map #1 (Item_Net.content (#safeEs cs) @ Item_Net.content (#unsafeEs cs)) end
+
+fun make_introduction_rules_callback filter_opt context =
+  Context_Callbacks.make_introduction_rules_callback extract_intro_rules filter_opt context
+
+fun make_elimination_rules_callback filter_opt context =
+  Context_Callbacks.make_elimination_rules_callback extract_elim_rules filter_opt context
 
 local open MessagePackBinIO.Pack MessagePackBinIO.Unpack in
 

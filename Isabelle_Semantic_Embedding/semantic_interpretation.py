@@ -72,6 +72,8 @@ class Entry(NamedTuple):
 class CostSummary(NamedTuple):
     """Token usage and dollar cost for an interpretation run."""
     input_tokens: int
+    cache_creation_tokens: int
+    cache_read_tokens: int
     output_tokens: int
     cost_usd: float
 
@@ -102,6 +104,8 @@ class InterpretationTask:
         self.current_batch: int = 0
         self.batch_range: range = range(0)
         self.total_input_tokens = 0
+        self.total_cache_creation_tokens = 0
+        self.total_cache_read_tokens = 0
         self.total_output_tokens = 0
         self.total_cost_usd = 0.0
 
@@ -117,43 +121,53 @@ class InterpretationTask:
         Semantic_DB[entry.universal_key] = SemanticRecord(
             EntityKind(entry.kind), entry.name, entry.prop_str, sem)
 
-    def historical_cost(self) -> tuple[int, int, float]:
+    def historical_cost(self) -> tuple[int, int, int, int, float]:
         """Read cumulative cost from LMDB (without modifying it)."""
         import msgpack
         env = Semantic_DB._ensure_env()
         with env.begin() as txn:
             raw = txn.get(self.theory_key)
         if raw is None:
-            return (0, 0, 0.0)
+            return (0, 0, 0, 0, 0.0)
         prev = msgpack.unpackb(raw)
         return (prev.get(b"input_tokens", 0),
+                prev.get(b"cache_creation_tokens", 0),
+                prev.get(b"cache_read_tokens", 0),
                 prev.get(b"output_tokens", 0),
                 prev.get(b"cost_usd", 0.0))
 
-    def write_cost(self) -> tuple[int, int, float]:
+    def write_cost(self) -> tuple[int, int, int, int, float]:
         """Accumulate cost into the LMDB store. Returns updated cumulative totals."""
         import msgpack
         env = Semantic_DB._ensure_env()
         with env.begin(write=True) as txn:
             raw = txn.get(self.theory_key)
-            prev_in, prev_out, prev_cost, finished = 0, 0, 0.0, False
+            prev_in, prev_cw, prev_cr, prev_out, prev_cost, finished = 0, 0, 0, 0, 0.0, False
             if raw is not None:
                 prev = msgpack.unpackb(raw)
                 prev_in = prev.get(b"input_tokens", 0)
+                prev_cw = prev.get(b"cache_creation_tokens", 0)
+                prev_cr = prev.get(b"cache_read_tokens", 0)
                 prev_out = prev.get(b"output_tokens", 0)
                 prev_cost = prev.get(b"cost_usd", 0.0)
                 finished = prev.get(b"finished", False)
             total = (prev_in + self.total_input_tokens,
+                     prev_cw + self.total_cache_creation_tokens,
+                     prev_cr + self.total_cache_read_tokens,
                      prev_out + self.total_output_tokens,
                      prev_cost + self.total_cost_usd)
             packed: bytes = msgpack.packb({  # type: ignore[assignment]
                 "input_tokens": total[0],
-                "output_tokens": total[1],
-                "cost_usd": total[2],
+                "cache_creation_tokens": total[1],
+                "cache_read_tokens": total[2],
+                "output_tokens": total[3],
+                "cost_usd": total[4],
                 "finished": finished,
             })
             txn.put(self.theory_key, packed)
         self.total_input_tokens = 0
+        self.total_cache_creation_tokens = 0
+        self.total_cache_read_tokens = 0
         self.total_output_tokens = 0
         self.total_cost_usd = 0.0
         return total
@@ -187,7 +201,8 @@ class InterpretationTask:
                 f"State only what the entity defines or asserts. "
                 f"Do NOT explain how it is derived or why it is useful. "
                 f"The formal statement is already shown; describe its meaning rather than transcribing it. "
-                f"Prefer plain English over formulas. Wrap formulas in backticks (e.g., `x`, `x + 1`).\n\n"
+                f"Prefer plain English over formulas. Wrap formulas in backticks (e.g., `x`, `x + 1`). "
+                f"Any nonstandard notation must be briefly explained.\n\n"
                 f"Entries:\n{entries_text}\n\n"
                 f"Submit translations via `mcp__isabelle_semantics__answer`."
             )
@@ -206,7 +221,8 @@ State only what the entity defines or asserts. \
 Do NOT explain how it is derived or why it is useful. \
 The formal statement is already shown; describe its meaning **rather than** transcribing it. \
 Prefer plain English over formulas. Wrap formulas in backticks (e.g., `x`, `x + 1`). \
-When a lemma/rule/term has a well-known name (e.g., proof by contradiction), you MUST mention it explicitly in the translation.
+When a lemma/rule/term has a well-known name (e.g., proof by contradiction), you MUST mention it explicitly in the translation. \
+Any nonstandard notation must be briefly explained.
 
 Examples of good translations:
 - constant Nat.add: The addition operator on natural numbers, taking two natural numbers and returning their sum.
@@ -379,6 +395,17 @@ async def _list_tools(client: ClaudeSDKClient) -> None:
         _log_message(message)
 
 
+def _accumulate_usage(task: InterpretationTask, message: ResultMessage) -> None:
+    if message.usage:
+        task.total_input_tokens += message.usage.get("input_tokens", 0)
+        task.total_cache_creation_tokens += message.usage.get("cache_creation_input_tokens", 0)
+        task.total_cache_read_tokens += message.usage.get("cache_read_input_tokens", 0)
+        task.total_output_tokens += message.usage.get("output_tokens", 0)
+    if message.total_cost_usd:
+        task.total_cost_usd += message.total_cost_usd
+    _log.info("round usage: %s, cost: $%.4f", message.usage, message.total_cost_usd or 0)
+
+
 class ReachLimitError(Exception):
     """Usage cap hit (e.g. 'You've hit your limit')."""
     pass
@@ -407,13 +434,7 @@ async def _run_agent(options: ClaudeAgentOptions) -> None:
                         if "Rate limit" in text:
                             raise RateLimitError()
                 if isinstance(message, ResultMessage):
-                    if message.usage:
-                        task.total_input_tokens += message.usage.get("input_tokens", 0)
-                        task.total_output_tokens += message.usage.get("output_tokens", 0)
-                    if message.total_cost_usd:
-                        task.total_cost_usd += message.total_cost_usd
-                    _log.info("round usage: %s, cost: $%.4f",
-                            message.usage, message.total_cost_usd or 0)
+                    _accumulate_usage(task, message)
             # Retry any globally missing entries
             while True:
                 missing = [k for k, v in task.results.items() if v is None]
@@ -428,15 +449,10 @@ async def _run_agent(options: ClaudeAgentOptions) -> None:
                 async for message in client.receive_response():
                     _log_message(message)
                     if isinstance(message, ResultMessage):
-                        if message.usage:
-                            task.total_input_tokens += message.usage.get("input_tokens", 0)
-                            task.total_output_tokens += message.usage.get("output_tokens", 0)
-                        if message.total_cost_usd:
-                            task.total_cost_usd += message.total_cost_usd
-                        _log.info("round usage: %s, cost: $%.4f",
-                                message.usage, message.total_cost_usd or 0)
-        _log.info("total usage: input=%d output=%d tokens, cost=$%.4f",
-                task.total_input_tokens, task.total_output_tokens, task.total_cost_usd)
+                        _accumulate_usage(task, message)
+        _log.info("total usage: input=%d cache_write=%d cache_read=%d output=%d tokens, cost=$%.4f",
+                task.total_input_tokens, task.total_cache_creation_tokens,
+                task.total_cache_read_tokens, task.total_output_tokens, task.total_cost_usd)
     except ReachLimitError:
         _log.info("agent: reached usage limit, waiting 20min to retry")
         await asyncio.sleep(1200)
@@ -494,12 +510,8 @@ def interpret_file(
 
     uncached = [i for i, r in enumerate(results) if r is None]
     _log.info("interpret_file: %d cached, %d to interpret", n - len(uncached), len(uncached))
-    total_input_tokens = 0
-    total_output_tokens = 0
-    total_cost_usd = 0.0
-    cum_input_tokens = 0
-    cum_output_tokens = 0
-    cum_cost_usd = 0.0
+    current_cost = CostSummary(0, 0, 0, 0, 0.0)
+    cumulative_cost = CostSummary(0, 0, 0, 0, 0.0)
 
     if uncached:
         from .hover import mk_definition_tool, mk_hover_tool
@@ -554,13 +566,12 @@ def interpret_file(
             answered = sum(1 for v in task.results.values() if v is not None)
             _log.info("interpret_file: agent finished, %d/%d interpreted",
                        answered, len(task.entries))
-            cum_input, cum_output, cum_cost = task.write_cost()
-            total_input_tokens = task.total_input_tokens
-            total_output_tokens = task.total_output_tokens
-            total_cost_usd = task.total_cost_usd
-            cum_input_tokens = cum_input
-            cum_output_tokens = cum_output
-            cum_cost_usd = cum_cost
+            cum = task.write_cost()
+            current_cost = CostSummary(
+                task.total_input_tokens, task.total_cache_creation_tokens,
+                task.total_cache_read_tokens, task.total_output_tokens,
+                task.total_cost_usd)
+            cumulative_cost = CostSummary(*cum)
 
             # Remap agent results to original indices (cache already written incrementally)
             for i, sem in enumerate(task.results.values()):
@@ -572,13 +583,13 @@ def interpret_file(
             connection, file_path, theory_longname, theory_key,
             entries=[],
         ) as task:
-            cum_input_tokens, cum_output_tokens, cum_cost_usd = task.historical_cost()
+            cumulative_cost = CostSummary(*task.historical_cost())
 
     return InterpretationResult(
         results,
         pretty_prints,
-        CostSummary(total_input_tokens, total_output_tokens, total_cost_usd),
-        CostSummary(cum_input_tokens, cum_output_tokens, cum_cost_usd),
+        current_cost,
+        cumulative_cost,
     )
 
 
