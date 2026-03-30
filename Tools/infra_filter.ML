@@ -63,11 +63,22 @@ fun gen_infra_filters (context : Context.generic)
     (* Class instance constant infixes *)
     val inst_infixes = map (fn T => "_" ^ Long_Name.base_name T ^ "_inst.") type_names
 
+    val internal_prefixes = ["Lifting.", "BNF_Def.", "Transfer.", "BNF_Cardinal_Order_Relation.",
+          "HOL.equal", "ATP.", "Num."]
+
+    (* For a.b.c, check if a.b_class.c exists as a constant (class method shorthand) *)
+    fun has_class_variant name =
+      Long_Name.is_qualified name andalso
+      let val class_name = String.concat [Long_Name.qualifier name, "_class.", Long_Name.base_name name]
+      in can (Consts.the_constraint consts) class_name end
+
     fun is_infra_const name =
       Name_Space.is_concealed const_space name
       orelse is_hidden const_space name
+      orelse exists (fn pfx => String.isPrefix pfx name) internal_prefixes
       orelse exists (fn pfx => String.isPrefix pfx name) pre_prefixes
       orelse exists (fn infix_ => String.isSubstring infix_ name) inst_infixes
+      orelse has_class_variant name
       orelse (exists (fn T => String.isPrefix (T ^ ".") name) type_names
               andalso not (Strhashtab.defined preserved_set name))
 
@@ -123,8 +134,6 @@ fun gen_infra_filters (context : Context.generic)
 
     (* --- Proposition content check --- *)
 
-    val internal_prefixes = ["Lifting.", "BNF_Def.", "Transfer.", "BNF_Cardinal_Order_Relation.",
-          "HOL.equal", "ATP."]
     fun is_internal_class (Const(name1, _) $ Const(\<^const_name>\<open>Pure.type\<close>, _)) =
           String.isSuffix "_class" name1
       | is_internal_class (Const(\<^const_name>\<open>Pure.eq\<close>, _) $ A $ B) =
@@ -133,9 +142,7 @@ fun gen_infra_filters (context : Context.generic)
       | is_internal_class (Const(\<^const_name>\<open>Pure.conjunction\<close>, _) $ A $ B) =
           is_internal_class A orelse is_internal_class B
       | is_internal_class _ = false
-    fun is_internal_constant (name, _) =
-      exists (fn pfx => String.isPrefix pfx name) internal_prefixes
-      orelse is_infra_const name
+    fun is_internal_constant (name, _) = is_infra_const name
 
     fun is_infra_thm (full_name, thm) =
         Name_Space.is_concealed fact_space full_name
