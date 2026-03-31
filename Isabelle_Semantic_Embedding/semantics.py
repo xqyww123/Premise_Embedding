@@ -518,6 +518,9 @@ class Semantic_Vector_Store(Vector_Store):
         k: int,
         kinds: list[EntityKind],
         domain: 'Semantic_Vector_Store.Domain' = ContextAll,
+        term_patterns: list[str] = [],
+        type_patterns: list[str] = [],
+        theories_include: list[str] = [],
     ) -> list[tuple[float, 'SemanticRecord']]:
         """Search the k closest entities to query, filtered by kinds and domain.
         Returns (score, record) pairs sorted by similarity.
@@ -525,6 +528,10 @@ class Semantic_Vector_Store(Vector_Store):
           ContextAll (default): all context entities of the given kinds
           ContextExtended(extra): context entities + additional keys
           Restricted(keys): only the given keys, filtered by kinds
+        Pattern/theory filters (empty = no restriction):
+          term_patterns: Isabelle term pattern strings (structural subterm matching)
+          type_patterns: Isabelle type pattern strings (type matching)
+          theories_include: only entities from these theories
         """
         if not kinds:
             return []
@@ -533,13 +540,19 @@ class Semantic_Vector_Store(Vector_Store):
                 return []
             from Isabelle_RPC_Host.context import entities_of
             candidates = entities_of(self.connection, kinds,
-                                     theories_not_include=_SKIP_THEORY_LONG_NAMES)
+                                     theories_not_include=_SKIP_THEORY_LONG_NAMES,
+                                     term_patterns=term_patterns,
+                                     type_patterns=type_patterns,
+                                     theories_include=theories_include)
         elif isinstance(domain, Semantic_Vector_Store.ContextExtended):
             if self.connection is None:
                 return []
             from Isabelle_RPC_Host.context import entities_of
             candidates = entities_of(self.connection, kinds,
-                                     theories_not_include=_SKIP_THEORY_LONG_NAMES)
+                                     theories_not_include=_SKIP_THEORY_LONG_NAMES,
+                                     term_patterns=term_patterns,
+                                     type_patterns=type_patterns,
+                                     theories_include=theories_include)
             seen = set(candidates)
             kind_set = set(kinds)
             for ek in domain.extra:

@@ -201,7 +201,7 @@ class InterpretationTask:
                 f"State only what the entity defines or asserts. "
                 f"Do NOT explain how it is derived or why it is useful. "
                 f"The formal statement is already shown; describe its meaning rather than transcribing it. "
-                f"Prefer plain English over formulas. Wrap formulas in backticks (e.g., `x`, `x + 1`). "
+                f"Prefer plain English over formulas. Wrap formulas in backticks (like `x`, `x + 1`). "
                 f"Any nonstandard notation must be briefly explained.\n\n"
                 f"Entries:\n{entries_text}\n\n"
                 f"Submit translations via `mcp__isabelle_semantics__answer`."
