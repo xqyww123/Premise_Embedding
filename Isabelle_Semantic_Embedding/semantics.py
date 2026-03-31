@@ -521,9 +521,11 @@ class Semantic_Vector_Store(Vector_Store):
         term_patterns: list[str] = [],
         type_patterns: list[str] = [],
         theories_include: list[str] = [],
-    ) -> list[tuple[float, 'SemanticRecord']]:
+    ) -> tuple[list[tuple[float, 'SemanticRecord']], list[str]]:
         """Search the k closest entities to query, filtered by kinds and domain.
-        Returns (score, record) pairs sorted by similarity.
+        Returns (results, warnings) where results are (score, record) pairs
+        sorted by similarity, and warnings include notices about undeclared
+        free variables in term patterns.
         Domain controls the search scope:
           ContextAll (default): all context entities of the given kinds
           ContextExtended(extra): context entities + additional keys
@@ -533,22 +535,23 @@ class Semantic_Vector_Store(Vector_Store):
           type_patterns: Isabelle type pattern strings (type matching)
           theories_include: only entities from these theories
         """
+        warnings: list[str] = []
         if not kinds:
-            return []
+            return [], warnings
         if domain is Semantic_Vector_Store.ContextAll:
             if self.connection is None:
-                return []
+                return [], warnings
             from Isabelle_RPC_Host.context import entities_of
-            candidates = entities_of(self.connection, kinds,
+            candidates, warnings = entities_of(self.connection, kinds,
                                      theories_not_include=_SKIP_THEORY_LONG_NAMES,
                                      term_patterns=term_patterns,
                                      type_patterns=type_patterns,
                                      theories_include=theories_include)
         elif isinstance(domain, Semantic_Vector_Store.ContextExtended):
             if self.connection is None:
-                return []
+                return [], warnings
             from Isabelle_RPC_Host.context import entities_of
-            candidates = entities_of(self.connection, kinds,
+            candidates, warnings = entities_of(self.connection, kinds,
                                      theories_not_include=_SKIP_THEORY_LONG_NAMES,
                                      term_patterns=term_patterns,
                                      type_patterns=type_patterns,
@@ -565,9 +568,10 @@ class Semantic_Vector_Store(Vector_Store):
         else:
             raise TypeError(f"Unknown domain type: {type(domain)}")
         if not candidates:
-            return []
+            return [], warnings
         top = self.topk(query, candidates, k)
-        return [(score, rec) for uk, score in top if (rec := Semantic_DB[uk]) is not None]
+        results = [(score, rec) for uk, score in top if (rec := Semantic_DB[uk]) is not None]
+        return results, warnings
 
     def _embed_keys(self, keys: list[universal_key]) -> int:
         """Embed the given keys that are missing from the vector store.
