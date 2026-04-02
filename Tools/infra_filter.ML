@@ -72,7 +72,11 @@ fun gen_infra_filters (context : Context.generic)
       let val class_name = String.concat [Long_Name.qualifier name, "_class.", Long_Name.base_name name]
       in can (Consts.the_constraint consts) class_name end
 
-    fun is_infra_const name =
+    fun returns_prop (Type("fun", [_, T'])) = returns_prop T'
+      | returns_prop (Type("prop", [])) = true
+      | returns_prop _ = false
+
+    fun is_infra_const' name typ_opt =
       Name_Space.is_concealed const_space name
       orelse is_hidden const_space name
       orelse exists (fn pfx => String.isPrefix pfx name) internal_prefixes
@@ -81,6 +85,13 @@ fun gen_infra_filters (context : Context.generic)
       orelse has_class_variant name
       orelse (exists (fn T => String.isPrefix (T ^ ".") name) type_names
               andalso not (Strhashtab.defined preserved_set name))
+      orelse String.isSubstring ".class." name
+      orelse (String.isSuffix "_class" (Long_Name.base_name name)
+              andalso returns_prop (case typ_opt of
+                        SOME T => T
+                      | NONE => (case try (Consts.the_constraint consts) name of
+                                   SOME T => T | NONE => dummyT)))
+    fun is_infra_const name = is_infra_const' name NONE
 
     (* --- ADT infrastructure theorem names --- *)
 
@@ -142,7 +153,7 @@ fun gen_infra_filters (context : Context.generic)
       | is_internal_class (Const(\<^const_name>\<open>Pure.conjunction\<close>, _) $ A $ B) =
           is_internal_class A orelse is_internal_class B
       | is_internal_class _ = false
-    fun is_internal_constant (name, _) = is_infra_const name
+    fun is_internal_constant (name, T) = is_infra_const' name (SOME T)
 
     fun is_infra_thm (full_name, thm) =
         Name_Space.is_concealed fact_space full_name

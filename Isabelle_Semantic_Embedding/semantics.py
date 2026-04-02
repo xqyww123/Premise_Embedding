@@ -222,7 +222,10 @@ def mk_query_by_name_tool(
             uk = universal_key_of(connection, tag, name)
             sem = Semantic_DB.query(uk, with_pretty=with_pretty)
             if sem is None:
-                return _mk_ret(f"{t} \"{name}\" has not been interpreted yet.")
+                return _mk_ret(
+                    f"{t} \"{name}\" has not been interpreted yet. "
+                    "Try using `mcp__proof__semantic_search` to find what you need."
+                )
             return _mk_ret(sem)
         except UndefinedEntity as e:
             if "." in name:
@@ -235,7 +238,10 @@ def mk_query_by_name_tool(
                 except (IsabelleError, UndefinedEntity):
                     pass
             log.warning("%s: %s", type(e).__name__, e)
-            return _mk_ret(str(e), is_error=True)
+            return _mk_ret(
+                str(e) + " Try using `mcp__proof__semantic_search` to find what you need.",
+                is_error=True,
+            )
         except IsabelleError as e:
             log.warning("%s: %s", type(e).__name__, e)
             return _mk_ret(str(e), is_error=True)
@@ -521,6 +527,7 @@ class Semantic_Vector_Store(Vector_Store):
         term_patterns: list[str] = [],
         type_patterns: list[str] = [],
         theories_include: list[str] = [],
+        name_contains: list[str] = [],
     ) -> tuple[list[tuple[float, 'SemanticRecord']], list[str]]:
         """Search the k closest entities to query, filtered by kinds and domain.
         Returns (results, warnings) where results are (score, record) pairs
@@ -546,7 +553,8 @@ class Semantic_Vector_Store(Vector_Store):
                                      theories_not_include=_SKIP_THEORY_LONG_NAMES,
                                      term_patterns=term_patterns,
                                      type_patterns=type_patterns,
-                                     theories_include=theories_include)
+                                     theories_include=theories_include,
+                                     name_contains=name_contains)
         elif isinstance(domain, Semantic_Vector_Store.ContextExtended):
             if self.connection is None:
                 return [], warnings
@@ -555,7 +563,8 @@ class Semantic_Vector_Store(Vector_Store):
                                      theories_not_include=_SKIP_THEORY_LONG_NAMES,
                                      term_patterns=term_patterns,
                                      type_patterns=type_patterns,
-                                     theories_include=theories_include)
+                                     theories_include=theories_include,
+                                     name_contains=name_contains)
             seen = set(candidates)
             kind_set = set(kinds)
             for ek in domain.extra:

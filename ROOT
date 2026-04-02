@@ -1,5 +1,6 @@
-session Semantic_Embedding = Isabelle_RPC +
+session Semantic_Embedding = HOL +
   sessions
+    Isabelle_RPC
     Performant_Isabelle_ML
   theories
     Sledgehammer_Embedding
