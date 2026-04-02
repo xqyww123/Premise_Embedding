@@ -1,15 +1,16 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
+import asyncio
 import importlib.util
 import json
 import os
 import pathlib
 import tempfile
 import time
-from typing import TYPE_CHECKING, Callable, NamedTuple, cast
+from typing import TYPE_CHECKING, Awaitable, Callable, NamedTuple, cast
 if TYPE_CHECKING:
     from Isabelle_RPC_Host.rpc import Connection
-import requests
+import httpx
 import numpy as np
 import lmdb
 import faiss
@@ -36,7 +37,7 @@ class Embedding_Provider(ABC):
     _cache: diskcache.Cache | None = None
 
     @abstractmethod
-    def _embed(self, text: list[str]) -> EmbedResult:
+    async def _embed(self, text: list[str]) -> EmbedResult:
         """Embed a list of texts into vectors.
 
         Must return an ``EmbedResult`` where ``vectors`` is a 2D float32 matrix
@@ -44,12 +45,12 @@ class Embedding_Provider(ABC):
         """
         ...
 
-    def _embed_batch(self, text: list[str]) -> EmbedResult:
+    async def _embed_batch(self, text: list[str]) -> EmbedResult:
         """Embed a large batch of texts. Defaults to ``_embed``.
 
         Override to implement chunked or rate-limited batching.
         """
-        return self._embed(text)
+        return await self._embed(text)
 
     @staticmethod
     def _get_cache() -> diskcache.Cache:
@@ -61,8 +62,8 @@ class Embedding_Provider(ABC):
                 size_limit=2 * 1024 * 1024 * 1024)
         return Embedding_Provider._cache
 
-    def _embed_cached(self, text: list[str],
-                      backend: 'Callable[[list[str]], EmbedResult]') -> EmbedResult:
+    async def _embed_cached(self, text: list[str],
+                      backend: 'Callable[[list[str]], Awaitable[EmbedResult]]') -> EmbedResult:
         """Per-string cache lookup, chunk misses, call backend with retry, cache incrementally."""
         cache = self._get_cache()
         results: list[np.ndarray | None] = [None] * len(text)
@@ -70,15 +71,15 @@ class Embedding_Provider(ABC):
         for i, t in enumerate(text):
             cached = cache.get((self.model, t))
             if cached is not None:
-                results[i] = np.frombuffer(bytes(cached), dtype=np.float32)
+                results[i] = np.frombuffer(cast(bytes, cached), dtype=np.float32)
             else:
                 misses.append((i, t))
         hits = len(text) - len(misses)
         if not misses:
-            self._log(f"[Embedding Cache] {self.model}: all {hits} texts cached")
+            await self._log(f"[Embedding Cache] {self.model}: all {hits} texts cached")
             return EmbedResult(np.stack(results), 0)  # type: ignore
         if hits > 0:
-            self._log(f"[Embedding Cache] {self.model}: {hits} hits, {len(misses)} misses")
+            await self._log(f"[Embedding Cache] {self.model}: {hits} hits, {len(misses)} misses")
         total_tokens = 0
         chunk_size = self.max_request_size
         total_chunks = (len(misses) + chunk_size - 1) // chunk_size
@@ -86,18 +87,18 @@ class Embedding_Provider(ABC):
             chunk = misses[ci:ci + chunk_size]
             chunk_texts = [t for _, t in chunk]
             if total_chunks > 1:
-                self._log(f"[Embedding] {self.model}: chunk {ci // chunk_size + 1}/{total_chunks} "
+                await self._log(f"[Embedding] {self.model}: chunk {ci // chunk_size + 1}/{total_chunks} "
                           f"({len(chunk)} texts)")
             last_err: Exception | None = None
             for attempt in range(10):
                 try:
-                    embed_result = backend(chunk_texts)
+                    embed_result = await backend(chunk_texts)
                     break
                 except Exception as e:
                     last_err = e
-                    self._log(f"[Embedding] {self.model}: chunk {ci // chunk_size + 1}/{total_chunks} "
+                    await self._log(f"[Embedding] {self.model}: chunk {ci // chunk_size + 1}/{total_chunks} "
                               f"attempt {attempt + 1}/10 failed: {e}")
-                    time.sleep(2 ** attempt)
+                    await asyncio.sleep(2 ** attempt)
             else:
                 raise RuntimeError(
                     f"Embedding chunk {ci // chunk_size + 1}/{total_chunks} "
@@ -113,32 +114,32 @@ class Embedding_Provider(ABC):
             faiss.normalize_L2(result.vectors)
         return result
 
-    def _log(self, msg: str) -> None:
+    async def _log(self, msg: str) -> None:
         from Isabelle_RPC_Host.rpc import Connection
         conn = Connection.current()
         if conn is not None:
-            conn.tracing(msg)
+            await conn.tracing(msg)
 
-    def embed(self, text: list[str]) -> EmbedResult:
+    async def embed(self, text: list[str]) -> EmbedResult:
         """Embed texts, always using cache."""
         total_chars = sum(len(t) for t in text)
-        self._log(f"[Embedding] {self.model}: embedding {len(text)} texts, {total_chars} chars")
-        result = self._embed_cached(text, self._embed)
-        self._log(f"[Embedding] {self.model}: done, total_tokens={result.total_tokens}")
+        await self._log(f"[Embedding] {self.model}: embedding {len(text)} texts, {total_chars} chars")
+        result = await self._embed_cached(text, self._embed)
+        await self._log(f"[Embedding] {self.model}: done, total_tokens={result.total_tokens}")
         return self._normalize(result)
 
-    def _embed_batch_or_fallback(self, text: list[str]) -> EmbedResult:
+    async def _embed_batch_or_fallback(self, text: list[str]) -> EmbedResult:
         """Route to _embed_batch if supported, otherwise fall back to _embed."""
         if self.supports_batch:
-            return self._embed_batch(text)
-        return self._embed(text)
+            return await self._embed_batch(text)
+        return await self._embed(text)
 
-    def embed_batch(self, text: list[str]) -> EmbedResult:
+    async def embed_batch(self, text: list[str]) -> EmbedResult:
         """Embed a large batch of texts, always using cache."""
         total_chars = sum(len(t) for t in text)
-        self._log(f"[Embedding Batch] {self.model}: embedding {len(text)} texts, {total_chars} chars")
-        result = self._embed_cached(text, self._embed_batch_or_fallback)
-        self._log(f"[Embedding Batch] {self.model}: done, total_tokens={result.total_tokens}")
+        await self._log(f"[Embedding Batch] {self.model}: embedding {len(text)} texts, {total_chars} chars")
+        result = await self._embed_cached(text, self._embed_batch_or_fallback)
+        await self._log(f"[Embedding Batch] {self.model}: done, total_tokens={result.total_tokens}")
         return self._normalize(result)
 
 def register_embedding_provider(name: str):
@@ -195,13 +196,13 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
         counts = data.get("request_counts", {})
         return counts.get("completed", 0), counts.get("total", 0)
 
-    def _embed(self, text: list[str]) -> EmbedResult:
+    async def _embed(self, text: list[str]) -> EmbedResult:
         url = self.base_url.rstrip("/") + "/v1/embeddings"
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        with requests.Session() as session:
-            resp = session.post(url, json={
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json={
                 "input": text,
                 "model": self.model,
                 "encoding_format": "float",
@@ -221,7 +222,7 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def _submit_one_batch(self, session: requests.Session, texts: list[str],
+    async def _submit_one_batch(self, client: httpx.AsyncClient, texts: list[str],
                           url_base: str, auth_headers: dict[str, str]) -> str:
         """Write JSONL, upload, create batch. Returns batch_id."""
         with tempfile.NamedTemporaryFile(mode='w+b', suffix='.jsonl') as f:
@@ -229,23 +230,23 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
                 f.write(json.dumps(self._format_batch_line(i, t)).encode())
                 f.write(b'\n')
             f.seek(0)
-            resp = session.post(f"{url_base}/v1/files",
+            resp = await client.post(f"{url_base}/v1/files",
                 headers=auth_headers,
                 files={"file": f}, data={"purpose": "batch"})
         resp.raise_for_status()
         file_id = resp.json()["id"]
-        resp = session.post(f"{url_base}{self._batch_endpoint}",
+        resp = await client.post(f"{url_base}{self._batch_endpoint}",
             headers={"Content-Type": "application/json", **auth_headers},
             json=self._create_batch_request(file_id))
         resp.raise_for_status()
         return resp.json()["id"]
 
-    def _poll_and_download(self, session: requests.Session, batch_id: str,
+    async def _poll_and_download(self, client: httpx.AsyncClient, batch_id: str,
                            n: int, url_base: str, auth_headers: dict[str, str],
                            conn: Connection | None) -> tuple[np.ndarray, int]:
         """Poll until batch completes, download results. Returns (vectors, total_tokens)."""
         while True:
-            resp = session.get(f"{url_base}{self._batch_endpoint}/{batch_id}",
+            resp = await client.get(f"{url_base}{self._batch_endpoint}/{batch_id}",
                 headers=auth_headers)
             resp.raise_for_status()
             batch_data = resp.json()
@@ -253,20 +254,20 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
             if status == self._batch_completed_status:
                 output_file_id = batch_data[self._batch_output_file_key]
                 if conn is not None:
-                    conn.tracing(
+                    await conn.tracing(
                         f"[Embedding Batch] batch {batch_id} completed, downloading results")
                 break
             elif status in self._batch_failed_statuses:
                 raise RuntimeError(f"Batch {batch_id} {status}: {batch_data}")
             if conn is not None:
                 completed, total = self._batch_progress(batch_data)
-                conn.tracing(
+                await conn.tracing(
                     f"[Embedding Batch] batch {batch_id}: status={status}, "
                     f"completed={completed}/{total}, "
                     f"waiting...")
-            time.sleep(10)
+            await asyncio.sleep(10)
 
-        resp = session.get(f"{url_base}/v1/files/{output_file_id}/content",
+        resp = await client.get(f"{url_base}/v1/files/{output_file_id}/content",
             headers=auth_headers)
         resp.raise_for_status()
         results: list[list[float] | None] = [None] * n
@@ -279,7 +280,7 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
             total_tokens += body.get("usage", {}).get("total_tokens", 0)
         return np.asarray(results, dtype=np.float32), total_tokens
 
-    def _embed_batch(self, text: list[str]) -> EmbedResult:
+    async def _embed_batch(self, text: list[str]) -> EmbedResult:
         """Embed via Batch API (async, 50% cost). Splits into sub-batches if needed."""
         from Isabelle_RPC_Host.rpc import Connection
         conn = Connection.current()
@@ -290,19 +291,19 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
         chunks = [text[i:i + self.max_batch_size]
                   for i in range(0, len(text), self.max_batch_size)]
         if conn is not None:
-            conn.tracing(
+            await conn.tracing(
                 f"[Embedding Batch] submitting {len(text)} texts ({total_chars} chars) "
                 f"to {self.model} via Batch API"
                 + (f" in {len(chunks)} sub-batches" if len(chunks) > 1 else ""))
 
-        with requests.Session() as session:
+        async with httpx.AsyncClient() as client:
             # Submit all sub-batches
             batch_ids: list[str] = []
             for ci, chunk in enumerate(chunks):
-                bid = self._submit_one_batch(session, chunk, url_base, auth_headers)
+                bid = await self._submit_one_batch(client, chunk, url_base, auth_headers)
                 batch_ids.append(bid)
                 if conn is not None:
-                    conn.tracing(
+                    await conn.tracing(
                         f"[Embedding Batch] sub-batch {ci+1}/{len(chunks)} submitted: {bid} "
                         f"({len(chunk)} texts)")
 
@@ -310,13 +311,13 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
             all_results: list[np.ndarray] = []
             grand_total_tokens = 0
             for ci, (bid, chunk) in enumerate(zip(batch_ids, chunks)):
-                vectors, tokens = self._poll_and_download(
-                    session, bid, len(chunk), url_base, auth_headers, conn)
+                vectors, tokens = await self._poll_and_download(
+                    client, bid, len(chunk), url_base, auth_headers, conn)
                 all_results.append(vectors)
                 grand_total_tokens += tokens
 
         if conn is not None:
-            conn.tracing(
+            await conn.tracing(
                 f"[Embedding Batch] all {len(chunks)} sub-batch(es) finished, "
                 f"total_tokens={grand_total_tokens}")
 
@@ -448,31 +449,31 @@ class Vector_Store(ABC):
             cursor = txn.cursor()
             return [cursor.set_key(k) for k in keys]
 
-    def embed(self, kv_pairs: list[tuple[key, str]]) -> int:
+    async def embed(self, kv_pairs: list[tuple[key, str]]) -> int:
         """Embed texts via emb_provider and store the resulting vectors. Returns total tokens used."""
         texts = [text for _, text in kv_pairs]
-        result = self.emb_provider.embed(texts)
+        result = await self.emb_provider.embed(texts)
         with self._env.begin(write=True) as txn:
             for (k, _), vec in zip(kv_pairs, result.vectors):
                 txn.put(k, vec.astype(np.float32).tobytes())
         return result.total_tokens
 
-    def _auto_embed(self, missing: list[key], matrix: np.ndarray, row: int) -> list[key]:
+    async def _auto_embed(self, missing: list[key], matrix: np.ndarray, row: int) -> list[key]:
         """Override to automatically obtain and store vectors for missing keys during topk.
         Writes recovered vectors directly into matrix starting at the given row.
         Returns the list of recovered keys (in the same order as written to matrix).
         Default: returns [], i.e., missing keys are skipped."""
         return []
 
-    def topk(self, query: np.ndarray | str, domain: list[key], k: int) -> list[tuple[key, float]]:
+    async def topk(self, query: np.ndarray | str, domain: list[key], k: int) -> list[tuple[key, float]]:
         """Return the top-k (key, score) pairs from domain most similar to query.
         If query is a string, it is embedded via emb_provider first.
         Keys missing from LMDB are passed to _auto_embed for recovery.
         Uses faiss.knn directly on the assembled matrix (no index)."""
         if isinstance(query, str):
             if self.connection is not None:
-                self.connection.tracing(f"[Semantic_Embedding] embedding query: {query!r}")
-            query = self.emb_provider.embed([query]).vectors[0]
+                await self.connection.tracing(f"[Semantic_Embedding] embedding query: {query!r}")
+            query = (await self.emb_provider.embed([query])).vectors[0]
         matrix = np.empty((len(domain), self.dimension), dtype=np.float32)
         valid_keys: list[key] = []
         missing_keys: list[key] = []
@@ -487,7 +488,7 @@ class Vector_Store(ABC):
                 else:
                     missing_keys.append(dk)
         if missing_keys:
-            recovered = self._auto_embed(missing_keys, matrix, i)
+            recovered = await self._auto_embed(missing_keys, matrix, i)
             valid_keys.extend(recovered)
             i += len(recovered)
         matrix = matrix[:i]

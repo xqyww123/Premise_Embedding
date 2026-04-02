@@ -1,5 +1,6 @@
 """Semantic query tools for looking up interpretations from parent theories."""
 
+import asyncio
 import os
 import threading
 from typing import Any, NamedTuple
@@ -219,7 +220,7 @@ def mk_query_by_name_tool(
                     f"Cannot query \"{name}\" — it is or will be your task to interpret it from the source.",
                     is_error=True,
                 )
-            uk = universal_key_of(connection, tag, name)
+            uk = await universal_key_of(connection, tag, name)
             sem = Semantic_DB.query(uk, with_pretty=with_pretty)
             if sem is None:
                 return _mk_ret(
@@ -231,7 +232,7 @@ def mk_query_by_name_tool(
             if "." in name:
                 short = name.rsplit(".", 1)[1]
                 try:
-                    uk = universal_key_of(connection, tag, short)
+                    uk = await universal_key_of(connection, tag, short)
                     sem = Semantic_DB.query(uk, with_pretty=with_pretty)
                     if sem is not None:
                         return _mk_ret(f"The {name} is undefined, but we find:\n{sem}")
@@ -279,7 +280,7 @@ def mk_query_by_position_tool(
                 isa_pos = UnicodePosition(args["line"], args["column"], thy_path).to_isabelle_position()
             else:
                 isa_pos = AsciiPosition(args["line"], args["column"], thy_path).to_isabelle_position()
-            entity = connection.callback(
+            entity = await connection.callback(
                 "pide_state.entity_at_position", (isa_pos.file, isa_pos.raw_offset))
             if entity is None:
                 log.debug("query_by_position: no entity found")
@@ -294,7 +295,7 @@ def mk_query_by_position_tool(
                     f"Cannot query \"{name}\" — it is your task to interpret it from the source.",
                     is_error=True,
                 )
-            uk = universal_key_of(connection, tag, name)
+            uk = await universal_key_of(connection, tag, name)
             sem = Semantic_DB.query(uk, with_pretty=with_pretty)
             if sem is None:
                 return _mk_ret(f"{tag.label} \"{name}\" has not been interpreted yet.")
@@ -310,11 +311,11 @@ def mk_query_by_position_tool(
 
 # --- Other utilities ---
 
-def interpret_theories_by_names(connection: Connection, names: list[str]) -> None:
+async def interpret_theories_by_names(connection: Connection, names: list[str]) -> None:
     """Interpret theories by name (short or long).
     Resolves names, skips already-interpreted theories, and interprets the rest.
     Calls back into Isabelle ML via the Semantic_Store.interpret_theories callback."""
-    connection.callback("Semantic_Store.interpret_theories", names)
+    await connection.callback("Semantic_Store.interpret_theories", names)
 
 
 class Semantic_Vector_Store(Vector_Store):
@@ -431,11 +432,11 @@ class Semantic_Vector_Store(Vector_Store):
                 data[b"total_tokens"] = data.get(b"total_tokens", 0) + total_tokens
             txn.put(theory_key, msgpack.packb(data))  # type: ignore
 
-    def _auto_embed(self, missing: list[key], matrix: np.ndarray, row: int) -> list[key]:
+    async def _auto_embed(self, missing: list[key], matrix: np.ndarray, row: int) -> list[key]:
         if self.connection is None:
             return []
-        if not self.connection.config_lookup("auto_interpret_for_embedding"):
-            self.connection.warning(
+        if not await self.connection.config_lookup("auto_interpret_for_embedding"):
+            await self.connection.warning(
                 f"[Semantic_Embedding] {len(missing)} entities missing semantic embeddings, "
                 f"but auto_interpret_for_embedding is disabled. "
                 f"Set [[auto_interpret_for_embedding = true]] to enable automatic interpretation and embedding.")
@@ -446,30 +447,30 @@ class Semantic_Vector_Store(Vector_Store):
             entity = destruct_key(k)
             if not self.is_thy_embedded(entity.theory):
                 theory_hashes.add(entity.theory)
-        self.connection.tracing(
+        await self.connection.tracing(
             f"[Semantic_Embedding] {len(missing)} entities missing embeddings, "
             f"spanning {len(theory_hashes)} un-embedded theories")
         # # DEBUG: show missing entities (requires debug_key_name from context.py)
         # from Isabelle_RPC_Host.context import debug_key_name
         # for k in missing[:50]:
         #     readable = debug_key_name(k) or f"<unknown {k.hex()[:16]}…>"
-        #     self.connection.tracing(f"  MISSING: {readable}")
+        #     await self.connection.tracing(f"  MISSING: {readable}")
         # if len(missing) > 50:
-        #     self.connection.tracing(f"  ... and {len(missing) - 50} more")
+        #     await self.connection.tracing(f"  ... and {len(missing) - 50} more")
         # Filter to uninterpreted theories, excluding the current theory and skipped theories
         from Isabelle_RPC_Host.context import theory_long_name
-        current_thy = theory_long_name(self.connection)
+        current_thy = await theory_long_name(self.connection)
         uninterpreted_theories: list[str] = []
         for th in theory_hashes:
             if not Semantic_DB.is_thy_interpreted(th):
-                name = self.connection.callback("Theory_Hash.theory_name_of", th)
+                name = await self.connection.callback("Theory_Hash.theory_name_of", th)
                 if name is not None and name != current_thy and not is_thy_skipped(name):
                     uninterpreted_theories.append(name)
         confirmed = False
         if uninterpreted_theories:
             if len(uninterpreted_theories) > 5:
                 import Isabelle_RPC_Host.dialogue
-                answer = self.connection.dialogue(
+                answer = await self.connection.dialogue(
                     f"[Semantic Embedding] {len(uninterpreted_theories)} uninterpreted theories "
                     f"need interpretation before embedding. "
                     f"This may consume a significant amount of API tokens. Proceed?",
@@ -477,11 +478,11 @@ class Semantic_Vector_Store(Vector_Store):
                 if answer != "Yes":
                     return []
                 confirmed = True
-            self.connection.tracing(
+            await self.connection.tracing(
                 f"[Semantic_Embedding] {len(uninterpreted_theories)} of {len(theory_hashes)} theories "
                 f"not yet interpreted, running interpretation for: "
                 + ", ".join(uninterpreted_theories))
-            interpret_theories_by_names(self.connection, uninterpreted_theories)
+            await interpret_theories_by_names(self.connection, uninterpreted_theories)
         # Query semantic store for interpretations and embed them
         texts: list[str] = []
         text_keys: list[key] = []
@@ -491,22 +492,22 @@ class Semantic_Vector_Store(Vector_Store):
                 texts.append(sem)
                 text_keys.append(k)
         if not texts:
-            self.connection.tracing(
+            await self.connection.tracing(
                 f"[Semantic_Embedding] no semantic interpretations found for the missing entities, skipping")
             return []
         if len(texts) > 42 and not confirmed:
             import Isabelle_RPC_Host.dialogue
-            answer = self.connection.dialogue(
+            answer = await self.connection.dialogue(
                 f"[Semantic Embedding] {len(texts)} entities to embed. "
                 f"This may consume a significant amount of API tokens. Proceed?",
                 ["Yes", "No"])
             if answer != "Yes":
                 return []
         total_chars = sum(len(t) for t in texts)
-        self.connection.tracing(
+        await self.connection.tracing(
             f"[Semantic_Embedding] embedding {len(texts)} of {len(missing)} missing entities "
             f"({total_chars} chars total) into vectors")
-        embed_result = self.emb_provider.embed(texts)
+        embed_result = await self.emb_provider.embed(texts)
         # Write vectors into matrix and store in LMDB
         with self._env.begin(write=True) as txn:
             for j, (k, vec) in enumerate(zip(text_keys, embed_result.vectors)):
@@ -518,7 +519,7 @@ class Semantic_Vector_Store(Vector_Store):
             self.mark_thy_embedded(th, embed_result.total_tokens)
         return text_keys
 
-    def lookup(
+    async def lookup(
         self,
         query: np.ndarray | str,
         k: int,
@@ -549,7 +550,7 @@ class Semantic_Vector_Store(Vector_Store):
             if self.connection is None:
                 return [], warnings
             from Isabelle_RPC_Host.context import entities_of
-            candidates, warnings = entities_of(self.connection, kinds,
+            candidates, warnings = await entities_of(self.connection, kinds,
                                      theories_not_include=_SKIP_THEORY_LONG_NAMES,
                                      term_patterns=term_patterns,
                                      type_patterns=type_patterns,
@@ -559,7 +560,7 @@ class Semantic_Vector_Store(Vector_Store):
             if self.connection is None:
                 return [], warnings
             from Isabelle_RPC_Host.context import entities_of
-            candidates, warnings = entities_of(self.connection, kinds,
+            candidates, warnings = await entities_of(self.connection, kinds,
                                      theories_not_include=_SKIP_THEORY_LONG_NAMES,
                                      term_patterns=term_patterns,
                                      type_patterns=type_patterns,
@@ -578,11 +579,11 @@ class Semantic_Vector_Store(Vector_Store):
             raise TypeError(f"Unknown domain type: {type(domain)}")
         if not candidates:
             return [], warnings
-        top = self.topk(query, candidates, k)
+        top = await self.topk(query, candidates, k)
         results = [(score, rec) for uk, score in top if (rec := Semantic_DB[uk]) is not None]
         return results, warnings
 
-    def _embed_keys(self, keys: list[universal_key]) -> int:
+    async def _embed_keys(self, keys: list[universal_key]) -> int:
         """Embed the given keys that are missing from the vector store.
         Looks up semantic texts from Semantic_DB, embeds them, and stores vectors.
         Returns the number of entities actually embedded."""
@@ -603,19 +604,19 @@ class Semantic_Vector_Store(Vector_Store):
             return 0
         # Embed and store
         if self.connection is not None:
-            self.connection.tracing(
+            await self.connection.tracing(
                 f"[Semantic_Embedding] embedding {len(texts)} entities ({sum(len(t) for t in texts)} chars)")
-        result = self.emb_provider.embed(texts)
+        result = await self.emb_provider.embed(texts)
         with self._env.begin(write=True) as txn:
             for k, vec in zip(text_keys, result.vectors):
                 txn.put(k, vec.astype(np.float32).tobytes())
         return len(text_keys)
 
-    def embed_entities(self, keys: list[universal_key]) -> None:
+    async def embed_entities(self, keys: list[universal_key]) -> None:
         """Embed the given entity keys, skipping those already embedded."""
-        self._embed_keys(keys)
+        await self._embed_keys(keys)
 
-    def embed_all_entities_in_theories(self, theories: list[str | universal_key]) -> None:
+    async def embed_all_entities_in_theories(self, theories: list[str | universal_key]) -> None:
         """Embed semantic interpretations into vectors for the given theories.
 
         For each theory, collects all entity keys, embeds missing ones,
@@ -636,24 +637,24 @@ class Semantic_Vector_Store(Vector_Store):
             if isinstance(thy, str):
                 thy_name = thy
                 try:
-                    thy_key = universal_key_of(self.connection, EntityKind.THEORY, thy)
+                    thy_key = await universal_key_of(self.connection, EntityKind.THEORY, thy)
                 except UndefinedEntity:
-                    self.connection.warning(
+                    await self.connection.warning(
                         f"[Semantic_Embedding] skipping unknown theory {thy!r}")
                     continue
             else:
                 thy_key = bytes(thy)
-                thy_name = self.connection.callback("Theory_Hash.theory_name_of", thy_key)
+                thy_name = await self.connection.callback("Theory_Hash.theory_name_of", thy_key)
                 if thy_name is None:
                     raise ValueError(
                         f"Theory key {thy_key.hex()} not found in the active Isabelle runtime; "
                         f"the theory may not be loaded")
             if self.is_thy_embedded(thy_key):
                 continue
-            keys = entities_of(self.connection, EntityKind.ALL, # type: ignore
+            keys, _warnings = await entities_of(self.connection, EntityKind.ALL, # type: ignore
                                theory=thy_name, the_theory_only=True)
             wip = is_WIP(thy_key)
-            self._embed_keys(keys)
+            await self._embed_keys(keys)
             if not wip:
                 self.mark_thy_embedded(thy_key)
 
@@ -667,7 +668,7 @@ def _resolve_embedding_model(connection: Connection | None, emb_provider: str | 
         return emb_provider
     if connection is not None:
         try:
-            name = connection.config_lookup("Semantic_Embedding.embedding_model")
+            name = connection.config_lookup_sync("Semantic_Embedding.embedding_model")
             if name:
                 return name
         except Exception:
@@ -690,70 +691,70 @@ Connection.semantic_vector_store = _conn_semantic_vector_store  # type: ignore
 # --- RPC wrappers ---
 
 @isabelle_remote_procedure("Semantic_Store.query")
-def _query(arg: Any, connection: Connection) -> str | None:
+async def _query(arg: Any, connection: Connection) -> str | None:
     key, with_pretty = arg
     return Semantic_DB.query(bytes(key), bool(with_pretty))
 
 
 @isabelle_remote_procedure("Semantic_Store.is_interpreted")
-def _is_interpreted(arg: Any, connection: Connection) -> bool:
+async def _is_interpreted(arg: Any, connection: Connection) -> bool:
     return Semantic_DB.is_thy_interpreted(bytes(arg))
 
 
 @isabelle_remote_procedure("Semantic_Store.mark_interpreted")
-def _mark_interpreted(arg: Any, connection: Connection) -> None:
+async def _mark_interpreted(arg: Any, connection: Connection) -> None:
     Semantic_DB.mark_interpreted(bytes(arg))
 
 
 @isabelle_remote_procedure("Semantic_Store.clean_wip")
-def _clean_wip(arg: Any, connection: Connection) -> int:
+async def _clean_wip(arg: Any, connection: Connection) -> int:
     return clean_wip()
 
 
 @isabelle_remote_procedure("Semantic_Store.contains")
-def _contains(arg: Any, connection: Connection) -> list[bool]:
+async def _contains(arg: Any, connection: Connection) -> list[bool]:
     keys = [bytes(k) for k in arg]
     return Semantic_DB.contains(keys)
 
 
 @isabelle_remote_procedure("Semantic_Embedding.query_knn")
-def _query_knn(arg: Any, connection: Connection) -> list[tuple[float, tuple[int, str]]]:
+async def _query_knn(arg: Any, connection: Connection) -> list[tuple[float, tuple[int, str]]]:
     query_str, k, kind_ints, domain_raw = arg
     kinds = [EntityKind(ki) for ki in kind_ints]
     domain = Semantic_Vector_Store.Restricted([bytes(uk) for uk in domain_raw]) if domain_raw is not None else Semantic_Vector_Store.ContextAll
     store = connection.semantic_vector_store()  # type: ignore
-    results = store.lookup(query_str, k, kinds, domain)
+    results, _warnings = await store.lookup(query_str, k, kinds, domain)
     return [(score, (int(rec.kind), rec.name))
             for score, rec in results]
 
 
 @isabelle_remote_procedure("Semantic_Embedding.embed_all_entities_in_theories")
-def _embed_all_entities_in_theories(arg: Any, connection: Connection) -> None:
+async def _embed_all_entities_in_theories(arg: Any, connection: Connection) -> None:
     theory_names, model_name = arg
     store = connection.semantic_vector_store(model_name or None)  # type: ignore
-    store.embed_all_entities_in_theories(theory_names)
+    await store.embed_all_entities_in_theories(theory_names)
 
 
 @isabelle_remote_procedure("Semantic_Embedding.embed_entities")
-def _embed_entities(arg: Any, connection: Connection) -> None:
+async def _embed_entities(arg: Any, connection: Connection) -> None:
     keys = [bytes(k) for k in arg]
     store = connection.semantic_vector_store()  # type: ignore
-    store.embed_entities(keys)
+    await store.embed_entities(keys)
 
 
 @isabelle_remote_procedure("Semantic_Embedding.contains")
-def _embedding_contains(arg: Any, connection: Connection) -> list[bool]:
+async def _embedding_contains(arg: Any, connection: Connection) -> list[bool]:
     keys = [bytes(k) for k in arg]
     store = connection.semantic_vector_store()  # type: ignore
     return store.contains(keys)
 
 
 @isabelle_remote_procedure("Semantic_Embedding.is_thy_embedded")
-def _is_thy_embedded_rpc(arg: Any, connection: Connection) -> bool:
+async def _is_thy_embedded_rpc(arg: Any, connection: Connection) -> bool:
     theory_name, model_name = arg
     store = connection.semantic_vector_store(model_name)  # type: ignore
     try:
-        thy_key = universal_key_of(connection, EntityKind.THEORY, theory_name)
+        thy_key = await universal_key_of(connection, EntityKind.THEORY, theory_name)
     except UndefinedEntity:
         return False
     return store.is_thy_embedded(thy_key)

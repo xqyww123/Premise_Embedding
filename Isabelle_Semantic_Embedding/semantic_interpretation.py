@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 from pathlib import Path
-import threading
 from typing import Any, NamedTuple, cast
 
 from Isabelle_RPC_Host import Connection, isabelle_remote_procedure
@@ -31,7 +31,7 @@ from claude_agent_sdk.types import (
 from .base import ToolCall_ret, mk_ret as _mk_ret
 from .semantics import Semantic_DB, SemanticRecord
 
-# --- Thread-local state ---
+# --- Context-local state ---
 
 _KIND_CONSTANT = 1
 _KIND_THEOREM = 2
@@ -241,10 +241,7 @@ However, you cannot query entries you have been asked to translate \u2014 do it 
 
 Submit all translations via `mcp__isabelle_semantics__answer` for each entry."""
 
-class _LocalState(threading.local):
-    task: InterpretationTask
-
-_local = _LocalState()
+_local_task: contextvars.ContextVar[InterpretationTask] = contextvars.ContextVar('_local_task')
 
 
 _log = logging.getLogger(__name__)
@@ -291,7 +288,7 @@ _answer_schema = {
     input_schema=_answer_schema,
 )
 async def _answer_tool(args: dict[str, Any]) -> ToolCall_ret:
-    task = _local.task
+    task = _local_task.get()
     interpretations = args["interpretations"]
     errors = []
     count = 0
@@ -415,7 +412,7 @@ class RateLimitError(Exception):
     pass
 
 async def _run_agent(options: ClaudeAgentOptions) -> None:
-    task = _local.task
+    task = _local_task.get()
     first_prompt, task.batch_range = task.batches[0]
     try:
         async with ClaudeSDKClient(options=options) as client:
@@ -465,7 +462,7 @@ async def _run_agent(options: ClaudeAgentOptions) -> None:
 
 # --- Public API ---
 
-def interpret_file(
+async def interpret_file(
     connection: Connection,
     file_path: str,
     theory_longname: str,
@@ -524,7 +521,7 @@ def interpret_file(
             connection, file_path, theory_longname, theory_key,
             entries=[entries[i] for i in uncached],
         ) as task:
-            _local.task = task
+            _local_task.set(task)
 
             m = len(task.entries)
 
@@ -562,7 +559,7 @@ def interpret_file(
             )
 
             _log.info("interpret_file: starting agent with %d batches", len(task.batches))
-            asyncio.run(_run_agent(options))
+            await _run_agent(options)
             answered = sum(1 for v in task.results.values() if v is not None)
             _log.info("interpret_file: agent finished, %d/%d interpreted",
                        answered, len(task.entries))
@@ -596,7 +593,7 @@ def interpret_file(
 # --- RPC shim ---
 
 @isabelle_remote_procedure("Semantic_Store.interpret_file")
-def _interpret_file(arg: Any, connection: Connection) -> InterpretationResult:
+async def _interpret_file(arg: Any, connection: Connection) -> InterpretationResult:
     (file_path, theory_longname, theory_key, raw_entries) = arg
     entries = [
         Entry(
@@ -608,7 +605,7 @@ def _interpret_file(arg: Any, connection: Connection) -> InterpretationResult:
         )
         for kind, name, prop, lineno, uk in raw_entries
     ]
-    return interpret_file(
+    return await interpret_file(
         connection, file_path, theory_longname, bytes(theory_key), entries
     )
 

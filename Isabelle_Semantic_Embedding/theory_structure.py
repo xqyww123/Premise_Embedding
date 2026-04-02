@@ -9,17 +9,17 @@ if TYPE_CHECKING:
     from Isabelle_RPC_Host import Connection
 
 
-def theory_info(connection: "Connection", theory_name: str) -> tuple[str, str]:
+async def theory_info(connection: "Connection", theory_name: str) -> tuple[str, str]:
     """Resolve a theory name to (long_name, file_path) via Isabelle callback."""
-    return tuple(connection.callback("Context.theory_long_name_and_path", theory_name))
+    return tuple(await connection.callback("Context.theory_long_name_and_path", theory_name))
 
 
-def get_session_databases(connection: "Connection") -> list[tuple[str, str]]:
+async def get_session_databases(connection: "Connection") -> list[tuple[str, str]]:
     """Return all loaded (ancestor) sessions and their export database paths.
 
     Returns a list of (session_name, db_path) pairs.
     """
-    return connection.callback("pide_state.get_session_databases", None)
+    return await connection.callback("pide_state.get_session_databases", None)
 
 
 def mk_unicode_file(path: str) -> str:
@@ -47,7 +47,7 @@ _GOAL_RE = re.compile(
 )
 
 @isabelle_remote_procedure("Semantic_Store.check_theorem_name_in_file")
-def check_theorem_name_in_file(arg: Any, connection: "Connection") -> list[tuple[int, int]]:
+async def check_theorem_name_in_file(arg: Any, connection: "Connection") -> list[tuple[int, int]]:
     """Check each name against the file content and return a pair per name.
 
     The file is preprocessed once into lookup structures, then each name is

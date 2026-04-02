@@ -11,6 +11,7 @@ Usage:
 import argparse
 import threading
 import time
+import asyncio
 
 import msgpack as mp
 import Isabelle_RPC_Host
@@ -28,7 +29,7 @@ args = parser.parse_args()
 
 logger = Isabelle_RPC_Host.mk_logger_(args.rpc_addr, None)
 
-# Launch RPC host in daemon thread
+# Launch RPC host in daemon thread (runs its own event loop via asyncio.run)
 rpc_thread = threading.Thread(
     target=Isabelle_RPC_Host.launch_server_,
     args=(args.rpc_addr, logger), daemon=True)
@@ -37,59 +38,58 @@ time.sleep(1)
 
 import sys
 
-# Connect to pre-running Isa-REPL server
-c = Client(args.repl_addr, args.session, timeout=None)
-print("Loading theories...", flush=True)
-fullnames = c.load_theory([args.theory, "Semantic_Embedding.Semantic_Collection_App"])
-print(f"Loaded: {fullnames}", flush=True)
+async def main():
+    # Connect to pre-running Isa-REPL server
+    async with Client(args.repl_addr, args.session, timeout=None) as c:
+        print("Loading theories...", flush=True)
+        fullnames = await c.load_theory([args.theory, "Semantic_Embedding.Semantic_Collection_App"])
+        print(f"Loaded: {fullnames}", flush=True)
 
-# Run the App — streams tracing via msgpack SOME/NONE protocol
-print("Running app...", flush=True)
-c.run_app("Semantic_Store.collect")
-mp.pack(args.theory, c.cout)
-models = [m.strip() for m in args.embed_models.split(",") if m.strip()] if args.embed_models else []
-mp.pack(models, c.cout)
-c.cout.flush()
+        # Run the App — streams tracing via msgpack SOME/NONE protocol
+        print("Running app...", flush=True)
+        await c.run_app("Semantic_Store.collect")
+        models = [m.strip() for m in args.embed_models.split(",") if m.strip()] if args.embed_models else []
+        await c._write(args.theory, models)
 
-# Read and print tracing messages until done
-#c.sock.settimeout(600)  # 10 min timeout for interpretation
-has_error = False
-try:
-    while True:
-        raw = c.unpack.unpack()
-        # App done marker: ((), ()) from REPL_Server.output cout packUnit ()
-        if isinstance(raw, (list, tuple)) and len(raw) == 2:
-            msg, err = raw
-            if err is not None and err != ():
-                err_str = err.decode("utf-8") if isinstance(err, bytes) else str(err)
-                print(err_str, file=sys.stderr, flush=True)
-                has_error = True
-                continue
-            if msg is None or msg == ():
-                # Check if this is the done marker (both sides are unit)
-                if (msg is None or msg == ()) and (err is None or err == ()):
+        # Read and print tracing messages until done
+        has_error = False
+        try:
+            while True:
+                raw = await c._feed_and_unpack()
+                # App done marker: ((), ()) from REPL_Server.output cout packUnit ()
+                if isinstance(raw, (list, tuple)) and len(raw) == 2:
+                    msg, err = raw
+                    if err is not None and err != ():
+                        err_str = err.decode("utf-8") if isinstance(err, bytes) else str(err)
+                        print(err_str, file=sys.stderr, flush=True)
+                        has_error = True
+                        continue
+                    if msg is None or msg == ():
+                        # Check if this is the done marker (both sides are unit)
+                        if (msg is None or msg == ()) and (err is None or err == ()):
+                            break
+                        continue
+                    if isinstance(msg, bytes):
+                        msg = msg.decode("utf-8", errors="replace")
+                    if isinstance(msg, str):
+                        if msg.startswith("ERROR:"):
+                            print(msg, file=sys.stderr, flush=True)
+                            has_error = True
+                        else:
+                            print(msg, flush=True)
+                elif raw is None:
                     break
-                continue
-            if isinstance(msg, bytes):
-                msg = msg.decode("utf-8", errors="replace")
-            if isinstance(msg, str):
-                if msg.startswith("ERROR:"):
-                    print(msg, file=sys.stderr, flush=True)
-                    has_error = True
                 else:
-                    print(msg, flush=True)
-        elif raw is None:
-            break
-        else:
-            print(f"[unexpected: {raw!r}]", flush=True)
-except Exception as e:
-    print(f"Connection error: {e}", file=sys.stderr, flush=True)
-    has_error = True
-    raise
+                    print(f"[unexpected: {raw!r}]", flush=True)
+        except Exception as e:
+            print(f"Connection error: {e}", file=sys.stderr, flush=True)
+            has_error = True
+            raise
 
-if has_error:
-    print("Failed.", file=sys.stderr)
-    sys.exit(1)
-else:
-    print("Done.")
-c.close()
+        if has_error:
+            print("Failed.", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print("Done.")
+
+asyncio.run(main())

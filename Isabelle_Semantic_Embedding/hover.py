@@ -20,7 +20,7 @@ from .base import ToolCall_ret, mk_ret as _mk_ret
 # Public API
 # ---------------------------------------------------------------------------
 
-def goto_definition(
+async def goto_definition(
     pos: IsabellePosition,
     connection: Optional[Connection] = None,
 ) -> Optional[tuple[str, int, int, int]]:
@@ -33,7 +33,7 @@ def goto_definition(
     if connection is None:
         return None
     try:
-        result = connection.callback(
+        result = await connection.callback(
             "pide_state.goto_definition", (pos.file, pos.raw_offset))
         if result is not None:
             def_file, def_line, def_offset, def_end_offset = result
@@ -43,7 +43,7 @@ def goto_definition(
     return None
 
 
-def hover_message(
+async def hover_message(
     pos: IsabellePosition,
     connection: Optional[Connection] = None,
 ) -> Optional[str]:
@@ -55,7 +55,7 @@ def hover_message(
     if connection is None:
         return None
     try:
-        result = connection.callback(
+        result = await connection.callback(
             "pide_state.hover_message", (pos.file, pos.raw_offset))
         if result is not None and result != "":
             return result
@@ -123,7 +123,7 @@ def mk_definition_tool(connection: Connection, unicode: bool = False) -> SdkMcpT
                 isa_pos = UnicodePosition(args["line"], args["column"], thy_path).to_isabelle_position()
             else:
                 isa_pos = AsciiPosition(args["line"], args["column"], thy_path).to_isabelle_position()
-            result = goto_definition(isa_pos, connection)
+            result = await goto_definition(isa_pos, connection)
             if result is None:
                 log.debug("definition: not found")
                 return _mk_ret("No definition found at this position.")
@@ -164,12 +164,12 @@ def mk_hover_tool(connection: Connection, unicode: bool = False) -> SdkMcpTool[A
                 isa_pos = UnicodePosition(args["line"], args["column"], thy_path).to_isabelle_position()
             else:
                 isa_pos = AsciiPosition(args["line"], args["column"], thy_path).to_isabelle_position()
-            result = hover_message(isa_pos, connection)
-            if unicode:
-                result = pretty_unicode(result)
+            result = await hover_message(isa_pos, connection)
             if result is None:
                 log.debug("hover: not found")
                 return _mk_ret("No hover information at this position.")
+            if unicode:
+                result = pretty_unicode(result)
             log.debug("hover: -> %s", result)
             return _mk_ret(result)
         except Exception:

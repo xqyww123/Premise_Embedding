@@ -8,7 +8,7 @@ import numpy as np
 import os
 import re
 import time
-import requests
+import httpx
 
 TEI_BASE_DEFAULT = os.getenv("TEI_BASE", None)
 API_KEY_DEFAULT = os.getenv("API_KEY", None)
@@ -31,7 +31,7 @@ type premise = tuple[
 type vector = bytearray | bytes
 
 @isabelle_remote_procedure("embed")
-def embed(arg : tuple[list[bytes | str], config], connection : Connection) -> list[vector]:
+async def embed(arg : tuple[list[bytes | str], config], connection : Connection) -> list[vector]:
     (texts, (base_url, MODEL_ID, api_key, dimension)) = arg
     if connection is not None and getattr(connection.server, "debugging", False) and texts:
         try:
@@ -91,16 +91,17 @@ def embed(arg : tuple[list[bytes | str], config], connection : Connection) -> li
             headers = {"Content-Type": "application/json"}
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
-            resp = requests.post(
-                url,
-                json={
-                    "input": [text.decode('utf-8') for text in new_texts],
-                    "model": MODEL_ID,
-                    "encoding_format": "float",
-                },
-                headers=headers,
-                timeout=60,
-            )
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    url,
+                    json={
+                        "input": [text.decode('utf-8') for text in new_texts],
+                        "model": MODEL_ID,
+                        "encoding_format": "float",
+                    },
+                    headers=headers,
+                    timeout=60,
+                )
             resp.raise_for_status()
             data = resp.json()
 
@@ -272,12 +273,12 @@ def encode_premise(premise: premise, pctxt: ctxt, model: str, token_limit: int) 
     return encode
 
 @isabelle_remote_procedure("embed_goal")
-def embed_goal(arg: tuple[goal, ctxt, config, int], connection : Connection) -> vector:
+async def embed_goal(arg: tuple[goal, ctxt, config, int], connection : Connection) -> vector:
     _t0 = time.perf_counter()
     (goal, ctxt, cfg, token_limit) = arg
     _, MODEL_ID, _, _ = cfg
     goal_str = encode_goal(goal, ctxt, MODEL_ID, token_limit)
-    result = embed(([goal_str], cfg), connection)[0]
+    result = (await embed(([goal_str], cfg), connection))[0]
     if connection is not None and getattr(connection.server, "debugging", False):
         elapsed = time.perf_counter() - _t0
         n = _count_tokens(goal_str, MODEL_ID)
@@ -289,12 +290,12 @@ def embed_goal(arg: tuple[goal, ctxt, config, int], connection : Connection) -> 
     return result
 
 @isabelle_remote_procedure("embed_premises")
-def embed_premises(arg: tuple[list[tuple[premise, ctxt]], config, int], connection : Connection) -> list[vector]:
+async def embed_premises(arg: tuple[list[tuple[premise, ctxt]], config, int], connection : Connection) -> list[vector]:
     _t0 = time.perf_counter()
     (premises, cfg, token_limit) = arg
     _, MODEL_ID, _, _ = cfg
     premises_str = [encode_premise(premise, ctxt, MODEL_ID, token_limit) for premise, ctxt in premises]
-    result = embed((premises_str, cfg), connection)
+    result = await embed((premises_str, cfg), connection)
     if connection is not None and getattr(connection.server, "debugging", False) and premises_str:
         elapsed = time.perf_counter() - _t0
         counts = [_count_tokens(s, MODEL_ID) for s in premises_str]
@@ -312,14 +313,14 @@ def embed_premises(arg: tuple[list[tuple[premise, ctxt]], config, int], connecti
     return result
 
 @isabelle_remote_procedure("embed_goal_and_premises")
-def embed_goal_and_premises(arg: tuple[goal, ctxt, list[tuple[premise, ctxt]], config, int], connection : Connection) -> tuple[bytes, list[bytes]]:
+async def embed_goal_and_premises(arg: tuple[goal, ctxt, list[tuple[premise, ctxt]], config, int], connection : Connection) -> tuple[bytes, list[bytes]]:
     _t0 = time.perf_counter()
     (goal, gctxt, premises, cfg, token_limit) = arg
     _, MODEL_ID, _, _ = cfg
     goal_str = encode_goal(goal, gctxt, MODEL_ID, token_limit)
     codes : list[str] = [encode_premise(premise, ctxt, MODEL_ID, token_limit) for premise, ctxt in premises]
     codes.append(goal_str)
-    vecs = embed((codes, cfg), connection)
+    vecs = await embed((codes, cfg), connection)
     goal_vec = vecs.pop()
     prem_vecs = vecs
     if connection is not None and getattr(connection.server, "debugging", False) and codes:
