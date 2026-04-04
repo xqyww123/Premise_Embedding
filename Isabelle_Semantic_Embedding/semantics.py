@@ -15,7 +15,7 @@ from Isabelle_RPC_Host.position import AsciiPosition, UnicodePosition, IsabelleP
 from Isabelle_RPC_Host.universal_key import EntityKind, UndefinedEntity, universal_key, universal_key_of, destruct_key, is_WIP
 from claude_agent_sdk import SdkMcpTool, tool
 
-from .semantic_embedding import Vector_Store, Embedding_Provider, embedding_provider, key
+from .semantic_embedding import Vector_Store, Embedding_Provider, embedding_provider, Reranker_Provider, reranker_provider, key
 
 from .base import ToolCall_ret, mk_ret as _mk_ret
 from .hover import _position_schema, _validate_position_args, _resolve_thy_path
@@ -318,6 +318,9 @@ async def interpret_theories_by_names(connection: Connection, names: list[str]) 
     await connection.callback("Semantic_Store.interpret_theories", names)
 
 
+_RERANK_FETCH_MULTIPLIER = 4
+
+
 class Semantic_Vector_Store(Vector_Store):
 
     class Domain:
@@ -380,7 +383,7 @@ class Semantic_Vector_Store(Vector_Store):
         connection: Connection | None = None,
     ):
         if emb_provider is None:
-            emb_provider = _resolve_embedding_model(connection, None)
+            emb_provider = os.getenv("EMBEDDING_MODEL", "fw.qwen3-embedding-8b")
         if isinstance(emb_provider, str):
             model_name = emb_provider
         else:
@@ -399,6 +402,13 @@ class Semantic_Vector_Store(Vector_Store):
                 if model_name in stores:
                     raise ValueError(f"Semantic_Vector_Store for {model_name!r} already registered on this connection")
                 stores[model_name] = self
+
+    async def _get_reranker(self) -> 'Reranker_Provider | None':
+        """Lazily resolve the reranker from current config/env at call time."""
+        reranker_name = await _resolve_reranker_model(self.connection)
+        if reranker_name is None:
+            return None
+        return reranker_provider(reranker_name)
 
     def is_thy_embedded(self, theory_key: universal_key) -> bool:
         """Check whether a theory's entities are all embedded in this vector store."""
@@ -579,9 +589,32 @@ class Semantic_Vector_Store(Vector_Store):
             raise TypeError(f"Unknown domain type: {type(domain)}")
         if not candidates:
             return [], warnings
-        top = await self.topk(query, candidates, k)
+        # Save original query string for potential reranking (topk embeds it)
+        query_str = query if isinstance(query, str) else None
+        reranker = (await self._get_reranker()) if query_str else None
+        fetch_k = k * _RERANK_FETCH_MULTIPLIER if reranker else k
+        top = await self.topk(query, candidates, fetch_k)
+        # Rerank if configured and query was a string
+        if reranker is not None and query_str is not None and len(top) > 1:
+            doc_entries: list[tuple[universal_key, SemanticRecord, str]] = []
+            for uk, _score in top:
+                rec = Semantic_DB[uk]
+                if rec is not None:
+                    doc_text = Semantic_DB.query(uk, with_pretty=True)
+                    if doc_text:
+                        doc_entries.append((uk, rec, doc_text))
+            if doc_entries:
+                try:
+                    rr = await reranker.rerank(
+                        query_str, [e[2] for e in doc_entries], min(k, len(doc_entries)))
+                    results = [(rr.scores[i], doc_entries[idx][1])
+                               for i, idx in enumerate(rr.indices)]
+                    return results, warnings
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning("Reranker failed, falling back to embedding scores: %s", e)
         results = [(score, rec) for uk, score in top if (rec := Semantic_DB[uk]) is not None]
-        return results, warnings
+        return results[:k], warnings
 
     async def _embed_keys(self, keys: list[universal_key]) -> int:
         """Embed the given keys that are missing from the vector store.
@@ -662,23 +695,30 @@ class Semantic_Vector_Store(Vector_Store):
 _svs_lock = threading.Lock()
 
 
-def _resolve_embedding_model(connection: Connection | None, emb_provider: str | None) -> str:
+async def _resolve_embedding_model(connection: Connection | None, emb_provider: str | None) -> str:
     """Resolve embedding model name from config, env, or default."""
     if emb_provider is not None:
         return emb_provider
     if connection is not None:
-        try:
-            name = connection.config_lookup_sync("Semantic_Embedding.embedding_model")
-            if name:
-                return name
-        except Exception:
-            pass
+        name = await connection.config_lookup("Semantic_Embedding.embedding_model")
+        if name:
+            return name
     return os.getenv("EMBEDDING_MODEL", "fw.qwen3-embedding-8b")
 
 
-def _conn_semantic_vector_store(self: Connection, embedding_model: str | None = None) -> Semantic_Vector_Store:
+async def _resolve_reranker_model(connection: Connection | None) -> str | None:
+    """Resolve reranker model name from config, env, or None (disabled)."""
+    if connection is not None:
+        name = await connection.config_lookup("Semantic_Embedding.reranker_model")
+        if name:
+            return name
+    model = os.getenv("RERANKER_MODEL", "")
+    return model if model else None
+
+
+async def _conn_semantic_vector_store(self: Connection, embedding_model: str | None = None) -> Semantic_Vector_Store:
     """Get or create a Semantic_Vector_Store for the given embedding model."""
-    resolved = _resolve_embedding_model(self, embedding_model)
+    resolved = await _resolve_embedding_model(self, embedding_model)
     with _svs_lock:
         stores = getattr(self, '_semantic_vector_stores', None)
         if stores is not None and resolved in stores:
@@ -722,7 +762,7 @@ async def _query_knn(arg: Any, connection: Connection) -> list[tuple[float, tupl
     query_str, k, kind_ints, domain_raw = arg
     kinds = [EntityKind(ki) for ki in kind_ints]
     domain = Semantic_Vector_Store.Restricted([bytes(uk) for uk in domain_raw]) if domain_raw is not None else Semantic_Vector_Store.ContextAll
-    store = connection.semantic_vector_store()  # type: ignore
+    store = await connection.semantic_vector_store()  # type: ignore
     results, _warnings = await store.lookup(query_str, k, kinds, domain)
     return [(score, (int(rec.kind), rec.name))
             for score, rec in results]
@@ -731,28 +771,28 @@ async def _query_knn(arg: Any, connection: Connection) -> list[tuple[float, tupl
 @isabelle_remote_procedure("Semantic_Embedding.embed_all_entities_in_theories")
 async def _embed_all_entities_in_theories(arg: Any, connection: Connection) -> None:
     theory_names, model_name = arg
-    store = connection.semantic_vector_store(model_name or None)  # type: ignore
+    store = await connection.semantic_vector_store(model_name or None)  # type: ignore
     await store.embed_all_entities_in_theories(theory_names)
 
 
 @isabelle_remote_procedure("Semantic_Embedding.embed_entities")
 async def _embed_entities(arg: Any, connection: Connection) -> None:
     keys = [bytes(k) for k in arg]
-    store = connection.semantic_vector_store()  # type: ignore
+    store = await connection.semantic_vector_store()  # type: ignore
     await store.embed_entities(keys)
 
 
 @isabelle_remote_procedure("Semantic_Embedding.contains")
 async def _embedding_contains(arg: Any, connection: Connection) -> list[bool]:
     keys = [bytes(k) for k in arg]
-    store = connection.semantic_vector_store()  # type: ignore
+    store = await connection.semantic_vector_store()  # type: ignore
     return store.contains(keys)
 
 
 @isabelle_remote_procedure("Semantic_Embedding.is_thy_embedded")
 async def _is_thy_embedded_rpc(arg: Any, connection: Connection) -> bool:
     theory_name, model_name = arg
-    store = connection.semantic_vector_store(model_name)  # type: ignore
+    store = await connection.semantic_vector_store(model_name)  # type: ignore
     try:
         thy_key = await universal_key_of(connection, EntityKind.THEORY, theory_name)
     except UndefinedEntity:

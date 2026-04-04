@@ -29,6 +29,10 @@ signature SEMANTIC_STORE = sig
      Empty string means use the environment variable EMBEDDING_MODEL. *)
   val embedding_model : string Config.T
 
+  (* Config option: reranker model name for re-ranking search results.
+     Empty string means disabled (use env var RERANKER_MODEL or no reranking). *)
+  val reranker_model : string Config.T
+
   (* Search k nearest entities by semantic similarity to a query string.
      kinds filters entity types; NONE domain means all entities of those kinds.
      Returns (score, entity) pairs sorted by similarity. *)
@@ -84,6 +88,11 @@ val embedding_model = Attrib.setup_config_string
   \<^binding>\<open>embedding_model\<close> (K "")
 val _ = Config.register_rpc_option "Semantic_Embedding.embedding_model"
           (Config.string_value embedding_model)
+
+val reranker_model = Attrib.setup_config_string
+  \<^binding>\<open>reranker_model\<close> (K "")
+val _ = Config.register_rpc_option "Semantic_Embedding.reranker_model"
+          (Config.string_value reranker_model)
 
 structure Thm_Dedup = Hash_Table(struct
   type key = Universal_Key.universal_key

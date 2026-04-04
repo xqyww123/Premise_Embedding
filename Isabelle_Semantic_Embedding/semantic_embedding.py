@@ -379,6 +379,108 @@ class Qwen3_Embedding_8B_by_Fireworks(OpenAI_Embedding_Provider):
     supports_batch = False
     normalize = True
 
+@register_embedding_provider("gemini.gemini-embedding-2")
+class Gemini_Embedding(Embedding_Provider):
+    model = "gemini-embedding-2-preview"
+    dimension = 3072
+    max_request_size = 100  # Gemini batchEmbedContents limit
+    api_key: str | None = os.getenv("GEMINI_API_KEY")
+
+    async def _embed(self, text: list[str]) -> EmbedResult:
+        url = (f"https://generativelanguage.googleapis.com/v1beta"
+               f"/models/{self.model}:batchEmbedContents")
+        requests = [{"model": f"models/{self.model}",
+                     "content": {"parts": [{"text": t}]}}
+                    for t in text]
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, params={"key": self.api_key},
+                json={"requests": requests}, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            vectors = np.asarray(
+                [emb["values"] for emb in data["embeddings"]],
+                dtype=np.float32)
+            return EmbedResult(vectors, 0)
+
+
+# --- Reranker Provider ---
+
+class RerankResult(NamedTuple):
+    """Reranker output: document indices and their relevance scores, sorted by relevance."""
+    indices: list[int]
+    scores: list[float]
+
+
+class Reranker_Provider(ABC):
+    type name = str
+    model: str
+    max_documents: int = 200
+    PROVIDERS: dict[name, type['Reranker_Provider']] = {}
+
+    @abstractmethod
+    async def rerank(self, query: str, documents: list[str], top_n: int) -> RerankResult:
+        """Rerank documents by relevance to query. Returns top_n results sorted by relevance."""
+        ...
+
+
+def register_reranker_provider(name: str):
+    """Class decorator to register a Reranker_Provider subclass by name."""
+    def decorator(cls: type[Reranker_Provider]) -> type[Reranker_Provider]:
+        Reranker_Provider.PROVIDERS[name] = cls
+        return cls
+    return decorator
+
+
+def reranker_provider(name: Reranker_Provider.name) -> Reranker_Provider:
+    """Instantiate a Reranker_Provider by name.
+    Checks PROVIDERS registry first, then dynamically loads from drivers/{name}.py."""
+    if name in Reranker_Provider.PROVIDERS:
+        return Reranker_Provider.PROVIDERS[name]()
+    path = pathlib.Path(__file__).parent / "drivers" / f"{name}.py"
+    if not path.exists():
+        raise ImportError(f"Reranker driver {name!r} not found in PROVIDERS or at {path}")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load reranker driver {name!r} from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.Reranker_Provider()
+
+
+class OpenAI_Reranker_Provider(Reranker_Provider):
+    """Reranker using OpenAI-compatible /v1/rerank endpoint."""
+    base_url: str
+    api_key: str | None = None
+
+    async def rerank(self, query: str, documents: list[str], top_n: int) -> RerankResult:
+        url = self.base_url.rstrip("/") + "/v1/rerank"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json={
+                "model": self.model,
+                "query": query,
+                "documents": documents,
+                "top_n": top_n,
+            }, headers=headers, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+        results = sorted(data["results"], key=lambda r: r["relevance_score"], reverse=True)
+        return RerankResult(
+            [r["index"] for r in results[:top_n]],
+            [r["relevance_score"] for r in results[:top_n]],
+        )
+
+
+@register_reranker_provider("fw.qwen3-reranker-8b")
+class Qwen3_Reranker_8B_by_Fireworks(OpenAI_Reranker_Provider):
+    base_url = "https://api.fireworks.ai/inference"
+    api_key: str | None = os.getenv("FIREWORKS_API_KEY")
+    model = "fireworks/qwen3-reranker-8b"
+    max_documents = 200
+
+
 type key = bytes
 
 import threading

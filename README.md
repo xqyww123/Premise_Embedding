@@ -109,6 +109,7 @@ Set in Isabelle via `declare [[option = value]]`:
 |--------|------|---------|-------------|
 | `auto_interpret_for_embedding` | bool | `true` | Auto-trigger interpretation when embeddings are missing |
 | `Semantic_Embedding.embedding_model` | string | `""` | Override embedding model (empty = use env var or default) |
+| `Semantic_Embedding.reranker_model` | string | `""` | Reranker model for re-ranking search results (empty = disabled; env var `RERANKER_MODEL`) |
 
 These are accessible from Python via `connection.config_lookup("option_name")`.
 
