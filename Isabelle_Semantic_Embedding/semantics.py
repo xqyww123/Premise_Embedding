@@ -614,6 +614,16 @@ class Semantic_Vector_Store(Vector_Store):
                     import logging
                     logging.getLogger(__name__).warning("Reranker failed, falling back to embedding scores: %s", e)
         results = [(score, rec) for uk, score in top if (rec := Semantic_DB[uk]) is not None]
+        if len(results) < k:
+            # Pad with entities that had no embedding, assigned score 0
+            top_set = {uk for uk, _ in top}
+            for uk in candidates:
+                if len(results) >= k:
+                    break
+                if uk not in top_set:
+                    rec = Semantic_DB[uk]
+                    if rec is not None:
+                        results.append((0.0, rec))
         return results[:k], warnings
 
     async def _embed_keys(self, keys: list[universal_key]) -> int:
