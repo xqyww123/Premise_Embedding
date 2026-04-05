@@ -5,7 +5,7 @@
   - Global registry (Synchronized.var + global hash tables) for theory-level entries.
   - Local registry (Proof_Data, lazily initialized) for proof-context-level entries.
 
-  Theorems with a derivation_id are always registered globally.
+  Theorems with a derivation name are always registered globally.
   The same term may receive different serials in different registries,
   but one serial always corresponds to exactly one term/thm.
 *)
@@ -24,8 +24,8 @@ structure Term_Serial_Index : TERM_SERIAL_INDEX = struct
 (* serial -> term, for aconv filtering after iNet match *)
 val term_tab : term Inthashtab.table = Inthashtab.empty 256
 
-(* derivation_id serial -> term serial *)
-val deriv_cache : serial Inthashtab.table = Inthashtab.empty 256
+(* derivation name -> term serial *)
+val deriv_cache : serial Strhashtab.table = Strhashtab.empty 256
 
 (* serial -> thm, for reverse lookup from serial to theorem *)
 val thm_tab : thm Inthashtab.table = Inthashtab.empty 256
@@ -99,19 +99,8 @@ fun serial_of_term (Context.Theory _) term =
 *)
 
 fun serial_of_thm context thm =
-  case Thm.derivation_id thm of
-    SOME {serial = did, ...} =>
-      (* Always global for theorems with derivation_id *)
-      Synchronized.change_result state (fn net =>
-        let val (s, net') =
-          case Inthashtab.lookup deriv_cache did of
-            SOME s => (s, net)
-          | NONE =>
-              let val (s, net') = serial_of_term_internal term_tab net (Thm.prop_of thm)
-                  val _ = Inthashtab.update deriv_cache (did, s)
-              in (s, net') end
-        in Inthashtab.update thm_tab (s, Thm.trim_context thm); (s, net') end)
-  | NONE =>
+  case Thm.raw_derivation_name thm of
+    "" =>
       (case context of
         Context.Theory _ =>
           Synchronized.change_result state (fn net =>
@@ -125,6 +114,17 @@ fun serial_of_thm context thm =
                 val _ = net_ref := net'
                 val _ = Inthashtab.update local_tht (s, Thm.trim_context thm)
             in (s, net) end))
+  | name =>
+      (* Always global for named theorems *)
+      Synchronized.change_result state (fn net =>
+        let val (s, net') =
+          case Strhashtab.lookup deriv_cache name of
+            SOME s => (s, net)
+          | NONE =>
+              let val (s, net') = serial_of_term_internal term_tab net (Thm.prop_of thm)
+                  val _ = Strhashtab.update deriv_cache (name, s)
+              in (s, net') end
+        in Inthashtab.update thm_tab (s, Thm.trim_context thm); (s, net') end)
 
 (*
 fun term_of_serial (Context.Theory _) s = Inthashtab.lookup term_tab s

@@ -165,7 +165,7 @@ fun get_theorems_with_positions context =
    1. Classical reasoner rules (safeIs/unsafeIs or safeEs/unsafeEs)
    2. Name-based heuristic: facts whose base name ends with I (intro) or E (elim),
       where the preceding character is not an uppercase letter.
-   Uses Thm.derivation_name for names; rules with empty names are skipped. *)
+   Uses Thm.raw_derivation_name for names; rules with empty names are skipped. *)
 local
 
 fun has_rule_suffix suffix name =
@@ -189,7 +189,7 @@ fun get_rules_with_positions selector suffix context =
     val cs = Classical.rep_cs (Classical.get_cs context)
     val cs_results = map_filter (fn (thm, _, _) =>
       let val thm = Thm.transfer thy thm
-          val name = Thm.derivation_name thm
+          val name = Thm.raw_derivation_name thm
       in if name = "" orelse Strhashtab.defined seen name then NONE
          else if not (String.isPrefix thy_prefix name) then NONE
          else (Strhashtab.update seen (name, ());
@@ -208,7 +208,7 @@ fun get_rules_with_positions selector suffix context =
       if not (has_rule_suffix suffix name) then []
       else map_filter (fn thm =>
         let val thm = Thm.transfer thy thm
-            val dname = Thm.derivation_name thm
+            val dname = Thm.raw_derivation_name thm
             val key = if dname = "" then name else dname
         in if Strhashtab.defined seen key then NONE
            else (Strhashtab.update seen (key, ());
@@ -244,7 +244,7 @@ fun get_entities_with_positions context entities =
       let val (base, _) = parse_thm_name name
       in pos_of fact_space base end
     fun thm_name_pos thm =
-      let val name = Thm.derivation_name thm
+      let val name = Thm.raw_derivation_name thm
       in if name = "" then error "Anonymous theorem (empty derivation_name)"
          else (name, fact_pos name)
       end
@@ -259,7 +259,6 @@ fun get_entities_with_positions context entities =
           | Universal_Key.Theorem thm => thm_name_pos thm
           | Universal_Key.Introduction_Rule thm => thm_name_pos thm
           | Universal_Key.Elimination_Rule thm => thm_name_pos thm
-          | Universal_Key.Theorem_ID _ => error "Theorem_ID not supported in get_entities_with_positions"
         ) entities
   end
 
@@ -277,7 +276,7 @@ fun get_theorems_with_positions_of context entities =
         SOME entry => #pos entry | NONE => Position.none
     fun from_thm thm =
       let val thm = Thm.transfer thy thm
-          val name = Thm.derivation_name thm
+          val name = Thm.raw_derivation_name thm
       in if name = "" then error "Anonymous theorem (empty derivation_name)"
          else [(name, 0, pos_of name, thm, is_global name)]
       end
@@ -295,7 +294,6 @@ fun get_theorems_with_positions_of context entities =
   in
     maps (fn Universal_Key.Theorem thm => from_thm thm
            | Universal_Key.Named_Theorem name => from_name name
-           | Universal_Key.Theorem_ID _ => error "Theorem_ID not supported in get_theorems_with_positions_of"
            | _ => []) entities
   end
 

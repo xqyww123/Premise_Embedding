@@ -97,7 +97,7 @@ val fact_space = Facts.space_of facts
 val ns_entry = Name_Space.the_entry fact_space "AAA"
 \<close>
 
-ML \<open>Thm.derivation_id @{thm allI}\<close>
+ML \<open>Thm.raw_derivation_name @{thm allI}\<close>
 
 ML \<open>type x = Proofterm.thm_id\<close>
 
@@ -107,7 +107,7 @@ ML \<open>\<^try>\<open>xxxx catch e => xxx\<close>\<close>
 
 
 
-ML \<open>Thm.derivation_id\<close>
+ML \<open>Thm.raw_derivation_name\<close>
 
 ML \<open>  l et
     val n = 400 * 1024 * 1024
@@ -146,7 +146,7 @@ ML \<open>Theory_Hash.hash_of @{theory String}\<close>
 ML \<open>Semantic_Store.interpret  (Context.Theory @{theory List})\<close>
 
 ML \<open> @{thm append1_eq_conv}
-  |> Thm.derivation_id\<close>
+  |> Thm.raw_derivation_name\<close>
 
 ML \<open>
 #query_class (Semantic_Store.make_query_functions (Context.Theory @{theory}) [] true)
@@ -168,7 +168,7 @@ term Bit_Operations.semiring_modulo_trivial
 
 thm List.List.list.pred_True
 
-ML \<open>Thm.derivation_id\<close>
+ML \<open>Thm.raw_derivation_name\<close>
 ML \<open>Word.fromLargeWord\<close>
 ML \<open>PackWord.subVec\<close>
 ML \<open>Word31.wordSize\<close>
