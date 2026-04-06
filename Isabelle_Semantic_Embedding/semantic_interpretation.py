@@ -31,6 +31,11 @@ from claude_agent_sdk.types import (
 from .base import ToolCall_ret, mk_ret as _mk_ret
 from .semantics import Semantic_DB, SemanticRecord
 
+# --- Module-level configuration ---
+
+interpretation_model: str = "claude-opus-4-6"
+"""LLM model used for semantic interpretation. Set before calling interpret_file."""
+
 # --- Context-local state ---
 
 _KIND_CONSTANT = 1
@@ -548,7 +553,7 @@ async def interpret_file(
                 query_by_name_tool, query_by_position_tool,
                 definition_tool, hover_tool, _answer_tool])
             options = ClaudeAgentOptions(
-                model="claude-opus-4-6",
+                model=interpretation_model,
                 cwd=str(Path(__file__).parent / "Agent_Interpretation_Dir"),
                 setting_sources=["project"],
                 permission_mode="default",

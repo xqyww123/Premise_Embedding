@@ -275,6 +275,8 @@ def cmd_collect(args: argparse.Namespace) -> None:
     import asyncio
     import Isabelle_RPC_Host
     import Isabelle_Semantic_Embedding
+    import Isabelle_Semantic_Embedding.semantic_interpretation as si
+    si.interpretation_model = args.model
     from IsaREPL import Client
 
     logger = Isabelle_RPC_Host.mk_logger_(args.rpc_addr, None)
@@ -350,6 +352,8 @@ p_collect.add_argument("theory", help="Theory name to interpret (e.g., HOL.List)
 p_collect.add_argument("--repl-addr", default="127.0.0.1:6666", help="Isa-REPL server address")
 p_collect.add_argument("--rpc-addr", default="127.0.0.1:27182", help="RPC host address")
 p_collect.add_argument("--session", default="HOL", help="Session qualifier for theory name resolution")
+p_collect.add_argument("--model", default="claude-opus-4-6",
+    help="LLM model for semantic interpretation (default: claude-opus-4-6)")
 p_collect.add_argument("--embed-models", default="",
     help="Comma-separated embedding model names (e.g., 'fw.qwen3-embedding-8b,codestral-embed')")
 
