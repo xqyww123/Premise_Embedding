@@ -284,7 +284,8 @@ _answer_schema = {
     "answer",
     "Submit English translations for one or more of the listed entries. "
     "Each translation should be a concise plain-English description of what the entity defines or asserts. "
-    "You may also resubmit an entry to correct a previous answer.",
+    "You may also resubmit an entry to correct a previous answer. "
+    "To see the remaining unanswered entries in the current batch, call this tool with an empty list [].",
     input_schema=_answer_schema,
 )
 async def _answer_tool(args: dict[str, Any]) -> ToolCall_ret:
@@ -313,7 +314,11 @@ async def _answer_tool(args: dict[str, Any]) -> ToolCall_ret:
         else:
             msg = f"Good job! You can resubmit corrections later using the `mcp__isabelle_semantics__answer` tool if needed.\n\n{next_prompt}"
     else:
-        msg = f"Answered {count} translation{cs}, remaining {batch_remaining} in this batch."
+        remaining_indices = [i for i in task.batch_range if task.results[task._keys[i]] is None]
+        remaining_text = task.format_entries(remaining_indices)
+        msg = (f"Answered {count} translation{cs}, remaining {batch_remaining} in this batch.\n\n"
+               f"Unanswered entries:\n{remaining_text}\n\n"
+               f"Submit translations via `mcp__isabelle_semantics__answer`.")
     if errors:
         msg += "\nErrors:\n" + "\n".join(errors)
     return _mk_ret(msg)
