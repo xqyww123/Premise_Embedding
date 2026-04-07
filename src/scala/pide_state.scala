@@ -601,6 +601,85 @@ object Get_Session_Databases extends Scala.Fun("pide_state.get_session_databases
 }
 
 
+/* Feasibility probe: dump COMMAND_SPAN keyword + ENTITY def/ref markup
+   for the command at a given position.  Returns a human-readable string. */
+
+object Probe_Command_Header extends Scala.Fun("pide_state.probe_command_header", thread = true)
+  with Scala.Single_Fun
+{
+  val here = Scala_Project.here
+
+  override def invoke(session: Session, args: List[Bytes]): List[Bytes] = {
+    val (file_path, offset) =
+      XML.Decode.pair(XML.Decode.string, XML.Decode.int)(
+        YXML.parse_body(args.head.text))
+
+    val state = session.get_state()
+    val version = state.recent_finished.version.get_finished
+    val result = new StringBuilder
+
+    version.nodes.iterator.map(_._1).find(_.node == file_path) match {
+      case Some(node_name) =>
+        val node = version.nodes(node_name)
+        val snapshot = state.snapshot(node_name = node_name)
+
+        // Find command via node iteration
+        var pos = 1
+        var found: Option[(Command, Int)] = None
+        val it = node.commands.iterator
+        while (it.hasNext && found.isEmpty) {
+          val command = it.next()
+          val len = command.chunk.range.stop
+          if (offset >= pos && offset < pos + len)
+            found = Some((command, pos))
+          pos += len
+        }
+
+        found match {
+          case Some((command, cmd_pos)) =>
+            val len = command.chunk.range.stop
+            result.append("keyword (span.name): " + command.span.name + "\n")
+            result.append("source: " + command.source.take(100).replace("\n", "\\n") + "\n")
+            result.append("span: [" + cmd_pos + ", " + (cmd_pos + len) + ")\n")
+
+            // Search for all ENTITY markup in the command range
+            val cmd_range = Text.Range(cmd_pos - 1, cmd_pos - 1 + len)
+            val entities = snapshot.cumulate[List[(String, String, String)]](
+              cmd_range, Nil, Markup.Elements(Markup.ENTITY), _ => {
+                case (acc, Text.Info(_, XML.Elem(markup @ Markup(Markup.ENTITY, props), _))) =>
+                  val kind = Markup.Kind.get(props)
+                  val name = Markup.Name.get(props)
+                  val tag =
+                    if (Markup.Entity.Def.unapply(markup).isDefined) "DEF"
+                    else if (Markup.Entity.Ref.unapply(markup).isDefined) "REF"
+                    else "???"
+                  Some((kind, name, tag) :: acc)
+                case _ => None
+              })
+
+            entities match {
+              case Text.Info(_, ents) :: _ =>
+                result.append("entities (" + ents.length + "):\n")
+                for ((kind, name, tag) <- ents.reverse)
+                  result.append("  [" + tag + "] " + kind + " " + name + "\n")
+              case _ =>
+                result.append("entities: none\n")
+            }
+
+          case None =>
+            result.append("no command at offset " + offset + " in " + file_path)
+        }
+
+      case None =>
+        result.append("no live node for: " + file_path)
+    }
+
+    List(Bytes(YXML.string_of_body(XML.Encode.string(result.toString))))
+  }
+}
+
+
 class PIDE_State_Functions extends Scala.Functions(
   Save_Thy_Files, Resolve_Positions, Goto_Definition, Hover_Message,
-  Entity_At_Position, Command_At_Position, Get_Session_Databases)
+  Entity_At_Position, Command_At_Position, Get_Session_Databases,
+  Probe_Command_Header)

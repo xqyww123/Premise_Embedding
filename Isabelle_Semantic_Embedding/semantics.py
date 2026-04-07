@@ -200,13 +200,17 @@ def _mk_query_by_name_schema(working_names: list[str]) -> dict:
     }
 
 
-async def _get_definition_source(
+async def _get_definition_with_pos(
     connection: Connection, kind: EntityKind, uk: universal_key
-) -> str | None:
-    """Look up the source code of the command defining an entity.
+) -> tuple[str, IsabellePosition] | None:
+    """Look up the source code and position of the command defining an entity.
 
     Uses cached entity enumeration to find the definition position,
     then calls command_at_position to retrieve the source.
+
+    Returns ``(source, cmd_pos)`` where *cmd_pos* is an
+    `IsabellePosition` for the command start (symbol offset), or ``None``
+    if the position or source is unavailable.
     """
     from Isabelle_RPC_Host.context import entities_of
     from .hover import command_at_position
@@ -221,8 +225,43 @@ async def _get_definition_source(
     cmd = await command_at_position(pos, connection)
     if cmd is None:
         return None
-    source, _, _ = cmd
+    source, start_offset, _ = cmd
+    cmd_pos = IsabellePosition(0, start_offset, pos.file)
+    return (source, cmd_pos)
+
+
+async def _get_definition_source(
+    connection: Connection, kind: EntityKind, uk: universal_key
+) -> str | None:
+    """Look up the source code of the command defining an entity.
+
+    Convenience wrapper around `_get_definition_with_pos` that discards
+    the position.
+    """
+    result = await _get_definition_with_pos(connection, kind, uk)
+    if result is None:
+        return None
+    source, _ = result
     return source
+
+
+async def query_by_name_raw(
+    connection: Connection,
+    kind: EntityKind,
+    name: str,
+    with_pretty: bool = True,
+) -> tuple[str, universal_key]:
+    """Look up entity by kind and name, returning ``(semantic_text, universal_key)``.
+
+    Raises `UndefinedEntity`, `IsabelleError`, or `LookupError` (not yet interpreted).
+    """
+    uk = await universal_key_of(connection, kind, name)
+    sem = Semantic_DB.query(uk, with_pretty=with_pretty)
+    if sem is None:
+        raise LookupError(
+            f'{kind.label} "{name}" has not been interpreted yet. '
+            'Try using `mcp__proof__search_isabelle` to find what you need.')
+    return (sem, uk)
 
 
 def mk_query_by_name_tool(
@@ -258,31 +297,25 @@ def mk_query_by_name_tool(
                     f"Cannot query \"{name}\" — it is or will be your task to interpret it from the source.",
                     is_error=True,
                 )
-            uk = await universal_key_of(connection, tag, name)
-            sem = Semantic_DB.query(uk, with_pretty=with_pretty)
-            if sem is None:
-                return _mk_ret(
-                    f"{t} \"{name}\" has not been interpreted yet. "
-                    "Try using `mcp__proof__semantic_search` to find what you need."
-                )
+            sem, uk = await query_by_name_raw(connection, tag, name, with_pretty=with_pretty)
             if args.get("show_defs", False):
                 src = await _get_definition_source(connection, tag, uk)
                 if src is not None:
                     sem += f"\n\nDefinition:\n{src}"
             return _mk_ret(sem)
+        except LookupError as e:
+            return _mk_ret(str(e))
         except UndefinedEntity as e:
             if "." in name:
                 short = name.rsplit(".", 1)[1]
                 try:
-                    uk = await universal_key_of(connection, tag, short)
-                    sem = Semantic_DB.query(uk, with_pretty=with_pretty)
-                    if sem is not None:
-                        if args.get("show_defs", False):
-                            src = await _get_definition_source(connection, tag, uk)
-                            if src is not None:
-                                sem += f"\n\nDefinition:\n{src}"
-                        return _mk_ret(f"The {name} is undefined, but we find:\n{sem}")
-                except (IsabelleError, UndefinedEntity):
+                    sem, uk = await query_by_name_raw(connection, tag, short, with_pretty=with_pretty)
+                    if args.get("show_defs", False):
+                        src = await _get_definition_source(connection, tag, uk)
+                        if src is not None:
+                            sem += f"\n\nDefinition:\n{src}"
+                    return _mk_ret(f"The {name} is undefined, but we find:\n{sem}")
+                except (IsabelleError, UndefinedEntity, LookupError):
                     pass
             log.warning("%s: %s", type(e).__name__, e)
             return _mk_ret(

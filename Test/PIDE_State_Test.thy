@@ -1,5 +1,5 @@
 theory PIDE_State_Test
-  imports Semantic_Embedding
+  imports "../Semantic_Embedding"
 begin
 
 section \<open>Test: absolutize_id_based_pos resolves ID-based positions\<close>
