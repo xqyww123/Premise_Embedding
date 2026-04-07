@@ -168,6 +168,7 @@ class InterpretationTask:
                 "output_tokens": total[3],
                 "cost_usd": total[4],
                 "finished": finished,
+                "model": interpretation_model,
             })
             txn.put(self.theory_key, packed)
         self.total_input_tokens = 0
@@ -322,7 +323,8 @@ async def _answer_tool(args: dict[str, Any]) -> ToolCall_ret:
         remaining_indices = [i for i in task.batch_range if task.results[task._keys[i]] is None]
         remaining_text = task.format_entries(remaining_indices)
         msg = (f"Answered {count} translation{cs}, remaining {batch_remaining} in this batch.\n\n"
-               f"Unanswered entries:\n{remaining_text}\n\n"
+               f"Unanswered entries:\n{remaining_text}\n"
+               f"In file: {task.file_path}\n\n"
                f"Submit translations via `mcp__isabelle_semantics__answer`.")
     if errors:
         msg += "\nErrors:\n" + "\n".join(errors)

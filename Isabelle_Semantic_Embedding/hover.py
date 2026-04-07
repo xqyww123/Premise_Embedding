@@ -43,6 +43,29 @@ async def goto_definition(
     return None
 
 
+async def command_at_position(
+    pos: IsabellePosition,
+    connection: Optional[Connection] = None,
+) -> Optional[tuple[str, int, int]]:
+    """Given a cursor position, return the source code of the command there.
+
+    Returns (source, start_offset, end_offset) or None.
+    Offsets are 1-based Isabelle symbol offsets within the file.
+    Tries live PIDE state first, falls back to session export DB.
+    """
+    if connection is None:
+        return None
+    try:
+        result = await connection.callback(
+            "pide_state.command_at_position", (pos.file, pos.raw_offset))
+        if result is not None:
+            source, start_offset, end_offset = result
+            return (source, start_offset, end_offset)
+    except Exception:
+        pass
+    return None
+
+
 async def hover_message(
     pos: IsabellePosition,
     connection: Optional[Connection] = None,

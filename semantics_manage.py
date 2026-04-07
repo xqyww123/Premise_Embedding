@@ -138,7 +138,10 @@ def cmd_list(args: argparse.Namespace) -> None:
                 data = msgpack.unpackb(val)
                 finished = data.get(b"finished", data.get("finished", False))
                 cost = data.get(b"cost_usd", data.get("cost_usd", 0.0))
-                theory_meta[key] = {"finished": finished, "cost_usd": cost}
+                model = data.get(b"model", data.get("model", b""))
+                if isinstance(model, bytes):
+                    model = model.decode("utf-8", errors="replace")
+                theory_meta[key] = {"finished": finished, "cost_usd": cost, "model": model}
             elif len(key) > 16:
                 entity_counts[key[:16]] += 1
     env.close()
@@ -156,8 +159,8 @@ def cmd_list(args: argparse.Namespace) -> None:
     name_w = max(max((len(hash_to_name.get(h, "?")) for h in all_hashes), default=6), 6)
     name_w = min(name_w, 60)
 
-    print(f"{'Theory':<{name_w}}  {'Entities':>8}  {'Status':<8}  {'Cost':>9}  Universal Key")
-    print("─" * (name_w + 8 + 8 + 9 + 14 + 10))
+    print(f"{'Theory':<{name_w}}  {'Entities':>8}  {'Status':<8}  {'Cost':>9}  {'Model':<20}  Universal Key")
+    print("─" * (name_w + 8 + 8 + 9 + 20 + 16 + 12))
 
     for h in all_hashes:
         name = hash_to_name.get(h, "?")
@@ -165,11 +168,12 @@ def cmd_list(args: argparse.Namespace) -> None:
         meta = theory_meta.get(h, {})
         finished = meta.get("finished", False)
         cost = meta.get("cost_usd", 0.0)
+        model = meta.get("model", "")
         status = "done" if finished else "WIP"
         from Isabelle_RPC_Host.theory_hash import is_persistent
         if not is_persistent(h):
             status += " *"
-        print(f"{name:<{name_w}}  {count:>8}  {status:<8}  ${cost:>8.4f}  {h.hex()}")
+        print(f"{name:<{name_w}}  {count:>8}  {status:<8}  ${cost:>8.4f}  {model:<20}  {h.hex()}")
 
     print()
     total_entities = sum(entity_counts.values())

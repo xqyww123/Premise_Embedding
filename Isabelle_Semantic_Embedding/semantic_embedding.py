@@ -493,7 +493,7 @@ def _get_lmdb_env(path: str) -> lmdb.Environment:
     with _lmdb_lock:
         env = _lmdb_envs.get(path)
         if env is None:
-            env = lmdb.open(path, map_size=1 << 30)
+            env = lmdb.open(path, map_size=1 << 34)
             _lmdb_envs[path] = env
         return env
 

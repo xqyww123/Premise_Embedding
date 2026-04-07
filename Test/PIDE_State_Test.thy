@@ -8,6 +8,9 @@ definition AAA_test :: bool where \<open>AAA_test = True\<close>
 
 definition BBB_test :: bool where \<open>BBB_test = False\<close>
 
+ML \<open>PIDE_State.command_at_position (Position.make {line=74, offset=1694, end_offset=530, props={label="", file="~~/src/HOL/List.thy", id=""}})\<close>
+ML \<open>PIDE_State.command_at_position (Position.make {line=5, offset=113, end_offset=40, props={label="", file="/home/qiyuan/Current/MLML/contrib/Semantic_Embedding/Semantic_Embedding.thy", id=""}})\<close>
+
 ML \<open>
 let
   (* ---- helpers ---- *)

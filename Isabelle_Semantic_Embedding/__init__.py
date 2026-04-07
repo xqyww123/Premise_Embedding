@@ -12,7 +12,7 @@ from .premise_selection import (
 )
 
 from .theory_structure import mk_unicode_file, theory_info
-from .hover import goto_definition, hover_message
+from .hover import goto_definition, hover_message, command_at_position
 from .semantic_interpretation import interpret_file, _interpret_file
 from .semantics import (
     Semantic_DB,
@@ -34,6 +34,7 @@ __all__ = [
     "encode_premise",
     "goto_definition",
     "hover_message",
+    "command_at_position",
     "interpret_file",
     "Semantic_DB",
     "query_by_name_tool",

@@ -7,6 +7,7 @@ Access PIDE document state via Scala functions:
   - goto_definition: resolve entity reference at a position to its definition position
   - hover_message: extract tooltip information at a position
   - entity_at_position: return (kind, fully_qualified_name) of entity at a position
+  - command_at_position: return source code of the command at a position
 *)
 
 signature PIDE_STATE =
@@ -32,6 +33,11 @@ sig
      at that location, where name is the fully qualified name.
      Tries live PIDE state first, falls back to session export DB. *)
   val entity_at_position: Position.T -> (string * string) option
+
+  (* Given a position (file + offset), return the source code of the command
+     at that location together with its span (start_offset, end_offset) in the file.
+     Tries live PIDE state first, falls back to session export DB. *)
+  val command_at_position: Position.T -> (string * int * int) option
 
   (* Convert between symbol offset and line:column via Python RPC.
      Requires the Isabelle_RPC Python host to be running. *)
@@ -227,6 +233,29 @@ fun entity_at_position pos =
     else entity_at_position_pide file offset
   end;
 
+fun command_at_position_pide file_path symbol_offset =
+  let
+    val input_body =
+      XML.Encode.pair XML.Encode.string XML.Encode.int
+        (file_path, symbol_offset);
+    val yxml = Scala.function1 "pide_state.command_at_position"
+      (YXML.string_of_body input_body);
+    val (source, (start_offset, end_offset)) =
+      YXML.parse_body yxml
+      |> XML.Decode.pair XML.Decode.string
+           (XML.Decode.pair XML.Decode.int XML.Decode.int);
+  in
+    if source = "" then NONE
+    else SOME (source, start_offset, end_offset)
+  end;
+
+fun command_at_position pos =
+  let val (file, offset) = pos_file_offset pos
+  in
+    if file = "" orelse offset = 0 then NONE
+    else command_at_position_pide file offset
+  end;
+
 val get_session_databases : unit -> (string * string) list =
   let
     val cache = Synchronized.cache (fn () =>
@@ -270,6 +299,14 @@ val _ = Theory.setup (Context.theory_map (
       ret_schema = packOption (packPair (packString, packString)),
       function = fn (file, offset) =>
         PIDE_State.entity_at_position (Position.make0 0 offset 0 "" file ""),
+      timeout = SOME (Time.fromSeconds 10)
+    }
+  #> Remote_Procedure_Calling.register_global_callback {
+      name = "pide_state.command_at_position",
+      arg_schema = unpackPair (unpackString, unpackInt),
+      ret_schema = packOption (packTuple3 (packString, packInt, packInt)),
+      function = fn (file, offset) =>
+        PIDE_State.command_at_position (Position.make0 0 offset 0 "" file ""),
       timeout = SOME (Time.fromSeconds 10)
     }
   #> Remote_Procedure_Calling.register_global_callback {

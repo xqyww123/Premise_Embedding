@@ -37,6 +37,13 @@ def is_thy_skipped(name: str) -> bool:
     return base in _SKIP_THEORY_BASES
 
 
+EXPR_DISPLAY_LIMIT = 500
+
+def trunc_expr(s: str, limit: int = EXPR_DISPLAY_LIMIT) -> str:
+    """Truncate an expression string to the given limit (default EXPR_DISPLAY_LIMIT)."""
+    return s[:limit] + "…" if len(s) > limit else s
+
+
 class _Semantic_DB:
     _env: lmdb.Environment | None = None
     _lock = threading.Lock()
@@ -51,7 +58,7 @@ class _Semantic_DB:
         def pretty_print(self) -> str:
             pp = f"{self.kind.label} {self.name}"
             if self.expr:
-                pp += f": {self.expr}"
+                pp += f": {trunc_expr(self.expr)}"
             return pp
 
     def _ensure_env(self) -> lmdb.Environment:
@@ -130,6 +137,7 @@ class _Semantic_DB:
                     "input_tokens": 0, "cache_creation_tokens": 0,
                     "cache_read_tokens": 0, "output_tokens": 0,
                     "cost_usd": 0.0, "finished": True,
+                    "model": "",
                 }))  # type: ignore
 
     def clean_wip(self) -> int:
@@ -182,9 +190,39 @@ def _mk_query_by_name_schema(working_names: list[str]) -> dict:
                 "type": "string",
                 "description": _NAME_DESCRIPTION_INTERP if working_names else _NAME_DESCRIPTION_BASE,
             },
+            "show_defs": {
+                "type": "boolean",
+                "description": "If true, include the Isabelle source code of the command defining the entity.",
+                "default": False,
+            },
         },
         "required": ["type", "name"],
     }
+
+
+async def _get_definition_source(
+    connection: Connection, kind: EntityKind, uk: universal_key
+) -> str | None:
+    """Look up the source code of the command defining an entity.
+
+    Uses cached entity enumeration to find the definition position,
+    then calls command_at_position to retrieve the source.
+    """
+    from Isabelle_RPC_Host.context import entities_of
+    from .hover import command_at_position
+    entries, _ = await entities_of(connection, [kind])
+    pos = None
+    for key, p in entries:
+        if key == uk:
+            pos = p
+            break
+    if pos is None:
+        return None
+    cmd = await command_at_position(pos, connection)
+    if cmd is None:
+        return None
+    source, _, _ = cmd
+    return source
 
 
 def mk_query_by_name_tool(
@@ -227,6 +265,10 @@ def mk_query_by_name_tool(
                     f"{t} \"{name}\" has not been interpreted yet. "
                     "Try using `mcp__proof__semantic_search` to find what you need."
                 )
+            if args.get("show_defs", False):
+                src = await _get_definition_source(connection, tag, uk)
+                if src is not None:
+                    sem += f"\n\nDefinition:\n{src}"
             return _mk_ret(sem)
         except UndefinedEntity as e:
             if "." in name:
@@ -235,6 +277,10 @@ def mk_query_by_name_tool(
                     uk = await universal_key_of(connection, tag, short)
                     sem = Semantic_DB.query(uk, with_pretty=with_pretty)
                     if sem is not None:
+                        if args.get("show_defs", False):
+                            src = await _get_definition_source(connection, tag, uk)
+                            if src is not None:
+                                sem += f"\n\nDefinition:\n{src}"
                         return _mk_ret(f"The {name} is undefined, but we find:\n{sem}")
                 except (IsabelleError, UndefinedEntity):
                     pass
@@ -262,10 +308,21 @@ def mk_query_by_position_tool(
         description += (
             " Do not query entries you have been asked to interpret"
             " — interpret those from the source file yourself.")
+    _query_by_position_schema = {
+        **_position_schema,
+        "properties": {
+            **_position_schema["properties"],
+            "show_defs": {
+                "type": "boolean",
+                "description": "If true, include the Isabelle source code of the command defining the entity.",
+                "default": False,
+            },
+        },
+    }
     @tool(
         "query_by_position",
         description,
-        input_schema=_position_schema,
+        input_schema=_query_by_position_schema,
     )
     async def query_by_position_tool(args: dict[str, Any]) -> ToolCall_ret:
         try:
@@ -299,6 +356,10 @@ def mk_query_by_position_tool(
             sem = Semantic_DB.query(uk, with_pretty=with_pretty)
             if sem is None:
                 return _mk_ret(f"{tag.label} \"{name}\" has not been interpreted yet.")
+            if args.get("show_defs", False):
+                src = await _get_definition_source(connection, tag, uk)
+                if src is not None:
+                    sem += f"\n\nDefinition:\n{src}"
             return _mk_ret(sem)
         except (IsabelleError, UndefinedEntity) as e:
             log.warning("%s: %s", type(e).__name__, e)
@@ -560,22 +621,24 @@ class Semantic_Vector_Store(Vector_Store):
             if self.connection is None:
                 return [], warnings
             from Isabelle_RPC_Host.context import entities_of
-            candidates, warnings = await entities_of(self.connection, kinds,
+            entries, warnings = await entities_of(self.connection, kinds,
                                      theories_not_include=_SKIP_THEORY_LONG_NAMES,
                                      term_patterns=term_patterns,
                                      type_patterns=type_patterns,
                                      theories_include=theories_include,
                                      name_contains=name_contains)
+            candidates = [k for k, _ in entries]
         elif isinstance(domain, Semantic_Vector_Store.ContextExtended):
             if self.connection is None:
                 return [], warnings
             from Isabelle_RPC_Host.context import entities_of
-            candidates, warnings = await entities_of(self.connection, kinds,
+            entries, warnings = await entities_of(self.connection, kinds,
                                      theories_not_include=_SKIP_THEORY_LONG_NAMES,
                                      term_patterns=term_patterns,
                                      type_patterns=type_patterns,
                                      theories_include=theories_include,
                                      name_contains=name_contains)
+            candidates = [k for k, _ in entries]
             seen = set(candidates)
             kind_set = set(kinds)
             for ek in domain.extra:
@@ -694,8 +757,9 @@ class Semantic_Vector_Store(Vector_Store):
                         f"the theory may not be loaded")
             if self.is_thy_embedded(thy_key):
                 continue
-            keys, _warnings = await entities_of(self.connection, EntityKind.ALL, # type: ignore
+            entries, _warnings = await entities_of(self.connection, EntityKind.ALL, # type: ignore
                                theory=thy_name, the_theory_only=True)
+            keys = [k for k, _ in entries]
             wip = is_WIP(thy_key)
             await self._embed_keys(keys)
             if not wip:

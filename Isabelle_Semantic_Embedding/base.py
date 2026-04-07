@@ -9,3 +9,4 @@ def mk_ret(text: str, is_error: bool = False) -> ToolCall_ret:
     if is_error:
         ret["is_error"] = True
     return ret
+

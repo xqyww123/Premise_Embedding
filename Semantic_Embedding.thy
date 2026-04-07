@@ -2,6 +2,8 @@ theory Semantic_Embedding
   imports Main Isabelle_RPC.Remote_Procedure_Calling
 begin
 
+(* datatype test = A | B | C *)
+
 (* declare [[ML_debugger, ML_exception_debugger]] *)
 
 ML_file \<open>Tools/pide_state.ML\<close>

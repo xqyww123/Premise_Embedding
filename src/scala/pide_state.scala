@@ -8,6 +8,7 @@ Scala functions for accessing PIDE document state from ML:
     (live PIDE first, then DB fallback via Build.read_theory)
   - Hover message: extract tooltip information at a position
     (live PIDE first, then DB fallback via Build.read_theory)
+  - Command at position: retrieve source code of the command at a given position
 */
 
 package isabelle.semantic_embedding
@@ -95,6 +96,64 @@ object PIDE_Query {
       case Text.Info(_, result) :: _ if result != ("", "") => result
       case _ => ("", "")
     }
+  }
+
+  def command_at_position(node: Document.Node, offset: Int): (String, Int, Int) = {
+    var pos = 1
+    var result: (String, Int, Int) = ("", 0, 0)
+    val it = node.commands.iterator
+    while (it.hasNext && result._1.isEmpty) {
+      val command = it.next()
+      val len = command.chunk.range.stop
+      if (offset >= pos && offset < pos + len)
+        result = (command.source, pos, pos + len)
+      pos += len
+    }
+    result
+  }
+
+  def command_at_position(snapshot: Document.Snapshot, offset: Int): (String, Int, Int) = {
+    val range = symbol_offset_to_range(snapshot, offset)
+
+    val spans = snapshot.cumulate[Option[Text.Range]](
+      range, None, Markup.Elements(Markup.COMMAND_SPAN), _ => {
+        case (None, Text.Info(info_range, _)) => Some(Some(info_range))
+        case _ => None
+      })
+
+    spans match {
+      case Text.Info(_, Some(span_range)) :: _ =>
+        snapshot.snippet_command match {
+          case Some(command) =>
+            // DB snippet: ranges are in decoded text offsets, need to extract source substring
+            val src = span_range.try_substring(command.source).getOrElse("")
+            // Convert decoded text offsets back to symbol offsets for the return value
+            val chunk = command.chunk
+            // Invert: find symbol offsets that decode to span_range.start/stop
+            // Use a linear scan of symbol positions
+            val sym_start = symbol_offset_of_decoded(chunk, span_range.start)
+            val sym_stop = symbol_offset_of_decoded(chunk, span_range.stop)
+            (src, sym_start, sym_stop)
+          case None =>
+            // Live PIDE: shouldn't reach here, but handle gracefully
+            ("", 0, 0)
+        }
+      case _ => ("", 0, 0)
+    }
+  }
+
+  /** Find the 1-based symbol offset whose decoded text offset is >= target.
+    * This inverts Text_Chunk.decode for the purpose of returning symbol offsets. */
+  private def symbol_offset_of_decoded(chunk: Symbol.Text_Chunk, target: Int): Int = {
+    // Binary search: find smallest symbol offset s such that chunk.decode(s) >= target
+    var lo = 1
+    var hi = chunk.range.stop + 1  // upper bound: one past the last symbol
+    while (lo < hi) {
+      val mid = (lo + hi) / 2
+      if (chunk.decode(mid) < target) lo = mid + 1
+      else hi = mid
+    }
+    lo
   }
 
   def hover_message(snapshot: Document.Snapshot, offset: Int): String = {
@@ -479,6 +538,46 @@ object Entity_At_Position extends Scala.Fun("pide_state.entity_at_position", thr
 }
 
 
+object Command_At_Position extends Scala.Fun("pide_state.command_at_position", thread = true)
+  with Scala.Single_Fun
+{
+  val here = Scala_Project.here
+
+  override def invoke(session: Session, args: List[Bytes]): List[Bytes] = {
+    val (file_path, offset) =
+      XML.Decode.pair(XML.Decode.string, XML.Decode.int)(
+        YXML.parse_body(args.head.text))
+
+    val state = session.get_state()
+    val version = state.recent_finished.version.get_finished
+
+    // Try live PIDE state first
+    val live_result: (String, Int, Int) =
+      version.nodes.iterator.map(_._1).find(_.node == file_path) match {
+        case Some(node_name) =>
+          PIDE_Query.command_at_position(version.nodes(node_name), offset)
+        case None => ("", 0, 0)
+      }
+
+    // Fall back to DB if live returns nothing
+    val result =
+      if (live_result != ("", 0, 0)) live_result
+      else {
+        DB_Snapshots.get_snapshot(session, file_path) match {
+          case Some(snapshot) =>
+            PIDE_Query.command_at_position(snapshot, offset)
+          case None => ("", 0, 0)
+        }
+      }
+
+    val body = XML.Encode.pair(XML.Encode.string,
+      XML.Encode.pair(XML.Encode.int, XML.Encode.int))(
+        (result._1, (result._2, result._3)))
+    List(Bytes(YXML.string_of_body(body)))
+  }
+}
+
+
 object Get_Session_Databases extends Scala.Fun("pide_state.get_session_databases", thread = true)
   with Scala.Single_Fun
 {
@@ -504,4 +603,4 @@ object Get_Session_Databases extends Scala.Fun("pide_state.get_session_databases
 
 class PIDE_State_Functions extends Scala.Functions(
   Save_Thy_Files, Resolve_Positions, Goto_Definition, Hover_Message,
-  Entity_At_Position, Get_Session_Databases)
+  Entity_At_Position, Command_At_Position, Get_Session_Databases)
