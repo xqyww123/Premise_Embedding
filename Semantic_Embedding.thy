@@ -20,31 +20,67 @@ ML \<open>Semantic_Store.query_semantics   (Context.Theory @{theory List})
       (Universal_Key.Named_Introduction_Rule "HOL.notI") false\<close>
 
 ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
-      ("proof by contradiction", 10, [Universal_Key.IntroductionRuleK], NONE)\<close>
- 
-ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
-      ("all the possible elements of a list are finite", 10, [Universal_Key.TheoremK], NONE)\<close>
+      {query_text = "proof by contradiction", k = 10,
+       kinds = [Universal_Key.IntroductionRuleK],
+       domain = Semantic_Store.ContextAll,
+       term_patterns = [], type_patterns = [],
+       theories_include = [], name_contains = []}\<close>
 
 ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
-      ("The length of a concatenated list equals the sum of the lengths of each of its parts", 10, [Universal_Key.TheoremK], NONE)\<close>
+      {query_text = "all the possible elements of a list are finite", k = 10,
+       kinds = [Universal_Key.TheoremK],
+       domain = Semantic_Store.ContextAll,
+       term_patterns = [], type_patterns = [],
+       theories_include = [], name_contains = []}\<close>
 
 ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
-      ("an element belongs to a set different A - B if it belongs to A but not B", 10, [Universal_Key.IntroductionRuleK], NONE)\<close>
+      {query_text = "The length of a concatenated list equals the sum of the lengths of each of its parts", k = 10,
+       kinds = [Universal_Key.TheoremK],
+       domain = Semantic_Store.ContextAll,
+       term_patterns = [], type_patterns = [],
+       theories_include = [], name_contains = []}\<close>
 
 ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
-      ("a in insert b A means either a is b or a belongs A", 10, [Universal_Key.EliminationRuleK], NONE)\<close>
+      {query_text = "an element belongs to a set different A - B if it belongs to A but not B", k = 10,
+       kinds = [Universal_Key.IntroductionRuleK],
+       domain = Semantic_Store.ContextAll,
+       term_patterns = [], type_patterns = [],
+       theories_include = [], name_contains = []}\<close>
 
 ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
-      ("The reversal of the reversal of a list is itself", 10, [Universal_Key.TheoremK], NONE)\<close>
+      {query_text = "a in insert b A means either a is b or a belongs A", k = 10,
+       kinds = [Universal_Key.EliminationRuleK],
+       domain = Semantic_Store.ContextAll,
+       term_patterns = [], type_patterns = [],
+       theories_include = [], name_contains = []}\<close>
 
 ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
-      ("De Morgan's Law", 10, [Universal_Key.TheoremK], NONE)\<close>
+      {query_text = "The reversal of the reversal of a list is itself", k = 10,
+       kinds = [Universal_Key.TheoremK],
+       domain = Semantic_Store.ContextAll,
+       term_patterns = [], type_patterns = [],
+       theories_include = [], name_contains = []}\<close>
 
 ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
-      ("The commutativity of the conjunction operator", 10, [Universal_Key.TheoremK], NONE)\<close>
+      {query_text = "De Morgan's Law", k = 10,
+       kinds = [Universal_Key.TheoremK],
+       domain = Semantic_Store.ContextAll,
+       term_patterns = [], type_patterns = [],
+       theories_include = [], name_contains = []}\<close>
 
 ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
-      ("The length of a list", 10, [Universal_Key.ConstantK], NONE)\<close>
+      {query_text = "The commutativity of the conjunction operator", k = 10,
+       kinds = [Universal_Key.TheoremK],
+       domain = Semantic_Store.ContextAll,
+       term_patterns = [], type_patterns = [],
+       theories_include = [], name_contains = []}\<close>
+
+ML \<open>Semantic_Store.query_knn (Context.Theory @{theory List})
+      {query_text = "The length of a list", k = 10,
+       kinds = [Universal_Key.ConstantK],
+       domain = Semantic_Store.ContextAll,
+       term_patterns = [], type_patterns = [],
+       theories_include = [], name_contains = []}\<close>
 
 text \<open>The length of a list\<close>
 

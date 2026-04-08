@@ -7,6 +7,7 @@ import contextvars
 import logging
 import os
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any, NamedTuple, cast
 
 from Isabelle_RPC_Host import Connection, isabelle_remote_procedure
@@ -185,7 +186,7 @@ class InterpretationTask:
         prompt, self.batch_range = self.batches[self.current_batch]
         return prompt
 
-    def format_entries(self, indices: range) -> str:
+    def format_entries(self, indices: Iterable[int]) -> str:
         lines = []
         for i in indices:
             e = self.entries[i]

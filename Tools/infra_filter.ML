@@ -10,55 +10,7 @@ end
 
 structure Infra_Filter : INFRA_FILTER = struct
 
-(* Term size that counts number literals and string literals as small constants.
-   - numeral <bits>: size 1
-   - uminus (numeral <bits>): size 2
-   - Suc (Suc ... 0): size 2
-   - String.Literal b0..b6 (Literal ... zero): size 1
-   - String.char.Char b0..b7: size 1
-   - list of chars (String.char list): size 1 per char + 1 for the list *)
-local
-  fun is_numeral (Const ("Num.num.One", _)) = true
-    | is_numeral (Const ("Num.num.Bit0", _) $ t) = is_numeral t
-    | is_numeral (Const ("Num.num.Bit1", _) $ t) = is_numeral t
-    | is_numeral _ = false
-
-  fun is_nat_literal (Const ("Groups.zero_class.zero", _)) = true
-    | is_nat_literal (Const ("Nat.Suc", _) $ t) = is_nat_literal t
-    | is_nat_literal _ = false
-
-  fun is_literal_chain (Const ("Groups.zero_class.zero", Type ("String.literal", _))) = true
-    | is_literal_chain (Const ("String.Literal", _) $ _ $ _ $ _ $ _ $ _ $ _ $ _ $ t) =
-        is_literal_chain t
-    | is_literal_chain _ = false
-
-  fun is_char (Const ("String.char.Char", _) $ _ $ _ $ _ $ _ $ _ $ _ $ _ $ _) = true
-    | is_char _ = false
-
-  fun is_char_list (Const ("List.list.Nil", Type ("List.list", [Type ("String.char", _)]))) = true
-    | is_char_list (Const ("List.list.Cons", _) $ c $ cs) = is_char c andalso is_char_list cs
-    | is_char_list _ = false
-
-  fun add_size (Const ("Num.numeral_class.numeral", _) $ t) n =
-        if is_numeral t then n + 1 else add_size t (n + 1)
-    | add_size (Const ("Groups.uminus_class.uminus", _) $
-                  (Const ("Num.numeral_class.numeral", _) $ t)) n =
-        if is_numeral t then n + 2 else add_size t (n + 2)
-    | add_size (t as (Const ("Nat.Suc", _) $ _)) n =
-        if is_nat_literal t then n + 2 else add_size_default t n
-    | add_size (t as (Const ("String.Literal", _) $ _ $ _ $ _ $ _ $ _ $ _ $ _ $ _)) n =
-        if is_literal_chain t then n + 1 else add_size_default t n
-    | add_size (t as (Const ("List.list.Cons", _) $ _ $ _)) n =
-        if is_char_list t then n + 1 else add_size_default t n
-    | add_size (t as (Const ("List.list.Nil", Type ("List.list", [Type ("String.char", _)])))) n =
-        n + 1
-    | add_size t n = add_size_default t n
-  and add_size_default (t $ u) n = add_size t (add_size u n)
-    | add_size_default (Abs (_, _, t)) n = add_size t (n + 1)
-    | add_size_default _ n = n + 1
-in
-  val smart_size_of_term = fn t => add_size t 0
-end
+val smart_size_of_term = smart_size_of_term (* from Performant_Isabelle_ML *)
 
 fun gen_infra_filters (context : Context.generic)
     : {is_infra_const: string -> bool, is_infra_thm: string * thm -> bool,
@@ -79,6 +31,7 @@ fun gen_infra_filters (context : Context.generic)
           name <> "fun"
           andalso not (Name_Space.is_concealed type_space name)
           andalso not (Long_Name.is_hidden (Name_Space.intern type_space name)))
+    val type_name_prefixes = map (fn T => T ^ ".") type_names
 
     (* --- ADT infrastructure constants --- *)
 
@@ -117,43 +70,56 @@ fun gen_infra_filters (context : Context.generic)
     val internal_prefixes = ["Lifting.", "BNF_Def.", "Transfer.", "BNF_Cardinal_Order_Relation.",
           "HOL.equal", "ATP.", "Num."]
 
-    (* For a.b.c, check if a.b_class.c exists as a constant (class method shorthand) *)
-    fun has_class_variant name =
-      Long_Name.is_qualified name andalso
-      let val class_name = String.concat [Long_Name.qualifier name, "_class.", Long_Name.base_name name]
-      in can (Consts.the_constraint consts) class_name end
+    (* Pre-compute names that have a _class variant as a constant.
+       For each constant "a.b_class.c", record "a.b.c" as having a class variant. *)
+    val has_class_variant_set =
+      let val all_const_names = #constants (Consts.dest consts) |> map fst
+      in Strhashtab.make_set (map_filter (fn cname =>
+           if String.isSubstring "_class." cname then
+             let val qual = Long_Name.qualifier cname
+                 val base = Long_Name.base_name cname
+             in if String.isSuffix "_class" qual then
+                  SOME (String.concat [
+                    String.substring (qual, 0, size qual - 6), ".", base])
+                else NONE
+             end
+           else NONE) all_const_names)
+      end
+    fun has_class_variant name = Strhashtab.defined has_class_variant_set name
 
     fun returns_prop (Type("fun", [_, T'])) = returns_prop T'
       | returns_prop (Type("prop", [])) = true
       | returns_prop _ = false
 
+    val infra_const_cache : bool Strhashtab.table = Strhashtab.empty 4096
     fun is_infra_const' name typ_opt =
-      Name_Space.is_concealed const_space name
-      orelse is_hidden const_space name
-      orelse exists (fn pfx => String.isPrefix pfx name) internal_prefixes
-      orelse exists (fn pfx => String.isPrefix pfx name) pre_prefixes
-      orelse exists (fn infix_ => String.isSubstring infix_ name) inst_infixes
-      orelse has_class_variant name
-      orelse (exists (fn T => String.isPrefix (T ^ ".") name) type_names
-              andalso not (Strhashtab.defined preserved_set name))
-      orelse String.isSubstring ".class." name
-      orelse (String.isSuffix "_class" (Long_Name.base_name name)
-              andalso returns_prop (case typ_opt of
-                        SOME T => T
-                      | NONE => (case try (Consts.the_constraint consts) name of
-                                   SOME T => T | NONE => dummyT)))
+      case Strhashtab.lookup infra_const_cache name of
+        SOME result => result
+      | NONE =>
+          let val result =
+            Name_Space.is_concealed const_space name
+            orelse is_hidden const_space name
+            orelse exists (fn pfx => String.isPrefix pfx name) internal_prefixes
+            orelse exists (fn pfx => String.isPrefix pfx name) pre_prefixes
+            orelse exists (fn infix_ => String.isSubstring infix_ name) inst_infixes
+            orelse has_class_variant name
+            orelse (exists (fn pfx => String.isPrefix pfx name) type_name_prefixes
+                    andalso not (Strhashtab.defined preserved_set name))
+            orelse String.isSubstring ".class." name
+            orelse (String.isSuffix "_class" (Long_Name.base_name name)
+                    andalso returns_prop (case typ_opt of
+                              SOME T => T
+                            | NONE => (case try (Consts.the_constraint consts) name of
+                                         SOME T => T | NONE => dummyT)))
+              val _ = Strhashtab.update infra_const_cache (name, result)
+          in result end
     fun is_infra_const name = is_infra_const' name NONE
 
     (* --- ADT infrastructure theorem names --- *)
 
     fun is_ADT_infra_thm full_name =
-      exists (fn T =>
-        String.isPrefix (T ^ ".") full_name
-        andalso let val suffix = String.extract (full_name, size T + 1, NONE)
-                in String.isSuffix "_def" suffix
-                 (* orelse suffix = "splits" orelse suffix = "split"
-                   orelse String.isPrefix "split_" suffix *) end)
-        type_names
+      String.isSuffix "_def" full_name
+      andalso exists (fn pfx => String.isPrefix pfx full_name) type_name_prefixes
 
     (* --- Inductive infrastructure theorem names --- *)
 

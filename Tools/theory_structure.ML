@@ -165,7 +165,7 @@ fun get_theorems_with_positions context =
    1. Classical reasoner rules (safeIs/unsafeIs or safeEs/unsafeEs)
    2. Name-based heuristic: facts whose base name ends with I (intro) or E (elim),
       where the preceding character is not an uppercase letter.
-   Uses Thm.raw_derivation_name for names; rules with empty names are skipped. *)
+   Uses Thm.get_name_hint for names; rules without name hints are skipped. *)
 local
 
 fun has_rule_suffix suffix name =
@@ -189,14 +189,15 @@ fun get_rules_with_positions selector suffix context =
     val cs = Classical.rep_cs (Classical.get_cs context)
     val cs_results = map_filter (fn (thm, _, _) =>
       let val thm = Thm.transfer thy thm
-          val name = Thm.raw_derivation_name thm
-      in if name = "" orelse Strhashtab.defined seen name then NONE
+      in if not (Thm.has_name_hint thm) then NONE
+         else let val name = Thm.get_name_hint thm
+      in if Strhashtab.defined seen name then NONE
          else if not (String.isPrefix thy_prefix name) then NONE
          else (Strhashtab.update seen (name, ());
                let val pos = case try (Name_Space.the_entry fact_space) name of
                      SOME entry => #pos entry | NONE => Position.none
                in SOME (name, pos, thm) end)
-      end) (selector cs)
+      end end) (selector cs)
 
     (* Source 2: name-based heuristic from facts *)
     val (parent_facts, facts) = Context.cases
@@ -208,8 +209,7 @@ fun get_rules_with_positions selector suffix context =
       if not (has_rule_suffix suffix name) then []
       else map_filter (fn thm =>
         let val thm = Thm.transfer thy thm
-            val dname = Thm.raw_derivation_name thm
-            val key = if dname = "" then name else dname
+            val key = if Thm.has_name_hint thm then Thm.get_name_hint thm else name
         in if Strhashtab.defined seen key then NONE
            else (Strhashtab.update seen (key, ());
                  let val pos = case try (Name_Space.the_entry fact_space) name of
@@ -244,10 +244,9 @@ fun get_entities_with_positions context entities =
       let val (base, _) = parse_thm_name name
       in pos_of fact_space base end
     fun thm_name_pos thm =
-      let val name = Thm.raw_derivation_name thm
-      in if name = "" then error "Anonymous theorem (empty derivation_name)"
-         else (name, fact_pos name)
-      end
+      if Thm.has_name_hint thm
+      then let val name = Thm.get_name_hint thm in (name, fact_pos name) end
+      else error "Anonymous theorem (no name hint)"
   in
     map (fn Universal_Key.Constant name => (name, pos_of const_space name)
           | Universal_Key.Type name => (name, pos_of type_space name)
@@ -276,9 +275,10 @@ fun get_theorems_with_positions_of context entities =
         SOME entry => #pos entry | NONE => Position.none
     fun from_thm thm =
       let val thm = Thm.transfer thy thm
-          val name = Thm.raw_derivation_name thm
-      in if name = "" then error "Anonymous theorem (empty derivation_name)"
-         else [(name, 0, pos_of name, thm, is_global name)]
+      in if not (Thm.has_name_hint thm)
+         then error "Anonymous theorem (no name hint)"
+         else let val name = Thm.get_name_hint thm
+              in [(name, 0, pos_of name, thm, is_global name)] end
       end
     fun from_name name =
       case Facts.lookup context facts name of

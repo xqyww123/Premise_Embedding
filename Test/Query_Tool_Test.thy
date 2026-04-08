@@ -20,7 +20,7 @@ val query_test_cbs =
   in [
     Universal_Key.make_universal_key_callback ctx,
     Context_Callbacks.make_constants_callback NONE ctx,
-    Context_Callbacks.make_theorems_callback NONE ctx,
+    Context_Callbacks.make_theorems_callback NONE NONE ctx,
     Context_Callbacks.make_types_callback NONE ctx,
     Context_Callbacks.make_classes_callback NONE ctx,
     Context_Callbacks.make_locales_callback NONE ctx,
@@ -37,7 +37,7 @@ let
     "from Isabelle_RPC_Host.context import entities_of",
     "from Isabelle_RPC_Host.universal_key import EntityKind",
     "entries, _ = await entities_of(connection, [EntityKind.CONSTANT])",
-    "with_pos = sum(1 for _, p in entries if p is not None)",
+    "with_pos = sum(1 for _, _, p in entries if p is not None)",
     "return f'total={len(entries)} with_pos={with_pos}'"
   ])
   val _ = writeln ("Test 1 - " ^ r)
@@ -53,7 +53,7 @@ let
     "from Isabelle_RPC_Host.universal_key import EntityKind, universal_key_of",
     "uk = await universal_key_of(connection, EntityKind.CONSTANT, 'True')",
     "entries, _ = await entities_of(connection, [EntityKind.CONSTANT])",
-    "for k, p in entries:",
+    "for k, _, p in entries:",
     "    if k == uk:",
     "        return f'file={p.file} line={p.line} offset={p.raw_offset}'",
     "return 'NOT_FOUND'"
@@ -72,7 +72,7 @@ let
     "from Isabelle_RPC_Host.universal_key import EntityKind, universal_key_of",
     "uk = await universal_key_of(connection, EntityKind.CONSTANT, 'Query_Test_Const')",
     "entries, _ = await entities_of(connection, [EntityKind.CONSTANT])",
-    "for k, p in entries:",
+    "for k, _, p in entries:",
     "    if k == uk:",
     "        return f'pos={p}'",
     "return 'NOT_FOUND'"
@@ -115,7 +115,7 @@ let
     "from Isabelle_RPC_Host.context import entities_of",
     "from Isabelle_RPC_Host.universal_key import EntityKind",
     "entries, _ = await entities_of(connection, [EntityKind.THEOREM])",
-    "with_pos = sum(1 for _, p in entries if p is not None)",
+    "with_pos = sum(1 for _, _, p in entries if p is not None)",
     "return f'total={len(entries)} with_pos={with_pos}'"
   ])
   val _ = writeln ("Test 5 - theorems: " ^ r)
@@ -131,7 +131,7 @@ let
     "from Isabelle_RPC_Host.universal_key import EntityKind, universal_key_of",
     "uk = await universal_key_of(connection, EntityKind.THEOREM, 'refl')",
     "entries, _ = await entities_of(connection, [EntityKind.THEOREM])",
-    "for k, p in entries:",
+    "for k, _, p in entries:",
     "    if k == uk:",
     "        return f'{p.file}:{p.line}'",
     "return 'NOT_FOUND'"
@@ -166,7 +166,7 @@ let
     "from Isabelle_RPC_Host.universal_key import EntityKind, universal_key_of",
     "uk = await universal_key_of(connection, EntityKind.CONSTANT, 'True')",
     "entries, _ = await entities_of(connection, [EntityKind.CONSTANT])",
-    "for k, p in entries:",
+    "for k, _, p in entries:",
     "    if k == uk:",
     "        return 'abs' if p.file.startswith('/') else 'unexpanded'",
     "return 'NOT_FOUND'"
@@ -267,7 +267,7 @@ let val SOME r = run_py (space_implode "\n" [
     "for name in ['conj', 'disj', 'implies', 'Not']:",
     "    uk = await universal_key_of(connection, EntityKind.CONSTANT, name)",
     "    entries, _ = await entities_of(connection, [EntityKind.CONSTANT])",
-    "    for k, p in entries:",
+    "    for k, _, p in entries:",
     "        if k == uk:",
     "            break",
     "    else:",

@@ -4,6 +4,17 @@ signature SEMANTIC_STORE = sig
   val zero_usage : usage
   val add_usage : usage * usage -> usage
 
+  (* Domain for semantic search: which entities to search over. *)
+  datatype search_domain =
+      ContextAll
+        (* All entities of the requested kinds in the current context.
+           Pattern filtering is applied by Python via ML callbacks. *)
+    | ContextExtended of (Universal_Key.universal_key * string) list
+        (* Like ContextAll, plus additional (key, name) pairs
+           (e.g. local contextual theorems from a proof state). *)
+    | Restricted of Universal_Key.universal_key list
+        (* Search only within the given keys; no callback-based filtering. *)
+
   (* Look up the English semantic interpretation of an entity.
      If with_pretty is true, prepends the pretty-printed formal signature. *)
   val query_semantics : Context.generic -> Universal_Key.entity -> bool -> semantics option
@@ -34,11 +45,14 @@ signature SEMANTIC_STORE = sig
   val reranker_model : string Config.T
 
   (* Search k nearest entities by semantic similarity to a query string.
-     kinds filters entity types; NONE domain means all entities of those kinds.
-     Returns (score, entity) pairs sorted by similarity. *)
+     Returns ((score, entity) list, warnings). Warnings include notices about
+     undeclared free variables in term patterns. *)
   val query_knn : Context.generic ->
-    semantics * int * Universal_Key.entity_kind list * Universal_Key.universal_key list option ->
-    (real * Universal_Key.entity) list
+    {query_text: semantics, k: int, kinds: Universal_Key.entity_kind list,
+     domain: search_domain,
+     term_patterns: string list, type_patterns: string list,
+     theories_include: string list, name_contains: string list} ->
+    (real * Universal_Key.entity) list * string list
 
   (* Embed semantic interpretations into vectors for the given theories
      and all their unembedded ancestors, under the specified embedding model
@@ -54,17 +68,27 @@ signature SEMANTIC_STORE = sig
   (* Interpret a list of entities, skipping those already interpreted. *)
   val interpret_entities : Context.generic -> Universal_Key.entity list -> unit
 
-  (* Context callbacks for introduction and elimination rules.
-     These are here (not in Context_Callbacks) because they require Classical from HOL. *)
-  val make_introduction_rules_callback :
-    (string * thm -> bool) option -> Context.generic -> Remote_Procedure_Calling.callback'
-  val make_elimination_rules_callback :
-    (string * thm -> bool) option -> Context.generic -> Remote_Procedure_Calling.callback'
+  (* Context callbacks with infra filters and theorem cache baked in.
+     Computes infra filters once and returns all entity callbacks. *)
+  val make_entity_callbacks : Context.generic ->
+    {constants: Remote_Procedure_Calling.callback',
+     theorems: Remote_Procedure_Calling.callback',
+     types: Remote_Procedure_Calling.callback',
+     classes: Remote_Procedure_Calling.callback',
+     locales: Remote_Procedure_Calling.callback',
+     introduction_rules: Remote_Procedure_Calling.callback',
+     elimination_rules: Remote_Procedure_Calling.callback'}
 end
 
 structure Semantic_Store : SEMANTIC_STORE = struct
 
 type semantics = string (*in English*)
+
+datatype search_domain =
+    ContextAll
+  | ContextExtended of (Universal_Key.universal_key * string) list
+  | Restricted of Universal_Key.universal_key list
+
 type usage = {input: int, cache_write: int, cache_read: int, output: int, cost: real}
 val zero_usage : usage = {input=0, cache_write=0, cache_read=0, output=0, cost=0.0}
 fun add_usage (a : usage, b : usage) : usage =
@@ -572,44 +596,168 @@ fun extract_elim_rules ctx =
   let val cs = Classical.rep_cs (Classical.get_cs ctx)
   in map #1 (Item_Net.content (#safeEs cs) @ Item_Net.content (#unsafeEs cs)) end
 
-fun make_introduction_rules_callback filter_opt context =
-  Context_Callbacks.make_introduction_rules_callback extract_intro_rules filter_opt context
+(* --- Theorem cache: pre-computed non-infra theorems with universal keys --- *)
 
-fun make_elimination_rules_callback filter_opt context =
-  Context_Callbacks.make_elimination_rules_callback extract_elim_rules filter_opt context
+structure Thm_Cache = Theory_Data(struct
+  type T = {
+    entries: Context_Callbacks.cached_thm_entry list,
+    facts: Facts.T
+  }
+  val empty = {entries = [], facts = Facts.empty}
+  fun merge ({entries = e1, facts = f1}, {entries = e2, facts = f2}) =
+    let
+      val seen = Bytehashtab.empty (length e1 + length e2)
+      fun add entry acc =
+        if Bytehashtab.defined seen (#uk entry) then acc
+        else (Bytehashtab.update seen (#uk entry, ()); entry :: acc)
+    in {entries = fold add e1 (fold add e2 []),
+        facts = Facts.merge (f1, f2)} end
+end)
+
+(* Process a list of (name, thm list) facts into cached_thm_entry list.
+   Filters out concealed, hidden, and infra theorems; computes universal keys. *)
+fun process_facts_into_cache (context : Context.generic)
+    (is_infra_thm : string * thm -> bool)
+    (facts_to_process : (string * thm list) list)
+    : Context_Callbacks.cached_thm_entry list =
+  let
+    val thy = Context.theory_of context
+    val all_facts = Context.cases Global_Theory.facts_of Proof_Context.facts_of context
+    val fact_space = Facts.space_of all_facts
+  in
+    maps (fn (name, thms) =>
+      let val entry_opt = try (Name_Space.the_entry fact_space) name
+      in case entry_opt of
+           NONE => []
+         | SOME e =>
+             if #concealed e orelse
+                Long_Name.is_hidden (Name_Space.intern fact_space name)
+             then []
+             else let
+               val ethy = #theory_long_name e
+               val epos = Context_Callbacks.entry_def_pos e
+             in map_filter (fn thm =>
+               let val thm' = Thm.transfer thy thm
+               in if is_infra_thm (name, thm') then NONE
+                  else SOME {
+                    uk = Universal_Key.key_of_theorem' NONE context thm',
+                    name = name, thy_name = ethy,
+                    pos = epos,
+                    thm = thm'
+                  } : Context_Callbacks.cached_thm_entry option
+               end) thms
+             end
+      end) facts_to_process
+  end
+
+(* Dedup new_entries against existing entries by universal key. *)
+fun dedup_against existing new_entries =
+  let
+    val seen = Bytehashtab.empty (length existing)
+    val _ = List.app (fn e => Bytehashtab.update seen (#uk e, ())) existing
+  in filter (fn e => not (Bytehashtab.defined seen (#uk e))) new_entries end
+
+(* Convenience callbacks with infra filters and theorem cache baked in.
+   Processes any uncached facts at creation time so callbacks see 0 uncached. *)
+fun make_entity_callbacks context =
+  let val {is_infra_const, is_infra_thm, is_infra_type, is_infra_class, is_infra_locale} =
+        Infra_Filter.gen_infra_filters context
+      val {entries = cached_entries, facts = cached_facts} =
+        Thm_Cache.get (Context.theory_of context)
+      (* Process uncached facts now, so callbacks see 0 uncached *)
+      val current_facts = Context.cases Global_Theory.facts_of Proof_Context.facts_of context
+      val uncached_facts = Facts.dest_static false [cached_facts] current_facts
+      val combined_entries =
+        if null uncached_facts then cached_entries
+        else let
+          val new_entries = process_facts_into_cache context is_infra_thm uncached_facts
+          val unique_new = dedup_against cached_entries new_entries
+        in cached_entries @ unique_new end
+      val thm_cache = SOME (combined_entries, current_facts)
+  in {
+    constants = Context_Callbacks.make_constants_callback (SOME (not o is_infra_const)) context,
+    theorems = Context_Callbacks.make_theorems_callback (SOME (not o is_infra_thm)) thm_cache context,
+    types = Context_Callbacks.make_types_callback (SOME (not o is_infra_type)) context,
+    classes = Context_Callbacks.make_classes_callback (SOME (not o is_infra_class)) context,
+    locales = Context_Callbacks.make_locales_callback (SOME (not o is_infra_locale)) context,
+    introduction_rules = Context_Callbacks.make_introduction_rules_callback
+      extract_intro_rules (SOME (not o is_infra_thm)) context,
+    elimination_rules = Context_Callbacks.make_elimination_rules_callback
+      extract_elim_rules (SOME (not o is_infra_thm)) context
+  } end
+
+
+(* --- Theorem cache update hook --- *)
+
+fun update_thm_cache thy =
+  let
+    val {entries = cached, facts = cached_facts} = Thm_Cache.get thy
+    val current_facts = Global_Theory.facts_of thy
+    val new_facts = Facts.dest_static false [cached_facts] current_facts
+  in
+    if null new_facts then NONE
+    else let
+      val t0 = Time.now ()
+      val context = Context.Theory thy
+      val {is_infra_thm, ...} = Infra_Filter.gen_infra_filters context
+      val new_entries = process_facts_into_cache context is_infra_thm new_facts
+      val unique_new = dedup_against cached new_entries
+      val _ = tracing (String.concat [
+        "[Semantic_Store] Thm_Cache updated: ", Int.toString (length unique_new), " new entries (",
+        Int.toString (length cached + length unique_new), " total) in ",
+        Int.toString (Time.toMilliseconds (Time.- (Time.now (), t0))), "ms"])
+    in
+      SOME (Thm_Cache.put {
+        entries = cached @ unique_new,
+        facts = current_facts
+      } thy)
+    end
+  end
+
+val _ = Theory.setup (Theory.at_begin update_thm_cache #> Theory.at_end update_thm_cache)
 
 local open MessagePackBinIO.Pack MessagePackBinIO.Unpack in
 
+fun pack_search_domain ContextAll =
+      packPair (packInt, packUnit) (0, ())
+  | pack_search_domain (ContextExtended extras) =
+      packPair (packInt, packList (packPair (packBytes, packString))) (1, extras)
+  | pack_search_domain (Restricted keys) =
+      packPair (packInt, packList packBytes) (2, keys)
+
 fun query_knn (context : Context.generic) =
   let
-    val {is_infra_const, is_infra_thm, is_infra_type, is_infra_class, is_infra_locale} =
-      Infra_Filter.gen_infra_filters context
+    val {constants, theorems, types, classes, locales,
+         introduction_rules, elimination_rules} = make_entity_callbacks context
     val callbacks = [
-      Context_Callbacks.make_constants_callback (SOME (not o is_infra_const)) context,
-      Context_Callbacks.make_theorems_callback (SOME (not o is_infra_thm)) context,
-      Context_Callbacks.make_types_callback (SOME (not o is_infra_type)) context,
-      Context_Callbacks.make_classes_callback (SOME (not o is_infra_class)) context,
-      Context_Callbacks.make_locales_callback (SOME (not o is_infra_locale)) context,
-      Context_Callbacks.make_introduction_rules_callback extract_intro_rules (SOME (not o is_infra_thm)) context,
-      Context_Callbacks.make_elimination_rules_callback extract_elim_rules (SOME (not o is_infra_thm)) context,
+      constants, theorems, types, classes, locales,
+      introduction_rules, elimination_rules,
       make_interpret_theory_callback context,
       Context_Callbacks.make_theory_long_name_callback context,
       Config.make_config_lookup_callback context
     ]
-    val cmd : (string * int * Universal_Key.entity_kind list * Universal_Key.universal_key list option,
-               (real * Universal_Key.entity) list)
+    val cmd : (string * int * Universal_Key.entity_kind list *
+               search_domain * string list * string list * string list * string list,
+               (real * Universal_Key.entity) list * string list)
               Remote_Procedure_Calling.command = {
       name = "Semantic_Embedding.query_knn",
-      arg_schema = packTuple4 (packString, packInt,
+      arg_schema = packTuple8 (packString, packInt,
                      packList Universal_Key.pack_entity_kind',
-                     packOption (packList Universal_Key.pack_universal_key)),
-      ret_schema = unpackList (unpackPair (unpackReal, Universal_Key.unpack_entity)),
+                     pack_search_domain,
+                     packList packString, packList packString,
+                     packList packString, packList packString),
+      ret_schema = unpackPair (
+                     unpackList (unpackPair (unpackReal, Universal_Key.unpack_entity)),
+                     unpackList unpackString),
       callback = callbacks,
       timeout = NONE
     }
   in
-    fn (query_text, k, kinds, domain) =>
-      Remote_Procedure_Calling.call_command cmd (query_text, k, kinds, domain)
+    fn {query_text, k, kinds, domain, term_patterns, type_patterns,
+        theories_include, name_contains} =>
+      Remote_Procedure_Calling.call_command cmd
+        (query_text, k, kinds, domain, term_patterns, type_patterns,
+         theories_include, name_contains)
   end
 
 fun is_thy_embedded (context : Context.generic) (theory_name : string, model : string) : bool =
@@ -647,16 +795,11 @@ fun embed_all_entities_in_theories (context : Context.generic) (theories : theor
       let
         val _ = tracing ("[Semantic_Store] embed_all_entities_in_theories: " ^
                    Int.toString (length unembedded) ^ " theories to embed")
-        val {is_infra_const, is_infra_thm, is_infra_type, is_infra_class, is_infra_locale} =
-          Infra_Filter.gen_infra_filters context
+        val {constants, theorems, types, classes, locales,
+             introduction_rules, elimination_rules} = make_entity_callbacks context
         val callbacks = [
-          Context_Callbacks.make_constants_callback (SOME (not o is_infra_const)) context,
-          Context_Callbacks.make_theorems_callback (SOME (not o is_infra_thm)) context,
-          Context_Callbacks.make_types_callback (SOME (not o is_infra_type)) context,
-          Context_Callbacks.make_classes_callback (SOME (not o is_infra_class)) context,
-          Context_Callbacks.make_locales_callback (SOME (not o is_infra_locale)) context,
-          Context_Callbacks.make_introduction_rules_callback extract_intro_rules (SOME (not o is_infra_thm)) context,
-          Context_Callbacks.make_elimination_rules_callback extract_elim_rules (SOME (not o is_infra_thm)) context,
+          constants, theorems, types, classes, locales,
+          introduction_rules, elimination_rules,
           Universal_Key.make_universal_key_callback context,
           Config.make_config_lookup_callback context
         ]

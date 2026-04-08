@@ -51,8 +51,8 @@ class _Semantic_DB:
     class Record(NamedTuple):
         kind: EntityKind
         name: str
-        expr: str
-        interpretation: str
+        expr: str | None
+        interpretation: str | None
 
         @property
         def pretty_print(self) -> str:
@@ -108,6 +108,8 @@ class _Semantic_DB:
         """Look up a semantic interpretation by universal key."""
         rec = self[key]
         if rec is None:
+            return None
+        if rec.interpretation is None:
             return None
         if with_pretty:
             return rec.pretty_print + "\n" + rec.interpretation
@@ -200,6 +202,14 @@ def _mk_query_by_name_schema(working_names: list[str]) -> dict:
     }
 
 
+import re as _re
+_TRAILING_BEGIN_RE = _re.compile(r'\nbegin\s*\Z')
+
+def _strip_trailing_begin(source: str) -> str:
+    """Remove a trailing ``begin`` line from command source."""
+    return _TRAILING_BEGIN_RE.sub('', source)
+
+
 async def _get_definition_with_pos(
     connection: Connection, kind: EntityKind, uk: universal_key
 ) -> tuple[str, IsabellePosition] | None:
@@ -216,7 +226,7 @@ async def _get_definition_with_pos(
     from .hover import command_at_position
     entries, _ = await entities_of(connection, [kind])
     pos = None
-    for key, p in entries:
+    for key, _, p in entries:
         if key == uk:
             pos = p
             break
@@ -226,6 +236,8 @@ async def _get_definition_with_pos(
     if cmd is None:
         return None
     source, start_offset, _ = cmd
+    # Strip trailing "begin" keyword (part of class/locale/context command spans)
+    source = _strip_trailing_begin(source)
     cmd_pos = IsabellePosition(0, start_offset, pos.file)
     return (source, cmd_pos)
 
@@ -433,8 +445,10 @@ class Semantic_Vector_Store(Vector_Store):
 
     class ContextExtended(Domain):
         """All available entities at the connection's context, plus additional keys."""
-        def __init__(self, extra: list[universal_key]):
+        def __init__(self, extra: list[universal_key],
+                     extra_names: dict[universal_key, str] | None = None):
             self.extra = extra
+            self.extra_names = extra_names or {}
     @staticmethod
     def clean_all_wip_in_created_dbs() -> None:
         """Remove all WIP (non-persistent) entries from every vector store on disk."""
@@ -647,9 +661,17 @@ class Semantic_Vector_Store(Vector_Store):
           type_patterns: Isabelle type pattern strings (type matching)
           theories_include: only entities from these theories
         """
+        import logging as _logging
+        import time as _time
+        _perf_log = _logging.getLogger("perf.lookup")
+        _t_lookup_start = _time.perf_counter()
+
         warnings: list[str] = []
         if not kinds:
             return [], warnings
+        # candidate_names: uk → full name (for synthesizing placeholder records)
+        candidate_names: dict[universal_key, str] = {}
+        _t_entities = _time.perf_counter()
         if domain is Semantic_Vector_Store.ContextAll:
             if self.connection is None:
                 return [], warnings
@@ -660,7 +682,9 @@ class Semantic_Vector_Store(Vector_Store):
                                      type_patterns=type_patterns,
                                      theories_include=theories_include,
                                      name_contains=name_contains)
-            candidates = [k for k, _ in entries]
+            candidates = [uk for uk, _, _ in entries]
+            for uk, name, _ in entries:
+                candidate_names[uk] = name
         elif isinstance(domain, Semantic_Vector_Store.ContextExtended):
             if self.connection is None:
                 return [], warnings
@@ -671,27 +695,55 @@ class Semantic_Vector_Store(Vector_Store):
                                      type_patterns=type_patterns,
                                      theories_include=theories_include,
                                      name_contains=name_contains)
-            candidates = [k for k, _ in entries]
+            candidates = [uk for uk, _, _ in entries]
+            for uk, name, _ in entries:
+                candidate_names[uk] = name
             seen = set(candidates)
             kind_set = set(kinds)
             for ek in domain.extra:
                 if ek not in seen and destruct_key(ek).kind in kind_set:
                     candidates.append(ek)
                     seen.add(ek)
+                    if ek in domain.extra_names:
+                        candidate_names[ek] = domain.extra_names[ek]
+                    else:
+                        extra_rec = Semantic_DB[ek]
+                        if extra_rec is not None:
+                            candidate_names[ek] = extra_rec.name
+                        else:
+                            entity = destruct_key(ek)
+                            if isinstance(entity.name, str):
+                                candidate_names[ek] = entity.name
         elif isinstance(domain, Semantic_Vector_Store.Restricted):
             kind_set = set(kinds)
             candidates = [dk for dk in domain.keys if destruct_key(dk).kind in kind_set]
         else:
             raise TypeError(f"Unknown domain type: {type(domain)}")
+        _perf_log.info("lookup: entities_of %.3fs (%d candidates)",
+                       _time.perf_counter() - _t_entities, len(candidates))
         if not candidates:
             return [], warnings
+
+        def _resolve(uk: universal_key) -> SemanticRecord | None:
+            """Look up SemanticRecord, falling back to a placeholder if name is known."""
+            rec = Semantic_DB[uk]
+            if rec is not None:
+                return rec
+            name = candidate_names.get(uk)
+            if name is not None:
+                return SemanticRecord(EntityKind(uk[16]), name, None, None)
+            return None
+
         # Save original query string for potential reranking (topk embeds it)
         query_str = query if isinstance(query, str) else None
         reranker = (await self._get_reranker()) if query_str else None
         fetch_k = k * _RERANK_FETCH_MULTIPLIER if reranker else k
+        _t_topk = _time.perf_counter()
         top = await self.topk(query, candidates, fetch_k)
+        _perf_log.info("lookup: topk %.3fs", _time.perf_counter() - _t_topk)
         # Rerank if configured and query was a string
         if reranker is not None and query_str is not None and len(top) > 1:
+            _t_rerank = _time.perf_counter()
             doc_entries: list[tuple[universal_key, SemanticRecord, str]] = []
             for uk, _score in top:
                 rec = Semantic_DB[uk]
@@ -703,24 +755,48 @@ class Semantic_Vector_Store(Vector_Store):
                 try:
                     rr = await reranker.rerank(
                         query_str, [e[2] for e in doc_entries], min(k, len(doc_entries)))
-                    results = [(rr.scores[i], doc_entries[idx][1])
-                               for i, idx in enumerate(rr.indices)]
-                    return results, warnings
+                    _perf_log.info("lookup: rerank %.3fs (%d docs)",
+                                   _time.perf_counter() - _t_rerank, len(doc_entries))
+                    reranked: list[tuple[float, SemanticRecord]] = [
+                        (rr.scores[i], doc_entries[idx][1])
+                        for i, idx in enumerate(rr.indices)]
+                    # Append candidates that had no reranking text (no interpretation)
+                    reranked_set = {e[1].name for e in reranked}
+                    for uk, score in top:
+                        if len(reranked) >= k:
+                            break
+                        rec = _resolve(uk)
+                        if rec is not None and rec.name not in reranked_set:
+                            reranked.append((score, rec))
+                    _perf_log.info("lookup: total %.3fs", _time.perf_counter() - _t_lookup_start)
+                    return reranked[:k], warnings
                 except Exception as e:
                     import logging
                     logging.getLogger(__name__).warning("Reranker failed, falling back to embedding scores: %s", e)
-        results = [(score, rec) for uk, score in top if (rec := Semantic_DB[uk]) is not None]
-        if len(results) < k:
+        _t_resolve = _time.perf_counter()
+        results: list[tuple[float, SemanticRecord] | None] = [None] * k
+        n = 0
+        for uk, score in top:
+            if n >= k:
+                break
+            rec = _resolve(uk)
+            if rec is not None:
+                results[n] = (score, rec)
+                n += 1
+        if n < k:
             # Pad with entities that had no embedding, assigned score 0
             top_set = {uk for uk, _ in top}
             for uk in candidates:
-                if len(results) >= k:
+                if n >= k:
                     break
                 if uk not in top_set:
-                    rec = Semantic_DB[uk]
+                    rec = _resolve(uk)
                     if rec is not None:
-                        results.append((0.0, rec))
-        return results[:k], warnings
+                        results[n] = (0.0, rec)
+                        n += 1
+        _perf_log.info("lookup: resolve_records %.3fs", _time.perf_counter() - _t_resolve)
+        _perf_log.info("lookup: total %.3fs", _time.perf_counter() - _t_lookup_start)
+        return results[:n], warnings  # type: ignore[list-item]
 
     async def _embed_keys(self, keys: list[universal_key]) -> int:
         """Embed the given keys that are missing from the vector store.
@@ -792,7 +868,7 @@ class Semantic_Vector_Store(Vector_Store):
                 continue
             entries, _warnings = await entities_of(self.connection, EntityKind.ALL, # type: ignore
                                theory=thy_name, the_theory_only=True)
-            keys = [k for k, _ in entries]
+            keys = [k for k, _, _ in entries]
             wip = is_WIP(thy_key)
             await self._embed_keys(keys)
             if not wip:
@@ -864,15 +940,45 @@ async def _contains(arg: Any, connection: Connection) -> list[bool]:
     return Semantic_DB.contains(keys)
 
 
+def _setup_perf_logging() -> None:
+    """Ensure perf.* loggers have a stderr handler."""
+    import logging as _logging, sys as _sys
+    root = _logging.getLogger("perf")
+    if root.handlers:
+        return
+    sh = _logging.StreamHandler(_sys.stderr)
+    sh.setFormatter(_logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
+    root.addHandler(sh)
+    root.setLevel(_logging.DEBUG)
+
 @isabelle_remote_procedure("Semantic_Embedding.query_knn")
-async def _query_knn(arg: Any, connection: Connection) -> list[tuple[float, tuple[int, str]]]:
-    query_str, k, kind_ints, domain_raw = arg
+async def _query_knn(arg: Any, connection: Connection) -> tuple[
+        list[tuple[float, tuple[int, str]]], list[str]]:
+    _setup_perf_logging()
+    (query_str, k, kind_ints, domain_raw,
+     term_patterns, type_patterns, theories_include, name_contains) = arg
     kinds = [EntityKind(ki) for ki in kind_ints]
-    domain = Semantic_Vector_Store.Restricted([bytes(uk) for uk in domain_raw]) if domain_raw is not None else Semantic_Vector_Store.ContextAll
+    # Decode domain tagged union: (tag, payload)
+    domain_tag, domain_payload = domain_raw
+    if domain_tag == 0:
+        domain: Semantic_Vector_Store.Domain = Semantic_Vector_Store.ContextAll
+    elif domain_tag == 1:
+        extras = [(bytes(k_), name) for k_, name in domain_payload]
+        domain = Semantic_Vector_Store.ContextExtended(
+            [k_ for k_, _ in extras],
+            extra_names={k_: name for k_, name in extras})
+    elif domain_tag == 2:
+        domain = Semantic_Vector_Store.Restricted([bytes(uk) for uk in domain_payload])
+    else:
+        raise ValueError(f"Unknown domain tag: {domain_tag}")
     store = await connection.semantic_vector_store()  # type: ignore
-    results, _warnings = await store.lookup(query_str, k, kinds, domain)
-    return [(score, (int(rec.kind), rec.name))
-            for score, rec in results]
+    results, warnings = await store.lookup(query_str, k, kinds, domain,
+        term_patterns=list(term_patterns),
+        type_patterns=list(type_patterns),
+        theories_include=list(theories_include),
+        name_contains=list(name_contains))
+    return ([(score, (int(rec.kind), rec.name)) for score, rec in results],
+            list(warnings))
 
 
 @isabelle_remote_procedure("Semantic_Embedding.embed_all_entities_in_theories")

@@ -195,6 +195,10 @@ object PIDE_Query {
 object DB_Snapshots {
   // digest -> (session_name, theory_name)
   private var digest_index: Map[String, (String, String)] = Map.empty
+  // base name (e.g. "Main") -> (session_name, theory_name)
+  // Fallback when file has been modified and digest no longer matches.
+  // Later sessions overwrite earlier ones, so the most derived ancestor wins.
+  private var name_index: Map[String, (String, String)] = Map.empty
   private var indexed_sessions: Set[String] = Set.empty
 
   // theory_name -> snapshot
@@ -250,6 +254,7 @@ object DB_Snapshots {
             if (base.nonEmpty) {
               val theory_name = session_name + "." + base
               digest_index += (digest -> (session_name, theory_name))
+              name_index += (base -> (session_name, theory_name))
             }
           }
         }
@@ -289,9 +294,16 @@ object DB_Snapshots {
     val sessions_structure = session.resources.sessions_structure
     val current_session = session.resources.session_base.session_name
     val ancestors = sessions_structure.build_hierarchy(current_session)
+    // Also index immediate descendants of the base session that may have been
+    // previously built (e.g. the working project session).  build_hierarchy
+    // only covers ancestors; this covers one level up so that goto-definition
+    // can resolve into a sibling/child session's export DB.
+    val descendants =
+      if (sessions_structure.build_graph.defined(current_session))
+        sessions_structure.build_graph.imm_succs(current_session).toList
+      else Nil
 
-    // Index all ancestor sessions
-    for (name <- ancestors) index_session(store, name)
+    for (name <- ancestors ::: descendants) index_session(store, name)
 
     // Compute file digest and look up
     val file = Path.explode(file_path)
@@ -304,7 +316,15 @@ object DB_Snapshots {
     digest_index.get(digest) match {
       case Some((session_name, theory_name)) =>
         load_snapshot(store, session_name, theory_name)
-      case None => None
+      case None =>
+        // Fallback: file was modified since the heap was built — match by theory base name
+        val base = Library.try_unsuffix(".thy", file.file_name).getOrElse("")
+        if (base.nonEmpty) {
+          name_index.get(base).flatMap { case (session_name, theory_name) =>
+            load_snapshot(store, session_name, theory_name)
+          }
+        }
+        else None
     }
   }
 }

@@ -99,8 +99,7 @@ fun serial_of_term (Context.Theory _) term =
 *)
 
 fun serial_of_thm context thm =
-  case Thm.raw_derivation_name thm of
-    "" =>
+  if not (Thm.has_name_hint thm) then
       (case context of
         Context.Theory _ =>
           Synchronized.change_result state (fn net =>
@@ -114,8 +113,9 @@ fun serial_of_thm context thm =
                 val _ = net_ref := net'
                 val _ = Inthashtab.update local_tht (s, Thm.trim_context thm)
             in (s, net) end))
-  | name =>
-      (* Always global for named theorems *)
+  else
+    let val name = Thm.get_name_hint thm
+    in (* Always global for named theorems *)
       Synchronized.change_result state (fn net =>
         let val (s, net') =
           case Strhashtab.lookup deriv_cache name of
@@ -125,6 +125,7 @@ fun serial_of_thm context thm =
                   val _ = Strhashtab.update deriv_cache (name, s)
               in (s, net') end
         in Inthashtab.update thm_tab (s, Thm.trim_context thm); (s, net') end)
+    end
 
 (*
 fun term_of_serial (Context.Theory _) s = Inthashtab.lookup term_tab s
