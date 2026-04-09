@@ -22,7 +22,7 @@ signature SEMANTIC_STORE = sig
   (* Interpret all uninterpreted ancestor theories of the current context,
      plus the current proof context if applicable. Calls Python via RPC
      to generate plain-English translations using a Claude agent. *)
-  val interpret : Context.generic -> unit
+  val interpret : bool -> Context.generic -> unit
 
   (* Remove all LMDB entries whose theory hashes are non-persistent
      (i.e., from non-loaded theories). Returns the number of entries deleted. *)
@@ -57,7 +57,7 @@ signature SEMANTIC_STORE = sig
   (* Embed semantic interpretations into vectors for the given theories
      and all their unembedded ancestors, under the specified embedding model
      (empty string = use default). *)
-  val embed_all_entities_in_theories : Context.generic -> theory list * string -> unit
+  val embed_all_entities_in_theories : bool -> Context.generic -> theory list * string -> unit
 
   (* Embed a list of entities, skipping those already embedded. *)
   val embed_entities : Context.generic -> Universal_Key.entity list -> unit
@@ -481,14 +481,14 @@ fun interpret' (context : Context.generic) : usage * usage =
     end
   end
 
-fun collect_uninterpreted thy =
+fun collect_uninterpreted (force : bool) thy =
   let
     val seen = Inthashtab.empty 64
     val _ = List.app (Inthashtab.update seen o rpair ()) base_theory_ids
     fun collect thy acc =
       let val id = Context.theory_identifier thy
       in
-        if is_interpreted thy orelse Inthashtab.defined seen id
+        if (not force andalso is_interpreted thy) orelse Inthashtab.defined seen id
         then acc
         else
           let val _ = Inthashtab.update seen (id, ())
@@ -497,10 +497,10 @@ fun collect_uninterpreted thy =
       end
   in collect thy [] end
 
-fun interpret (context : Context.generic) : unit =
+fun interpret (force : bool) (context : Context.generic) : unit =
   let
     val thy = Context.theory_of context
-    val theories = collect_uninterpreted thy
+    val theories = collect_uninterpreted force thy
     val contexts = map Context.Theory theories
       @ (case context of Context.Proof _ => [context] | _ => [])
     val _ = if null contexts then () else
@@ -772,7 +772,7 @@ fun is_thy_embedded (context : Context.generic) (theory_name : string, model : s
     }
   in Remote_Procedure_Calling.call_command cmd (theory_name, model) end
 
-fun embed_all_entities_in_theories (context : Context.generic) (theories : theory list, model : string) : unit =
+fun embed_all_entities_in_theories (force : bool) (context : Context.generic) (theories : theory list, model : string) : unit =
   let
     val seen = Inthashtab.empty 64
     val _ = List.app (Inthashtab.update seen o rpair ()) base_theory_ids
@@ -784,7 +784,7 @@ fun embed_all_entities_in_theories (context : Context.generic) (theories : theor
           let val _ = Inthashtab.update seen (id, ())
               val name = Context.theory_long_name thy
               val acc' = fold collect (Theory.parents_of thy) acc
-          in if is_thy_embedded context (name, model) then acc'
+          in if not force andalso is_thy_embedded context (name, model) then acc'
              else acc' @ [name]
           end
       end
@@ -803,14 +803,14 @@ fun embed_all_entities_in_theories (context : Context.generic) (theories : theor
           Universal_Key.make_universal_key_callback context,
           Config.make_config_lookup_callback context
         ]
-        val cmd : (string list * string, unit) Remote_Procedure_Calling.command = {
+        val cmd : (string list * string * bool, unit) Remote_Procedure_Calling.command = {
           name = "Semantic_Embedding.embed_all_entities_in_theories",
-          arg_schema = packPair (packList packString, packString),
+          arg_schema = packTuple3 (packList packString, packString, packBool),
           ret_schema = unpackUnit,
           callback = callbacks,
           timeout = NONE
         }
-      in Remote_Procedure_Calling.call_command cmd (unembedded, model) end
+      in Remote_Procedure_Calling.call_command cmd (unembedded, model, force) end
   end
 
 fun embed_entities (context : Context.generic) (entities : Universal_Key.entity list) : unit =

@@ -299,7 +299,7 @@ def cmd_collect(args: argparse.Namespace) -> None:
             print("Running app...", flush=True)
             await c.run_app("Semantic_Store.collect")
             models = [m.strip() for m in args.embed_models.split(",") if m.strip()] if args.embed_models else []
-            await c._write(args.theory, models)
+            await c._write(args.theory, models, args.reinterpret)
 
             has_error = False
             try:
@@ -360,6 +360,8 @@ p_collect.add_argument("--model", default="claude-opus-4-6",
     help="LLM model for semantic interpretation (default: claude-opus-4-6)")
 p_collect.add_argument("--embed-models", default="",
     help="Comma-separated embedding model names (e.g., 'fw.qwen3-embedding-8b,codestral-embed')")
+p_collect.add_argument("--reinterpret", action="store_true",
+    help="Re-interpret already-finished theories to pick up new entities")
 
 # list
 p_list = sub.add_parser("list", help="List all theories in the semantic database")

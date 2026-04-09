@@ -33,27 +33,72 @@ fun gen_infra_filters (context : Context.generic)
           andalso not (Long_Name.is_hidden (Name_Space.intern type_space name)))
     val type_name_prefixes = map (fn T => T ^ ".") type_names
 
-    (* --- ADT infrastructure constants --- *)
+    (* --- ADT/record infrastructure constants --- *)
 
-    (* Preserved datatype constant names: constructors, selectors, case, map, pred, rel, sets *)
+    (* Preserved constant names: datatype constructors/selectors/case, BNF map/pred/rel/sets,
+       record selectors/updaters/make/fields/extend/truncate *)
     val const_name = fst o Term.dest_Const
-    fun ctr_sugar_names T =
-      case Context.cases Ctr_Sugar.ctr_sugar_of_global Ctr_Sugar.ctr_sugar_of context T of
-        NONE => []
-      | SOME cs =>
-          map const_name (#ctrs cs)
-          @ maps (map const_name) (#selss cs)
-          @ [const_name (#casex cs)]
-    fun bnf_names T =
-      case Context.cases BNF_Def.bnf_of_global BNF_Def.bnf_of context T of
-        NONE => []
-      | SOME bnf =>
-          [const_name (BNF_Def.map_of_bnf bnf),
-           const_name (BNF_Def.pred_of_bnf bnf),
-           const_name (BNF_Def.rel_of_bnf bnf)]
-          @ map const_name (BNF_Def.sets_of_bnf bnf)
-    val preserved_set = Strhashtab.make_set
-      (maps (fn T => ctr_sugar_names T @ bnf_names T) type_names)
+    val thy = Context.theory_of context
+    val (preserved_names, adt_record_prefixes) =
+      let
+        fun ctr_sugar_names T =
+          case Context.cases Ctr_Sugar.ctr_sugar_of_global Ctr_Sugar.ctr_sugar_of context T of
+            NONE => []
+          | SOME cs =>
+              map const_name (#ctrs cs)
+              @ maps (map const_name) (#selss cs)
+              @ [const_name (#casex cs)]
+        fun bnf_names T =
+          case Context.cases BNF_Def.bnf_of_global BNF_Def.bnf_of context T of
+            NONE => []
+          | SOME bnf =>
+              [const_name (BNF_Def.map_of_bnf bnf),
+               const_name (BNF_Def.pred_of_bnf bnf),
+               const_name (BNF_Def.rel_of_bnf bnf)]
+              @ map const_name (BNF_Def.sets_of_bnf bnf)
+        fun record_names T =
+          case Record.get_info thy T of
+            NONE => []
+          | SOME info =>
+              let val fields = map fst (#fields info)
+                  val prefix = T ^ "."
+              in
+                fields
+                @ map (fn f => f ^ Record.updateN) fields
+                @ [prefix ^ "more", prefix ^ "more" ^ Record.updateN,
+                   prefix ^ "make", prefix ^ "fields", prefix ^ "extend", prefix ^ "truncate"]
+              end
+        fun co_rec_names T =
+          case Context.cases BNF_FP_Def_Sugar.fp_sugar_of_global BNF_FP_Def_Sugar.fp_sugar_of context T of
+            NONE => []
+          | SOME fp =>
+              (case #fp_co_induct_sugar fp of
+                NONE => []
+              | SOME sugar => [const_name (#co_rec sugar)])
+        val (all_names, prefixes) = fold (fn T => fn (names, pfxs) =>
+          let val ns = ctr_sugar_names T @ bnf_names T @ record_names T @ co_rec_names T
+          in (ns @ names, if null ns then pfxs else (T ^ ".") :: pfxs) end)
+          type_names ([], [])
+      in (all_names, prefixes) end
+    val preserved_set = Strhashtab.make_set preserved_names
+
+    (* Quotient type infrastructure constants:
+       - Abs_T/Rep_T (typedef-level; users work with quotient-level abs_T/rep_T instead)
+       - pcr_T/cr_T (Lifting package correspondence relations) *)
+    val quotient_typedef_infra = Strhashtab.make_set
+      (maps (fn T =>
+        case Quotient_Info.lookup_quotients_global thy T of
+          NONE => []
+        | SOME _ =>
+            let val base = Long_Name.base_name T
+                val qual = Long_Name.qualifier T
+                fun mk name = if qual = "" then name else qual ^ "." ^ name
+            in
+              maps (fn ({Rep_name, Abs_name, ...}, _) => [Rep_name, Abs_name])
+                (Typedef.get_info_global thy T)
+              @ [mk ("pcr_" ^ base), mk ("cr_" ^ base)]
+            end)
+        type_names)
 
     (* Pre-BNF intermediate constant prefixes *)
     val pre_prefixes = map_filter (fn T =>
@@ -103,7 +148,8 @@ fun gen_infra_filters (context : Context.generic)
             orelse exists (fn pfx => String.isPrefix pfx name) pre_prefixes
             orelse exists (fn infix_ => String.isSubstring infix_ name) inst_infixes
             orelse has_class_variant name
-            orelse (exists (fn pfx => String.isPrefix pfx name) type_name_prefixes
+            orelse Strhashtab.defined quotient_typedef_infra name
+            orelse (exists (fn pfx => String.isPrefix pfx name) adt_record_prefixes
                     andalso not (Strhashtab.defined preserved_set name))
             orelse String.isSubstring ".class." name
             orelse (String.isSuffix "_class" (Long_Name.base_name name)

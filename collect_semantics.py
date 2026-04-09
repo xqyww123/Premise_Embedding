@@ -25,6 +25,8 @@ parser.add_argument("--rpc-addr", default="127.0.0.1:27182", help="RPC host addr
 parser.add_argument("--session", default="HOL", help="Session qualifier for theory name resolution")
 parser.add_argument("--embed-models", default="",
     help="Comma-separated embedding model names (e.g., 'fw.qwen3-embedding-8b,codestral-embed')")
+parser.add_argument("--reinterpret", action="store_true",
+    help="Re-interpret already-finished theories to pick up new entities")
 args = parser.parse_args()
 
 logger = Isabelle_RPC_Host.mk_logger_(args.rpc_addr, None)
@@ -49,7 +51,7 @@ async def main():
         print("Running app...", flush=True)
         await c.run_app("Semantic_Store.collect")
         models = [m.strip() for m in args.embed_models.split(",") if m.strip()] if args.embed_models else []
-        await c._write(args.theory, models)
+        await c._write(args.theory, models, args.reinterpret)
 
         # Read and print tracing messages until done
         has_error = False

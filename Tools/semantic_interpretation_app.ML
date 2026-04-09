@@ -5,6 +5,7 @@
   Protocol:
     Client sends: theory_name (msgpack string)
                   models (msgpack string list, may be empty)
+                  force (msgpack bool – when true, re-interpret already-finished theories)
     Server streams: packString messages during interpretation/embedding (from tracing)
     Server sends:   packUnit when done successfully
     On error:       sends packString "ERROR: ..." then packUnit
@@ -26,6 +27,7 @@ val _ = REPL_Server.register_app "Semantic_Store.collect" (fn (cin, cout, state)
       let
         val thy_name = read unpackString
         val models = read (unpackList unpackString)
+        val force = read unpackBool
         val thy = Thy_Info.get_theory thy_name
         val _ = Theory_Hash.store_theory_hash thy
 
@@ -57,11 +59,11 @@ val _ = REPL_Server.register_app "Semantic_Store.collect" (fn (cin, cout, state)
 
         val context = Context.Theory thy
         val theories = thy :: Theory.ancestors_of thy
-        val _ = \<^try>\<open>Semantic_Store.interpret context
+        val _ = \<^try>\<open>Semantic_Store.interpret force context
           catch exn => (restore_channels (); Exn.reraise exn)\<close>
         val _ = List.app (fn model =>
           (send ("[Embedding] model: " ^ model);
-           \<^try>\<open>Semantic_Store.embed_all_entities_in_theories context (theories, model)
+           \<^try>\<open>Semantic_Store.embed_all_entities_in_theories force context (theories, model)
              catch exn => (restore_channels (); Exn.reraise exn)\<close>)) models
         val _ = restore_channels ()
         val _ = done ()

@@ -215,7 +215,7 @@ class InterpretationTask:
             )
 
         return f"""\
-Load the skill `isabelle-intro-elim-rules`.
+Load the skills `isabelle-intro-elim-rules`, `isabelle-datatype`, and `isabelle-record`.
 Informalize the following entities from Isabelle theory "{theory_longname}" (location: {file_path})
 
 Entries:

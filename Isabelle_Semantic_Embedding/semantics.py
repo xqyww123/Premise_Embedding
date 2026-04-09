@@ -831,7 +831,8 @@ class Semantic_Vector_Store(Vector_Store):
         """Embed the given entity keys, skipping those already embedded."""
         await self._embed_keys(keys)
 
-    async def embed_all_entities_in_theories(self, theories: list[str | universal_key]) -> None:
+    async def embed_all_entities_in_theories(self, theories: list[str | universal_key],
+                                              *, force: bool = False) -> None:
         """Embed semantic interpretations into vectors for the given theories.
 
         For each theory, collects all entity keys, embeds missing ones,
@@ -839,6 +840,7 @@ class Semantic_Vector_Store(Vector_Store):
 
         Args:
             theories: Long theory names (str) or universal keys to embed.
+            force: If True, re-visit theories already marked as fully embedded.
 
         Raises:
             RuntimeError: If no active connection is available.
@@ -864,7 +866,7 @@ class Semantic_Vector_Store(Vector_Store):
                     raise ValueError(
                         f"Theory key {thy_key.hex()} not found in the active Isabelle runtime; "
                         f"the theory may not be loaded")
-            if self.is_thy_embedded(thy_key):
+            if not force and self.is_thy_embedded(thy_key):
                 continue
             entries, _warnings = await entities_of(self.connection, EntityKind.ALL, # type: ignore
                                theory=thy_name, the_theory_only=True)
@@ -983,9 +985,9 @@ async def _query_knn(arg: Any, connection: Connection) -> tuple[
 
 @isabelle_remote_procedure("Semantic_Embedding.embed_all_entities_in_theories")
 async def _embed_all_entities_in_theories(arg: Any, connection: Connection) -> None:
-    theory_names, model_name = arg
+    theory_names, model_name, force = arg
     store = await connection.semantic_vector_store(model_name or None)  # type: ignore
-    await store.embed_all_entities_in_theories(theory_names)
+    await store.embed_all_entities_in_theories(theory_names, force=force)
 
 
 @isabelle_remote_procedure("Semantic_Embedding.embed_entities")
