@@ -338,6 +338,104 @@ fun build_entries (context : Context.generic)
       (entity, name, mk_prop_str entity, the_default 999999999 (Position.line_of pos), uk))
   end
 
+fun extract_intro_rules ctx =
+  let val cs = Classical.rep_cs (Classical.get_cs ctx)
+  in map #1 (Item_Net.content (#safeIs cs) @ Item_Net.content (#unsafeIs cs)) end
+
+fun extract_elim_rules ctx =
+  let val cs = Classical.rep_cs (Classical.get_cs ctx)
+  in map #1 (Item_Net.content (#safeEs cs) @ Item_Net.content (#unsafeEs cs)) end
+
+(* --- Theorem cache: pre-computed non-infra theorems with universal keys --- *)
+
+structure Thm_Cache = Theory_Data(struct
+  type T = {
+    entries: Context_Callbacks.cached_thm_entry list,
+    facts: Facts.T
+  }
+  val empty = {entries = [], facts = Facts.empty}
+  fun merge ({entries = e1, facts = f1}, {entries = e2, facts = f2}) =
+    let
+      val seen = Bytehashtab.empty (length e1 + length e2)
+      fun add entry acc =
+        if Bytehashtab.defined seen (#uk entry) then acc
+        else (Bytehashtab.update seen (#uk entry, ()); entry :: acc)
+    in {entries = fold add e1 (fold add e2 []),
+        facts = Facts.merge (f1, f2)} end
+end)
+
+(* Process a list of (name, thm list) facts into cached_thm_entry list.
+   Filters out concealed, hidden, and infra theorems; computes universal keys. *)
+fun process_facts_into_cache (context : Context.generic)
+    (is_infra_thm : string * thm -> bool)
+    (facts_to_process : (string * thm list) list)
+    : Context_Callbacks.cached_thm_entry list =
+  let
+    val thy = Context.theory_of context
+    val all_facts = Context.cases Global_Theory.facts_of Proof_Context.facts_of context
+    val fact_space = Facts.space_of all_facts
+  in
+    maps (fn (name, thms) =>
+      let val entry_opt = try (Name_Space.the_entry fact_space) name
+      in case entry_opt of
+           NONE => []
+         | SOME e =>
+             if #concealed e orelse
+                Long_Name.is_hidden (Name_Space.intern fact_space name)
+             then []
+             else let
+               val ethy = #theory_long_name e
+               val epos = Context_Callbacks.entry_def_pos e
+             in map_filter (fn thm =>
+               let val thm' = Thm.transfer thy thm
+               in if is_infra_thm (name, thm') then NONE
+                  else SOME {
+                    uk = Universal_Key.key_of_theorem' NONE context thm',
+                    name = name, thy_name = ethy,
+                    pos = epos,
+                    thm = thm'
+                  } : Context_Callbacks.cached_thm_entry option
+               end) thms
+             end
+      end) facts_to_process
+  end
+
+(* Dedup new_entries against existing entries by universal key. *)
+fun dedup_against existing new_entries =
+  let
+    val seen = Bytehashtab.empty (length existing)
+    val _ = List.app (fn e => Bytehashtab.update seen (#uk e, ())) existing
+  in filter (fn e => not (Bytehashtab.defined seen (#uk e))) new_entries end
+
+(* Convenience callbacks with infra filters and theorem cache baked in.
+   Processes any uncached facts at creation time so callbacks see 0 uncached. *)
+fun make_entity_callbacks context =
+  let val {is_infra_const, is_infra_thm, is_infra_type, is_infra_class, is_infra_locale} =
+        Infra_Filter.gen_infra_filters context
+      val {entries = cached_entries, facts = cached_facts} =
+        Thm_Cache.get (Context.theory_of context)
+      (* Process uncached facts now, so callbacks see 0 uncached *)
+      val current_facts = Context.cases Global_Theory.facts_of Proof_Context.facts_of context
+      val uncached_facts = Facts.dest_static false [cached_facts] current_facts
+      val combined_entries =
+        if null uncached_facts then cached_entries
+        else let
+          val new_entries = process_facts_into_cache context is_infra_thm uncached_facts
+          val unique_new = dedup_against cached_entries new_entries
+        in cached_entries @ unique_new end
+      val thm_cache = SOME (combined_entries, current_facts)
+  in {
+    constants = Context_Callbacks.make_constants_callback (SOME (not o is_infra_const)) context,
+    theorems = Context_Callbacks.make_theorems_callback (SOME (not o is_infra_thm)) thm_cache context,
+    types = Context_Callbacks.make_types_callback (SOME (not o is_infra_type)) context,
+    classes = Context_Callbacks.make_classes_callback (SOME (not o is_infra_class)) context,
+    locales = Context_Callbacks.make_locales_callback (SOME (not o is_infra_locale)) context,
+    introduction_rules = Context_Callbacks.make_introduction_rules_callback
+      extract_intro_rules (SOME (not o is_infra_thm)) context,
+    elimination_rules = Context_Callbacks.make_elimination_rules_callback
+      extract_elim_rules (SOME (not o is_infra_thm)) context
+  } end
+
 fun interpret' (context : Context.generic) : usage * usage =
   let
     (* 1. Get theory information *)
@@ -459,7 +557,11 @@ fun interpret' (context : Context.generic) : usage * usage =
       (* 7. Build callbacks capturing context *)
       val uk_cb = Universal_Key.make_universal_key_callback context
       val theory_info_cb = Context_Callbacks.make_theory_long_name_and_path_callback context
-      val cmd = make_interpret_file_cmd [uk_cb, theory_info_cb]
+      val {constants, theorems, types, classes, locales,
+           introduction_rules, elimination_rules} = make_entity_callbacks context
+      val cmd = make_interpret_file_cmd [uk_cb, theory_info_cb,
+            constants, theorems, types, classes, locales,
+            introduction_rules, elimination_rules]
 
       (* 8. Call RPC command *)
       val thy_key = Universal_Key.key_of_theory' thy
@@ -576,7 +678,11 @@ fun interpret_entities (context : Context.generic) (entities : Universal_Key.ent
         val thy_file_path = Theory_Structure.get_theory_file_path thy
         val uk_cb = Universal_Key.make_universal_key_callback context
         val theory_info_cb = Context_Callbacks.make_theory_long_name_and_path_callback context
-        val cmd = make_interpret_file_cmd [uk_cb, theory_info_cb]
+        val {constants, theorems, types, classes, locales,
+             introduction_rules, elimination_rules} = make_entity_callbacks context
+        val cmd = make_interpret_file_cmd [uk_cb, theory_info_cb,
+              constants, theorems, types, classes, locales,
+              introduction_rules, elimination_rules]
         val thy_key = Universal_Key.key_of_theory' thy
         val rpc_arg = {
           file_path = thy_file_path,
@@ -587,105 +693,6 @@ fun interpret_entities (context : Context.generic) (entities : Universal_Key.ent
         val _ = Remote_Procedure_Calling.call_command cmd rpc_arg
       in () end
   end
-
-fun extract_intro_rules ctx =
-  let val cs = Classical.rep_cs (Classical.get_cs ctx)
-  in map #1 (Item_Net.content (#safeIs cs) @ Item_Net.content (#unsafeIs cs)) end
-
-fun extract_elim_rules ctx =
-  let val cs = Classical.rep_cs (Classical.get_cs ctx)
-  in map #1 (Item_Net.content (#safeEs cs) @ Item_Net.content (#unsafeEs cs)) end
-
-(* --- Theorem cache: pre-computed non-infra theorems with universal keys --- *)
-
-structure Thm_Cache = Theory_Data(struct
-  type T = {
-    entries: Context_Callbacks.cached_thm_entry list,
-    facts: Facts.T
-  }
-  val empty = {entries = [], facts = Facts.empty}
-  fun merge ({entries = e1, facts = f1}, {entries = e2, facts = f2}) =
-    let
-      val seen = Bytehashtab.empty (length e1 + length e2)
-      fun add entry acc =
-        if Bytehashtab.defined seen (#uk entry) then acc
-        else (Bytehashtab.update seen (#uk entry, ()); entry :: acc)
-    in {entries = fold add e1 (fold add e2 []),
-        facts = Facts.merge (f1, f2)} end
-end)
-
-(* Process a list of (name, thm list) facts into cached_thm_entry list.
-   Filters out concealed, hidden, and infra theorems; computes universal keys. *)
-fun process_facts_into_cache (context : Context.generic)
-    (is_infra_thm : string * thm -> bool)
-    (facts_to_process : (string * thm list) list)
-    : Context_Callbacks.cached_thm_entry list =
-  let
-    val thy = Context.theory_of context
-    val all_facts = Context.cases Global_Theory.facts_of Proof_Context.facts_of context
-    val fact_space = Facts.space_of all_facts
-  in
-    maps (fn (name, thms) =>
-      let val entry_opt = try (Name_Space.the_entry fact_space) name
-      in case entry_opt of
-           NONE => []
-         | SOME e =>
-             if #concealed e orelse
-                Long_Name.is_hidden (Name_Space.intern fact_space name)
-             then []
-             else let
-               val ethy = #theory_long_name e
-               val epos = Context_Callbacks.entry_def_pos e
-             in map_filter (fn thm =>
-               let val thm' = Thm.transfer thy thm
-               in if is_infra_thm (name, thm') then NONE
-                  else SOME {
-                    uk = Universal_Key.key_of_theorem' NONE context thm',
-                    name = name, thy_name = ethy,
-                    pos = epos,
-                    thm = thm'
-                  } : Context_Callbacks.cached_thm_entry option
-               end) thms
-             end
-      end) facts_to_process
-  end
-
-(* Dedup new_entries against existing entries by universal key. *)
-fun dedup_against existing new_entries =
-  let
-    val seen = Bytehashtab.empty (length existing)
-    val _ = List.app (fn e => Bytehashtab.update seen (#uk e, ())) existing
-  in filter (fn e => not (Bytehashtab.defined seen (#uk e))) new_entries end
-
-(* Convenience callbacks with infra filters and theorem cache baked in.
-   Processes any uncached facts at creation time so callbacks see 0 uncached. *)
-fun make_entity_callbacks context =
-  let val {is_infra_const, is_infra_thm, is_infra_type, is_infra_class, is_infra_locale} =
-        Infra_Filter.gen_infra_filters context
-      val {entries = cached_entries, facts = cached_facts} =
-        Thm_Cache.get (Context.theory_of context)
-      (* Process uncached facts now, so callbacks see 0 uncached *)
-      val current_facts = Context.cases Global_Theory.facts_of Proof_Context.facts_of context
-      val uncached_facts = Facts.dest_static false [cached_facts] current_facts
-      val combined_entries =
-        if null uncached_facts then cached_entries
-        else let
-          val new_entries = process_facts_into_cache context is_infra_thm uncached_facts
-          val unique_new = dedup_against cached_entries new_entries
-        in cached_entries @ unique_new end
-      val thm_cache = SOME (combined_entries, current_facts)
-  in {
-    constants = Context_Callbacks.make_constants_callback (SOME (not o is_infra_const)) context,
-    theorems = Context_Callbacks.make_theorems_callback (SOME (not o is_infra_thm)) thm_cache context,
-    types = Context_Callbacks.make_types_callback (SOME (not o is_infra_type)) context,
-    classes = Context_Callbacks.make_classes_callback (SOME (not o is_infra_class)) context,
-    locales = Context_Callbacks.make_locales_callback (SOME (not o is_infra_locale)) context,
-    introduction_rules = Context_Callbacks.make_introduction_rules_callback
-      extract_intro_rules (SOME (not o is_infra_thm)) context,
-    elimination_rules = Context_Callbacks.make_elimination_rules_callback
-      extract_elim_rules (SOME (not o is_infra_thm)) context
-  } end
-
 
 (* --- Theorem cache update hook --- *)
 

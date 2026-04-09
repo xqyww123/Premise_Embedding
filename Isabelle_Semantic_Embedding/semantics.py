@@ -311,7 +311,11 @@ def mk_query_by_name_tool(
                 )
             sem, uk = await query_by_name_raw(connection, tag, name, with_pretty=with_pretty)
             if args.get("show_defs", False):
-                src = await _get_definition_source(connection, tag, uk)
+                try:
+                    src = await _get_definition_source(connection, tag, uk)
+                except Exception:
+                    log.debug("show_defs failed for %r", name, exc_info=True)
+                    src = None
                 if src is not None:
                     sem += f"\n\nDefinition:\n{src}"
             return _mk_ret(sem)
@@ -323,7 +327,11 @@ def mk_query_by_name_tool(
                 try:
                     sem, uk = await query_by_name_raw(connection, tag, short, with_pretty=with_pretty)
                     if args.get("show_defs", False):
-                        src = await _get_definition_source(connection, tag, uk)
+                        try:
+                            src = await _get_definition_source(connection, tag, uk)
+                        except Exception:
+                            log.debug("show_defs failed for %r", short, exc_info=True)
+                            src = None
                         if src is not None:
                             sem += f"\n\nDefinition:\n{src}"
                     return _mk_ret(f"The {name} is undefined, but we find:\n{sem}")
@@ -402,7 +410,11 @@ def mk_query_by_position_tool(
             if sem is None:
                 return _mk_ret(f"{tag.label} \"{name}\" has not been interpreted yet.")
             if args.get("show_defs", False):
-                src = await _get_definition_source(connection, tag, uk)
+                try:
+                    src = await _get_definition_source(connection, tag, uk)
+                except Exception:
+                    log.debug("show_defs failed for %r", name, exc_info=True)
+                    src = None
                 if src is not None:
                     sem += f"\n\nDefinition:\n{src}"
             return _mk_ret(sem)
