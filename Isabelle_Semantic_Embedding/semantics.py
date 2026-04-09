@@ -673,17 +673,11 @@ class Semantic_Vector_Store(Vector_Store):
           type_patterns: Isabelle type pattern strings (type matching)
           theories_include: only entities from these theories
         """
-        import logging as _logging
-        import time as _time
-        _perf_log = _logging.getLogger("perf.lookup")
-        _t_lookup_start = _time.perf_counter()
-
         warnings: list[str] = []
         if not kinds:
             return [], warnings
         # candidate_names: uk → full name (for synthesizing placeholder records)
         candidate_names: dict[universal_key, str] = {}
-        _t_entities = _time.perf_counter()
         if domain is Semantic_Vector_Store.ContextAll:
             if self.connection is None:
                 return [], warnings
@@ -731,8 +725,6 @@ class Semantic_Vector_Store(Vector_Store):
             candidates = [dk for dk in domain.keys if destruct_key(dk).kind in kind_set]
         else:
             raise TypeError(f"Unknown domain type: {type(domain)}")
-        _perf_log.info("lookup: entities_of %.3fs (%d candidates)",
-                       _time.perf_counter() - _t_entities, len(candidates))
         if not candidates:
             return [], warnings
 
@@ -750,12 +742,9 @@ class Semantic_Vector_Store(Vector_Store):
         query_str = query if isinstance(query, str) else None
         reranker = (await self._get_reranker()) if query_str else None
         fetch_k = k * _RERANK_FETCH_MULTIPLIER if reranker else k
-        _t_topk = _time.perf_counter()
         top = await self.topk(query, candidates, fetch_k)
-        _perf_log.info("lookup: topk %.3fs", _time.perf_counter() - _t_topk)
         # Rerank if configured and query was a string
         if reranker is not None and query_str is not None and len(top) > 1:
-            _t_rerank = _time.perf_counter()
             doc_entries: list[tuple[universal_key, SemanticRecord, str]] = []
             for uk, _score in top:
                 rec = Semantic_DB[uk]
@@ -767,8 +756,6 @@ class Semantic_Vector_Store(Vector_Store):
                 try:
                     rr = await reranker.rerank(
                         query_str, [e[2] for e in doc_entries], min(k, len(doc_entries)))
-                    _perf_log.info("lookup: rerank %.3fs (%d docs)",
-                                   _time.perf_counter() - _t_rerank, len(doc_entries))
                     reranked: list[tuple[float, SemanticRecord]] = [
                         (rr.scores[i], doc_entries[idx][1])
                         for i, idx in enumerate(rr.indices)]
@@ -780,12 +767,10 @@ class Semantic_Vector_Store(Vector_Store):
                         rec = _resolve(uk)
                         if rec is not None and rec.name not in reranked_set:
                             reranked.append((score, rec))
-                    _perf_log.info("lookup: total %.3fs", _time.perf_counter() - _t_lookup_start)
                     return reranked[:k], warnings
                 except Exception as e:
                     import logging
                     logging.getLogger(__name__).warning("Reranker failed, falling back to embedding scores: %s", e)
-        _t_resolve = _time.perf_counter()
         results: list[tuple[float, SemanticRecord] | None] = [None] * k
         n = 0
         for uk, score in top:
@@ -806,8 +791,6 @@ class Semantic_Vector_Store(Vector_Store):
                     if rec is not None:
                         results[n] = (0.0, rec)
                         n += 1
-        _perf_log.info("lookup: resolve_records %.3fs", _time.perf_counter() - _t_resolve)
-        _perf_log.info("lookup: total %.3fs", _time.perf_counter() - _t_lookup_start)
         return results[:n], warnings  # type: ignore[list-item]
 
     async def _embed_keys(self, keys: list[universal_key]) -> int:
@@ -954,21 +937,9 @@ async def _contains(arg: Any, connection: Connection) -> list[bool]:
     return Semantic_DB.contains(keys)
 
 
-def _setup_perf_logging() -> None:
-    """Ensure perf.* loggers have a stderr handler."""
-    import logging as _logging, sys as _sys
-    root = _logging.getLogger("perf")
-    if root.handlers:
-        return
-    sh = _logging.StreamHandler(_sys.stderr)
-    sh.setFormatter(_logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
-    root.addHandler(sh)
-    root.setLevel(_logging.DEBUG)
-
 @isabelle_remote_procedure("Semantic_Embedding.query_knn")
 async def _query_knn(arg: Any, connection: Connection) -> tuple[
         list[tuple[float, tuple[int, str]]], list[str]]:
-    _setup_perf_logging()
     (query_str, k, kind_ints, domain_raw,
      term_patterns, type_patterns, theories_include, name_contains) = arg
     kinds = [EntityKind(ki) for ki in kind_ints]

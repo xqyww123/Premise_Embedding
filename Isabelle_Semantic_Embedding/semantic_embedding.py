@@ -65,13 +65,9 @@ class Embedding_Provider(ABC):
     async def _embed_cached(self, text: list[str],
                       backend: 'Callable[[list[str]], Awaitable[EmbedResult]]') -> EmbedResult:
         """Per-string cache lookup, chunk misses, call backend with retry, cache incrementally."""
-        import logging as _logging
-        _perf_log = _logging.getLogger("perf.embed_cached")
-        _t0 = time.perf_counter()
         cache = self._get_cache()
         results: list[np.ndarray | None] = [None] * len(text)
         misses: list[tuple[int, str]] = []
-        _t_cache = time.perf_counter()
         for i, t in enumerate(text):
             cached = cache.get((self.model, t))
             if cached is not None:
@@ -79,8 +75,6 @@ class Embedding_Provider(ABC):
             else:
                 misses.append((i, t))
         hits = len(text) - len(misses)
-        _perf_log.info("embed_cached: cache_lookup %.3fs (%d hits, %d misses)",
-                       time.perf_counter() - _t_cache, hits, len(misses))
         if not misses:
             await self._log(f"[Embedding Cache] {self.model}: all {hits} texts cached")
             return EmbedResult(np.stack(results), 0)  # type: ignore
@@ -98,10 +92,7 @@ class Embedding_Provider(ABC):
             last_err: Exception | None = None
             for attempt in range(10):
                 try:
-                    _t_api = time.perf_counter()
                     embed_result = await backend(chunk_texts)
-                    _perf_log.info("embed_cached: api_call %.3fs (chunk %d/%d, %d texts)",
-                                   time.perf_counter() - _t_api, ci // chunk_size + 1, total_chunks, len(chunk))
                     break
                 except Exception as e:
                     last_err = e
@@ -113,13 +104,9 @@ class Embedding_Provider(ABC):
                     f"Embedding chunk {ci // chunk_size + 1}/{total_chunks} "
                     f"failed after 10 retries") from last_err
             total_tokens += embed_result.total_tokens
-            _t_store = time.perf_counter()
             for (i, t), vec in zip(chunk, embed_result.vectors):
                 cache.set((self.model, t), vec.tobytes(), expire=_EMBED_CACHE_TTL)
                 results[i] = vec
-            _perf_log.info("embed_cached: cache_store %.3fs (%d vectors)",
-                           time.perf_counter() - _t_store, len(chunk))
-        _perf_log.info("embed_cached: total %.3fs", time.perf_counter() - _t0)
         return EmbedResult(np.stack(results), total_tokens)  # type: ignore
 
     def _normalize(self, result: EmbedResult) -> EmbedResult:
@@ -585,20 +572,14 @@ class Vector_Store(ABC):
         If query is a string, it is embedded via emb_provider first.
         Keys missing from LMDB are passed to _auto_embed for recovery.
         Uses faiss.knn directly on the assembled matrix (no index)."""
-        import logging as _logging
-        _perf_log = _logging.getLogger("perf.topk")
-        _t0 = time.perf_counter()
         if isinstance(query, str):
             if self.connection is not None:
                 await self.connection.tracing(f"[Semantic_Embedding] embedding query: {query!r}")
-            _t_embed = time.perf_counter()
             query = (await self.emb_provider.embed([query])).vectors[0]
-            _perf_log.info("topk: query_embed %.3fs", time.perf_counter() - _t_embed)
         matrix = np.empty((len(domain), self.dimension), dtype=np.float32)
         valid_keys: list[key] = []
         missing_keys: list[key] = []
         i = 0
-        _t_lmdb = time.perf_counter()
         with self._env.begin(buffers=True) as txn:
             for dk in domain:
                 raw = txn.get(dk)
@@ -608,20 +589,13 @@ class Vector_Store(ABC):
                     i += 1
                 else:
                     missing_keys.append(dk)
-        _perf_log.info("topk: lmdb_read %.3fs (%d found, %d missing of %d domain)",
-                       time.perf_counter() - _t_lmdb, i, len(missing_keys), len(domain))
         if missing_keys:
-            _t_auto = time.perf_counter()
             recovered = await self._auto_embed(missing_keys, matrix, i)
-            _perf_log.info("topk: auto_embed %.3fs (%d recovered)", time.perf_counter() - _t_auto, len(recovered))
             valid_keys.extend(recovered)
             i += len(recovered)
         matrix = matrix[:i]
         if i == 0:
             return []
-        _t_faiss = time.perf_counter()
         distances, indices = faiss.knn(query.reshape(1, -1).astype(np.float32), matrix, min(k, i)) # type: ignore
-        _perf_log.info("topk: faiss_knn %.3fs (%d vectors)", time.perf_counter() - _t_faiss, i)
-        _perf_log.info("topk: total %.3fs", time.perf_counter() - _t0)
         return [(valid_keys[j], 1.0 - float(distances[0][ri]) / 2.0)
                 for ri, j in enumerate(indices[0]) if j >= 0]
