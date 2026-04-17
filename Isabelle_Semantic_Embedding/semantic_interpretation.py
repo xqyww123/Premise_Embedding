@@ -46,6 +46,8 @@ _KIND_CLASS = 4
 _KIND_LOCALE = 5
 _KIND_INTRODUCTION_RULE = 0x12
 _KIND_ELIMINATION_RULE = 0x22
+_KIND_INDUCTION_RULE = 0x32
+_KIND_CASE_SPLIT_RULE = 0x42
 _KIND_PROMPT_LABELS = {
     _KIND_CONSTANT: "constant",
     _KIND_THEOREM: "lemma",
@@ -54,6 +56,8 @@ _KIND_PROMPT_LABELS = {
     _KIND_LOCALE: "locale",
     _KIND_INTRODUCTION_RULE: "introduction rule",
     _KIND_ELIMINATION_RULE: "elimination rule",
+    _KIND_INDUCTION_RULE: "induction rule",
+    _KIND_CASE_SPLIT_RULE: "case-split rule",
 }
 _BATCH_SIZE = 20
 
@@ -267,7 +271,8 @@ _answer_schema = {
                     "type": {
                         "type": "string",
                         "enum": ["constant", "lemma", "type", "typeclass", "locale",
-                                 "introduction rule", "elimination rule"]
+                                 "introduction rule", "elimination rule",
+                                 "induction rule", "case-split rule"]
                     },
                     "name": {
                         "type": "string",

@@ -77,7 +77,9 @@ signature SEMANTIC_STORE = sig
      classes: Remote_Procedure_Calling.callback',
      locales: Remote_Procedure_Calling.callback',
      introduction_rules: Remote_Procedure_Calling.callback',
-     elimination_rules: Remote_Procedure_Calling.callback'}
+     elimination_rules: Remote_Procedure_Calling.callback',
+     induction_rules: Remote_Procedure_Calling.callback',
+     case_split_rules: Remote_Procedure_Calling.callback'}
 end
 
 structure Semantic_Store : SEMANTIC_STORE = struct
@@ -283,6 +285,10 @@ local
     | entity_kind_rank (Named_Introduction_Rule _) = 5
     | entity_kind_rank (Elimination_Rule _) = 6
     | entity_kind_rank (Named_Elimination_Rule _) = 6
+    | entity_kind_rank (Induction_Rule _) = 7
+    | entity_kind_rank (Named_Induction_Rule _) = 7
+    | entity_kind_rank (Case_Split_Rule _) = 8
+    | entity_kind_rank (Named_Case_Split_Rule _) = 8
     | entity_kind_rank _ = 10
 in
 fun key_kind_ord (k1, k2) = int_ord (entity_kind_rank k1, entity_kind_rank k2)
@@ -328,6 +334,14 @@ fun build_entries (context : Context.generic)
           (pp (Thm.prop_of thm)
            handle ERROR msg =>
              (warning ("mk_prop_str: Elimination_Rule pp failed: " ^ msg); raise ERROR msg))
+      | Universal_Key.Induction_Rule thm =>
+          (pp (Thm.prop_of thm)
+           handle ERROR msg =>
+             (warning ("mk_prop_str: Induction_Rule pp failed: " ^ msg); raise ERROR msg))
+      | Universal_Key.Case_Split_Rule thm =>
+          (pp (Thm.prop_of thm)
+           handle ERROR msg =>
+             (warning ("mk_prop_str: Case_Split_Rule pp failed: " ^ msg); raise ERROR msg))
       | Universal_Key.Constant cname =>
           (let val T = Consts.the_constraint (Sign.consts_of thy) cname
            in pp_typ T end
@@ -345,6 +359,16 @@ fun extract_intro_rules ctx =
 fun extract_elim_rules ctx =
   let val cs = Classical.rep_cs (Classical.get_cs ctx)
   in map #1 (Item_Net.content (#safeEs cs) @ Item_Net.content (#unsafeEs cs)) end
+
+fun extract_induct_rules ctx =
+  let val ctxt = Context.cases Proof_Context.init_global I ctx
+      val {type_induct, pred_induct, ...} = Induct.dest_rules ctxt
+  in map snd (type_induct @ pred_induct) end
+
+fun extract_case_split_rules ctx =
+  let val ctxt = Context.cases Proof_Context.init_global I ctx
+      val {type_cases, pred_cases, ...} = Induct.dest_rules ctxt
+  in map snd (type_cases @ pred_cases) end
 
 (* --- Theorem cache: pre-computed non-infra theorems with universal keys --- *)
 
@@ -433,7 +457,11 @@ fun make_entity_callbacks context =
     introduction_rules = Context_Callbacks.make_introduction_rules_callback
       extract_intro_rules (SOME (not o is_infra_thm)) context,
     elimination_rules = Context_Callbacks.make_elimination_rules_callback
-      extract_elim_rules (SOME (not o is_infra_thm)) context
+      extract_elim_rules (SOME (not o is_infra_thm)) context,
+    induction_rules = Context_Callbacks.make_induction_rules_callback
+      extract_induct_rules (SOME (not o is_infra_thm)) context,
+    case_split_rules = Context_Callbacks.make_case_split_rules_callback
+      extract_case_split_rules (SOME (not o is_infra_thm)) context
   } end
 
 fun interpret' (context : Context.generic) : usage * usage =
@@ -544,11 +572,27 @@ fun interpret' (context : Context.generic) : usage * usage =
                in SOME (entity, name, pos,
                     Universal_Key.key_of NONE context entity) end)
 
+    (* 5c. Extract induction and case-split rules *)
+    val induct_entries = Theory_Structure.get_induction_rules_with_positions context
+      |> map_filter (fn (name, pos, thm) =>
+          if is_infra_thm (name, thm) then NONE
+          else let val entity = Universal_Key.Induction_Rule thm
+               in SOME (entity, name, pos,
+                    Universal_Key.key_of NONE context entity) end)
+
+    val case_split_entries = Theory_Structure.get_case_split_rules_with_positions context
+      |> map_filter (fn (name, pos, thm) =>
+          if is_infra_thm (name, thm) then NONE
+          else let val entity = Universal_Key.Case_Split_Rule thm
+               in SOME (entity, name, pos,
+                    Universal_Key.key_of NONE context entity) end)
+
     (* 6. Build entries list, sorted by source position. *)
     val all_entries_with_pos =
       (const_entries @ deduped_thm_entries
        @ type_entries @ class_entries @ locale_entries
-       @ intro_entries @ elim_entries)
+       @ intro_entries @ elim_entries
+       @ induct_entries @ case_split_entries)
       |> sort entry_ord
     val entries = build_entries context all_entries_with_pos
   in
@@ -558,10 +602,12 @@ fun interpret' (context : Context.generic) : usage * usage =
       val uk_cb = Universal_Key.make_universal_key_callback context
       val theory_info_cb = Context_Callbacks.make_theory_long_name_and_path_callback context
       val {constants, theorems, types, classes, locales,
-           introduction_rules, elimination_rules} = make_entity_callbacks context
+           introduction_rules, elimination_rules,
+           induction_rules, case_split_rules} = make_entity_callbacks context
       val cmd = make_interpret_file_cmd [uk_cb, theory_info_cb,
             constants, theorems, types, classes, locales,
-            introduction_rules, elimination_rules]
+            introduction_rules, elimination_rules,
+            induction_rules, case_split_rules]
 
       (* 8. Call RPC command *)
       val thy_key = Universal_Key.key_of_theory' thy
@@ -679,10 +725,12 @@ fun interpret_entities (context : Context.generic) (entities : Universal_Key.ent
         val uk_cb = Universal_Key.make_universal_key_callback context
         val theory_info_cb = Context_Callbacks.make_theory_long_name_and_path_callback context
         val {constants, theorems, types, classes, locales,
-             introduction_rules, elimination_rules} = make_entity_callbacks context
+             introduction_rules, elimination_rules,
+             induction_rules, case_split_rules} = make_entity_callbacks context
         val cmd = make_interpret_file_cmd [uk_cb, theory_info_cb,
               constants, theorems, types, classes, locales,
-              introduction_rules, elimination_rules]
+              introduction_rules, elimination_rules,
+              induction_rules, case_split_rules]
         val thy_key = Universal_Key.key_of_theory' thy
         val rpc_arg = {
           file_path = thy_file_path,
@@ -735,10 +783,12 @@ fun pack_search_domain ContextAll =
 fun query_knn (context : Context.generic) =
   let
     val {constants, theorems, types, classes, locales,
-         introduction_rules, elimination_rules} = make_entity_callbacks context
+         introduction_rules, elimination_rules,
+         induction_rules, case_split_rules} = make_entity_callbacks context
     val callbacks = [
       constants, theorems, types, classes, locales,
       introduction_rules, elimination_rules,
+      induction_rules, case_split_rules,
       make_interpret_theory_callback context,
       Context_Callbacks.make_theory_long_name_callback context,
       Config.make_config_lookup_callback context
@@ -803,10 +853,12 @@ fun embed_all_entities_in_theories (force : bool) (context : Context.generic) (t
         val _ = tracing ("[Semantic_Store] embed_all_entities_in_theories: " ^
                    Int.toString (length unembedded) ^ " theories to embed")
         val {constants, theorems, types, classes, locales,
-             introduction_rules, elimination_rules} = make_entity_callbacks context
+             introduction_rules, elimination_rules,
+             induction_rules, case_split_rules} = make_entity_callbacks context
         val callbacks = [
           constants, theorems, types, classes, locales,
           introduction_rules, elimination_rules,
+          induction_rules, case_split_rules,
           Universal_Key.make_universal_key_callback context,
           Config.make_config_lookup_callback context
         ]

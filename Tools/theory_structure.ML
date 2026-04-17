@@ -10,6 +10,8 @@ signature THEORY_STRUCTURE = sig
   val parse_thm_name : string -> string * int option
   val get_introduction_rules_with_positions : Context.generic -> (string * Position.T * thm) list
   val get_elimination_rules_with_positions  : Context.generic -> (string * Position.T * thm) list
+  val get_induction_rules_with_positions    : Context.generic -> (string * Position.T * thm) list
+  val get_case_split_rules_with_positions   : Context.generic -> (string * Position.T * thm) list
   val get_entities_with_positions : Context.generic -> Universal_Key.entity list ->
     (string * Position.T) list
   val get_theorems_with_positions_of : Context.generic -> Universal_Key.entity list ->
@@ -227,6 +229,39 @@ val get_elimination_rules_with_positions =
     Item_Net.content (#safeEs cs) @ Item_Net.content (#unsafeEs cs)) #"E"
 end
 
+(* Get induction / case-split rules from Induct.dest_rules.
+   The registration key (first element of each pair) is discarded;
+   Thm.get_name_hint provides the actual theorem name. *)
+local
+fun get_induct_rules_with_positions selector context =
+  let
+    val thy = Context.theory_of context
+    val thy_prefix = Context.theory_base_name thy ^ "."
+    val ctxt = Context.cases Proof_Context.init_global I context
+    val fact_space = Facts.space_of (Proof_Context.facts_of ctxt)
+    val seen : unit Strhashtab.table = Strhashtab.empty 64
+    val rules = selector (Induct.dest_rules ctxt)
+  in
+    map_filter (fn (_, thm) =>
+      let val thm = Thm.transfer thy thm
+      in if not (Thm.has_name_hint thm) then NONE
+         else let val name = Thm.get_name_hint thm
+         in if Strhashtab.defined seen name then NONE
+            else if not (String.isPrefix thy_prefix name) then NONE
+            else (Strhashtab.update seen (name, ());
+                  let val pos = case try (Name_Space.the_entry fact_space) name of
+                          SOME entry => #pos entry | NONE => Position.none
+                  in SOME (name, pos, thm) end)
+         end
+      end) rules
+  end
+in
+val get_induction_rules_with_positions =
+  get_induct_rules_with_positions (fn r => #type_induct r @ #pred_induct r)
+val get_case_split_rules_with_positions =
+  get_induct_rules_with_positions (fn r => #type_cases r @ #pred_cases r)
+end
+
 (* Look up name and position for a list of entities *)
 fun get_entities_with_positions context entities =
   let
@@ -255,9 +290,13 @@ fun get_entities_with_positions context entities =
           | Universal_Key.Named_Theorem name => (name, fact_pos name)
           | Universal_Key.Named_Introduction_Rule name => (name, fact_pos name)
           | Universal_Key.Named_Elimination_Rule name => (name, fact_pos name)
+          | Universal_Key.Named_Induction_Rule name => (name, fact_pos name)
+          | Universal_Key.Named_Case_Split_Rule name => (name, fact_pos name)
           | Universal_Key.Theorem thm => thm_name_pos thm
           | Universal_Key.Introduction_Rule thm => thm_name_pos thm
           | Universal_Key.Elimination_Rule thm => thm_name_pos thm
+          | Universal_Key.Induction_Rule thm => thm_name_pos thm
+          | Universal_Key.Case_Split_Rule thm => thm_name_pos thm
         ) entities
   end
 
