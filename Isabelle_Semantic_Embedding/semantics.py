@@ -12,6 +12,7 @@ import platformdirs
 from Isabelle_RPC_Host import Connection, isabelle_remote_procedure
 from Isabelle_RPC_Host.rpc import IsabelleError
 from Isabelle_RPC_Host.position import AsciiPosition, UnicodePosition, IsabellePosition
+from Isabelle_RPC_Host.unicode import pretty_unicode
 from Isabelle_RPC_Host.universal_key import EntityKind, UndefinedEntity, universal_key, universal_key_of, destruct_key, is_WIP
 from claude_agent_sdk import SdkMcpTool, tool
 
@@ -239,6 +240,7 @@ async def _get_definition_with_pos(
     source, start_offset, _ = cmd
     # Strip trailing "begin" keyword (part of class/locale/context command spans)
     source = _strip_trailing_begin(source)
+    source = pretty_unicode(source)
     cmd_pos = IsabellePosition(0, start_offset, pos.file)
     return (source, cmd_pos)
 
