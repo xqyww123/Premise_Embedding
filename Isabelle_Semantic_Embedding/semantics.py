@@ -38,6 +38,8 @@ def is_thy_skipped(name: str) -> bool:
     return base in _SKIP_THEORY_BASES
 
 
+migrate_on_hash_change: bool = False
+
 EXPR_DISPLAY_LIMIT = 500
 
 def trunc_expr(s: str, limit: int = EXPR_DISPLAY_LIMIT) -> str:
@@ -155,6 +157,77 @@ class _Semantic_DB:
                 txn.delete(key)
         return len(to_delete)
 
+    @staticmethod
+    def _copy_prefix(env: lmdb.Environment, old_prefix: bytes, new_prefix: bytes) -> int:
+        assert len(old_prefix) == 16 and len(new_prefix) == 16
+        count = 0
+        with env.begin(write=True) as txn:
+            cursor = txn.cursor()
+            if cursor.set_range(old_prefix):
+                while True:
+                    key = bytes(cursor.key())
+                    if not key.startswith(old_prefix):
+                        break
+                    txn.put(new_prefix + key[16:], bytes(cursor.value()))
+                    count += 1
+                    if not cursor.next():
+                        break
+        return count
+
+    def _try_migrate(self, new_key: universal_key) -> bool:
+        from Isabelle_RPC_Host.theory_hash import open_theory_hash_store
+
+        new_hash = bytes(new_key[:16])
+        th_env = open_theory_hash_store()
+        with th_env.begin() as txn:
+            raw = txn.get(new_hash)
+            if raw is None:
+                return False
+            new_name, _ = msgpack.unpackb(raw)
+            if isinstance(new_name, bytes):
+                new_name = new_name.decode("utf-8")
+
+        candidates: list[tuple[bytes, int]] = []
+        with th_env.begin() as txn:
+            for k, v in txn.cursor():
+                k = bytes(k)
+                if k == new_hash:
+                    continue
+                name, ts = msgpack.unpackb(v)
+                if isinstance(name, bytes):
+                    name = name.decode("utf-8")
+                if name == new_name:
+                    candidates.append((k, ts))
+
+        if not candidates:
+            return False
+        candidates.sort(key=lambda x: x[1], reverse=True)
+
+        sem_env = self._ensure_env()
+        old_hash: bytes | None = None
+        for candidate_hash, _ in candidates:
+            with sem_env.begin() as txn:
+                raw = txn.get(candidate_hash)
+            if raw is not None and msgpack.unpackb(raw).get(b"finished", False):
+                old_hash = candidate_hash
+                break
+
+        if old_hash is None:
+            return False
+
+        n = self._copy_prefix(sem_env, old_hash, new_hash)
+
+        cache_dir = platformdirs.user_cache_dir("Isabelle_Semantic_Embedding", "Qiyuan")
+        if os.path.isdir(cache_dir):
+            from .semantic_embedding import _get_lmdb_env
+            for entry in os.listdir(cache_dir):
+                if entry.startswith("vector_") and entry.endswith(".lmdb"):
+                    path = os.path.join(cache_dir, entry)
+                    if os.path.isdir(path):
+                        self._copy_prefix(_get_lmdb_env(path), old_hash, new_hash)
+
+        print(f"Migrated {n} entries for {new_name} from {old_hash.hex()[:12]}… to {new_hash.hex()[:12]}…")
+        return True
 
 
 Semantic_DB = _Semantic_DB()
@@ -932,7 +1005,12 @@ async def _query(arg: Any, connection: Connection) -> str | None:
 
 @isabelle_remote_procedure("Semantic_Store.is_interpreted")
 async def _is_interpreted(arg: Any, connection: Connection) -> bool:
-    return Semantic_DB.is_thy_interpreted(bytes(arg))
+    key = bytes(arg)
+    if Semantic_DB.is_thy_interpreted(key):
+        return True
+    if migrate_on_hash_change and Semantic_DB._try_migrate(key):
+        return True
+    return False
 
 
 @isabelle_remote_procedure("Semantic_Store.mark_interpreted")

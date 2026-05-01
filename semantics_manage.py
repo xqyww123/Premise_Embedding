@@ -274,6 +274,11 @@ def cmd_remove(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_collect(args: argparse.Namespace) -> None:
+    if args.reinterpret and args.migrate_on_hash_change:
+        print("Error: --reinterpret and --migrate-on-hash-change are mutually exclusive.",
+              file=sys.stderr)
+        sys.exit(1)
+
     import threading
     import time
     import asyncio
@@ -281,6 +286,8 @@ def cmd_collect(args: argparse.Namespace) -> None:
     import Isabelle_Semantic_Embedding
     import Isabelle_Semantic_Embedding.semantic_interpretation as si
     si.interpretation_model = args.model
+    import Isabelle_Semantic_Embedding.semantics as sem
+    sem.migrate_on_hash_change = args.migrate_on_hash_change
     from IsaREPL import Client
 
     logger = Isabelle_RPC_Host.mk_logger_(args.rpc_addr, None)
@@ -362,6 +369,8 @@ p_collect.add_argument("--embed-models", default="",
     help="Comma-separated embedding model names (e.g., 'fw.qwen3-embedding-8b,codestral-embed')")
 p_collect.add_argument("--reinterpret", action="store_true",
     help="Re-interpret already-finished theories to pick up new entities")
+p_collect.add_argument("--migrate-on-hash-change", action="store_true",
+    help="Copy old data to new hash instead of re-interpreting when hash changes")
 
 # list
 p_list = sub.add_parser("list", help="List all theories in the semantic database")
