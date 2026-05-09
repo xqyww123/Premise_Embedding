@@ -85,6 +85,66 @@ fun gen_infra_filters (context : Context.generic)
       in (all_names, prefixes) end
     val preserved_set = Strhashtab.make_set preserved_names
 
+    (* BNF origin position set: positions (file, offset) where BNF-generated constants live.
+       Used to distinguish auto-generated ADT constants from lift_definition/user constants. *)
+    val bnf_origin_pos_set =
+      let
+        fun safe_const_name t = try (fst o Term.dest_Const) t
+        fun collect_bnf_names T =
+          let
+            val from_ctr = case Context.cases Ctr_Sugar.ctr_sugar_of_global Ctr_Sugar.ctr_sugar_of context T of
+                NONE => []
+              | SOME cs =>
+                  map const_name (#ctrs cs)
+                  @ maps (map const_name) (#selss cs)
+                  @ [const_name (#casex cs)]
+                  @ map_filter safe_const_name (#discs cs)
+            val from_bnf = case Context.cases BNF_Def.bnf_of_global BNF_Def.bnf_of context T of
+                NONE => []
+              | SOME bnf =>
+                  [const_name (BNF_Def.map_of_bnf bnf),
+                   const_name (BNF_Def.pred_of_bnf bnf),
+                   const_name (BNF_Def.rel_of_bnf bnf)]
+                  @ map const_name (BNF_Def.sets_of_bnf bnf)
+            val from_fp = case Context.cases BNF_FP_Def_Sugar.fp_sugar_of_global BNF_FP_Def_Sugar.fp_sugar_of context T of
+                NONE => []
+              | SOME fp =>
+                  let val res = #fp_res fp
+                      val co_rec_names = case #fp_co_induct_sugar fp of
+                          NONE => []
+                        | SOME sugar => map_filter safe_const_name [#co_rec sugar]
+                  in
+                    map_filter safe_const_name
+                      (#ctors res @ #dtors res @ #xtor_un_folds res @ #xtor_co_recs res)
+                    @ co_rec_names
+                  end
+            val from_pre_bnf = case Context.cases BNF_FP_Def_Sugar.fp_sugar_of_global BNF_FP_Def_Sugar.fp_sugar_of context T of
+                NONE => []
+              | SOME fp =>
+                  let val pre = #pre_bnf fp
+                  in map_filter safe_const_name
+                      ([BNF_Def.map_of_bnf pre] @ BNF_Def.sets_of_bnf pre)
+                  end
+          in from_ctr @ from_bnf @ from_fp @ from_pre_bnf end
+        val all_bnf_names = maps collect_bnf_names type_names
+        fun pos_key_of cname =
+          case try (Name_Space.the_entry const_space) cname of
+            NONE => NONE
+          | SOME entry =>
+              (case (Position.file_of (#pos entry), Position.offset_of (#pos entry)) of
+                (SOME file, SOME offset) => SOME (String.concat [file, "\t", Int.toString offset])
+              | _ => NONE)
+      in Strhashtab.make_set (map_filter pos_key_of all_bnf_names) end
+
+    fun on_bnf_origin_pos name =
+      case try (Name_Space.the_entry const_space) name of
+        NONE => false
+      | SOME entry =>
+          (case (Position.file_of (#pos entry), Position.offset_of (#pos entry)) of
+            (SOME file, SOME offset) =>
+              Strhashtab.defined bnf_origin_pos_set (String.concat [file, "\t", Int.toString offset])
+          | _ => false)
+
     (* Quotient type infrastructure constants:
        - Abs_T/Rep_T (typedef-level; users work with quotient-level abs_T/rep_T instead)
        - pcr_T/cr_T (Lifting package correspondence relations) *)
@@ -149,6 +209,8 @@ fun gen_infra_filters (context : Context.generic)
         SOME result => result
       | NONE =>
           let val result =
+            not (Strhashtab.defined preserved_set name)
+            andalso (
             Name_Space.is_concealed const_space name
             orelse is_hidden const_space name
             orelse exists (fn pfx => String.isPrefix pfx name) internal_prefixes
@@ -156,14 +218,16 @@ fun gen_infra_filters (context : Context.generic)
             orelse exists (fn infix_ => String.isSubstring infix_ name) inst_infixes
             orelse has_class_variant name
             orelse Strhashtab.defined quotient_typedef_infra name
+            orelse let val base = Long_Name.base_name name
+                   in String.isPrefix "Abs_" base orelse String.isPrefix "Rep_" base end
             orelse (exists (fn pfx => String.isPrefix pfx name) adt_record_prefixes
-                    andalso not (Strhashtab.defined preserved_set name))
+                    andalso on_bnf_origin_pos name)
             orelse String.isSubstring ".class." name
             orelse (String.isSuffix "_class" (Long_Name.base_name name)
                     andalso returns_prop (case typ_opt of
                               SOME T => T
                             | NONE => (case try (Consts.the_constraint consts) name of
-                                         SOME T => T | NONE => dummyT)))
+                                         SOME T => T | NONE => dummyT))))
               val _ = Strhashtab.update infra_const_cache (name, result)
           in result end
     fun is_infra_const name = is_infra_const' name NONE
