@@ -1,5 +1,6 @@
 signature INFRA_FILTER = sig
   val smart_size_of_term : term -> int
+  val is_infra_session : theory -> bool
   val gen_infra_filters : Context.generic ->
     {is_infra_const: string -> bool,
      is_infra_thm: string * thm -> bool,
@@ -12,6 +13,11 @@ end
 structure Infra_Filter : INFRA_FILTER = struct
 
 val smart_size_of_term = smart_size_of_term (* from Performant_Isabelle_ML *)
+
+val infra_session_names = ["HOL-Decision_Procs"]
+fun is_infra_session thy =
+  member (op =) infra_session_names
+    (Long_Name.qualifier (Context.theory_long_name thy))
 
 fun gen_infra_filters (context : Context.generic)
     : {is_infra_const: string -> bool,
@@ -175,10 +181,16 @@ fun gen_infra_filters (context : Context.generic)
     (* Class instance constant infixes *)
     val inst_infixes = map (fn T => "_" ^ Long_Name.base_name T ^ "_inst.") type_names
 
-    val internal_prefixes = ["Lifting.", "BNF_Def.", "Transfer.", "BNF_Cardinal_Order_Relation.",
-          "HOL.equal", "ATP.", "Code_Evaluation."]
+    val infra_session_thy_prefixes =
+      map_filter (fn anc =>
+        if is_infra_session anc
+        then SOME (Context.theory_base_name anc ^ ".")
+        else NONE) (Theory.ancestors_of thy)
 
-    val infra_theory_prefixes = ["Code_Evaluation.", "Num."]
+    val internal_prefixes = ["Lifting.", "BNF_Def.", "Transfer.", "BNF_Cardinal_Order_Relation.",
+          "HOL.equal", "ATP.", "Code_Evaluation."] @ infra_session_thy_prefixes
+
+    val infra_theory_prefixes = ["Code_Evaluation.", "Num."] @ infra_session_thy_prefixes
     fun is_from_infra_theory name =
       exists (fn pfx => String.isPrefix pfx name) infra_theory_prefixes
 

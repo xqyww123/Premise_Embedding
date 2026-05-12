@@ -178,6 +178,8 @@ end (*local RPC wrappers*)
 val base_theory_ids = map Context.theory_identifier
       [@{theory Code_Generator}, @{theory Pure}, @{theory Code_Evaluation}]
 
+val is_infra_session = Infra_Filter.is_infra_session
+
 (* --- RPC protocol --- *)
 
 local
@@ -684,6 +686,7 @@ fun collect_uninterpreted (force : bool) thy =
       let val id = Context.theory_identifier thy
       in
         if (not force andalso is_interpreted thy) orelse Inthashtab.defined seen id
+           orelse is_infra_session thy
         then acc
         else
           let val _ = Inthashtab.update seen (id, ())
@@ -888,7 +891,7 @@ fun embed_all_entities_in_theories (force : bool) (context : Context.generic) (t
     fun collect thy acc =
       let val id = Context.theory_identifier thy
       in
-        if Inthashtab.defined seen id then acc
+        if Inthashtab.defined seen id orelse is_infra_session thy then acc
         else
           let val _ = Inthashtab.update seen (id, ())
               val name = Context.theory_long_name thy
