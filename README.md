@@ -93,7 +93,7 @@ Key operations:
 
 `Semantic_Vector_Store` (in `semantics.py`) extends `Vector_Store` with:
 - **Auto-interpretation**: when vectors are missing, automatically interprets uninterpreted theories (if `auto_interpret_for_embedding` is enabled), fetches semantic texts from `Semantic_DB`, embeds them, and stores the vectors
-- **Model resolution**: reads from Isabelle config `Semantic_Embedding.embedding_model`, then env var `EMBEDDING_MODEL`, then defaults to `oai.text-embedding-3-small`
+- **Model resolution**: reads from Isabelle config `Semantic_Embedding.embedding_model`, then env var `EMBEDDING_MODEL`, then defaults to `qwen3-embedding-8b`
 - **Per-connection registry**: each `Connection` maintains a dict of stores by model name, accessed via `connection.semantic_vector_store(model_name)`
 
 `lookup(query, k, kinds, domain)` combines entity filtering with k-NN search:

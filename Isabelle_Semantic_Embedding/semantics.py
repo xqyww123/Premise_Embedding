@@ -582,11 +582,11 @@ class Semantic_Vector_Store(Vector_Store):
         connection: Connection | None = None,
     ):
         if emb_provider is None:
-            emb_provider = os.getenv("EMBEDDING_MODEL", "fw.qwen3-embedding-8b")
+            emb_provider = os.getenv("EMBEDDING_MODEL", "qwen3-embedding-8b")
         if isinstance(emb_provider, str):
             model_name = emb_provider
         else:
-            model_name = getattr(emb_provider, 'model', 'custom')
+            model_name = getattr(emb_provider, '_registration_name', getattr(emb_provider, 'model', 'custom'))
         cache_dir = platformdirs.user_cache_dir("Isabelle_Semantic_Embedding", "Qiyuan")
         os.makedirs(cache_dir, exist_ok=True)
         path = os.path.join(cache_dir, f"vector_{model_name}.lmdb")
@@ -970,7 +970,7 @@ async def _resolve_embedding_model(connection: Connection | None, emb_provider: 
         name = await connection.config_lookup("Semantic_Embedding.embedding_model")
         if name:
             return name
-    return os.getenv("EMBEDDING_MODEL", "fw.qwen3-embedding-8b")
+    return os.getenv("EMBEDDING_MODEL", "qwen3-embedding-8b")
 
 
 async def _resolve_reranker_model(connection: Connection | None) -> str | None:

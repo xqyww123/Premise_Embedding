@@ -366,7 +366,7 @@ p_collect.add_argument("--session", default="HOL", help="Session qualifier for t
 p_collect.add_argument("--model", default="claude-opus-4-6",
     help="LLM model for semantic interpretation (default: claude-opus-4-6)")
 p_collect.add_argument("--embed-models", default="",
-    help="Comma-separated embedding model names (e.g., 'fw.qwen3-embedding-8b,codestral-embed')")
+    help="Comma-separated embedding model names (e.g., 'qwen3-embedding-8b,codestral-embed')")
 p_collect.add_argument("--reinterpret", action="store_true",
     help="Re-interpret already-finished theories to pick up new entities")
 p_collect.add_argument("--migrate-on-hash-change", action="store_true",

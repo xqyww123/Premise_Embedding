@@ -7,7 +7,7 @@ import os
 import pathlib
 import tempfile
 import time
-from typing import TYPE_CHECKING, Awaitable, Callable, NamedTuple, cast
+from typing import TYPE_CHECKING, Awaitable, Callable, ClassVar, NamedTuple, cast
 if TYPE_CHECKING:
     from Isabelle_RPC_Host.rpc import Connection
 import httpx
@@ -28,6 +28,7 @@ class EmbedResult(NamedTuple):
 
 class Embedding_Provider(ABC):
     type name = str
+    _registration_name: ClassVar[str]
     dimension : int
     model : str
     max_request_size: int = 2048
@@ -35,6 +36,10 @@ class Embedding_Provider(ABC):
     normalize: bool = False  # L2-normalize returned vectors
     PROVIDERS: dict[name, type['Embedding_Provider']] = {}
     _cache: diskcache.Cache | None = None
+
+    @property
+    def _cache_key_prefix(self) -> str:
+        return getattr(self, '_registration_name', self.model)
 
     @abstractmethod
     async def _embed(self, text: list[str]) -> EmbedResult:
@@ -69,7 +74,7 @@ class Embedding_Provider(ABC):
         results: list[np.ndarray | None] = [None] * len(text)
         misses: list[tuple[int, str]] = []
         for i, t in enumerate(text):
-            cached = cache.get((self.model, t))
+            cached = cache.get((self._cache_key_prefix, t))
             if cached is not None:
                 results[i] = np.frombuffer(cast(bytes, cached), dtype=np.float32)
             else:
@@ -105,7 +110,7 @@ class Embedding_Provider(ABC):
                     f"failed after 10 retries") from last_err
             total_tokens += embed_result.total_tokens
             for (i, t), vec in zip(chunk, embed_result.vectors):
-                cache.set((self.model, t), vec.tobytes(), expire=_EMBED_CACHE_TTL)
+                cache.set((self._cache_key_prefix, t), vec.tobytes(), expire=_EMBED_CACHE_TTL)
                 results[i] = vec
         return EmbedResult(np.stack(results), total_tokens)  # type: ignore
 
@@ -145,6 +150,7 @@ class Embedding_Provider(ABC):
 def register_embedding_provider(name: str):
     """Class decorator to register an Embedding_Provider subclass by name."""
     def decorator(cls: type[Embedding_Provider]) -> type[Embedding_Provider]:
+        cls._registration_name = name
         Embedding_Provider.PROVIDERS[name] = cls
         return cls
     return decorator
@@ -369,13 +375,13 @@ class Qwen3_Embedding_by_Aliyun(OpenAI_Embedding_Provider):
     max_request_size = 10
     supports_batch = False
 
-@register_embedding_provider("fw.qwen3-embedding-8b")
-class Qwen3_Embedding_8B_by_Fireworks(OpenAI_Embedding_Provider):
-    base_url = "https://api.fireworks.ai/inference"
-    api_key: str | None = os.getenv("FIREWORKS_API_KEY")
-    model = "fireworks/qwen3-embedding-8b"
+@register_embedding_provider("qwen3-embedding-8b")
+class Qwen3_Embedding_8B(OpenAI_Embedding_Provider):
+    base_url = os.getenv("QWEN3_EMBEDDING_BASE_URL", "https://api.fireworks.ai/inference")
+    api_key: str | None = os.getenv("QWEN3_EMBEDDING_API_KEY")
+    model = os.getenv("QWEN3_EMBEDDING_MODEL", "fireworks/qwen3-embedding-8b")
     dimension = 4096
-    max_request_size = 2048
+    max_request_size = int(os.getenv("QWEN3_EMBEDDING_MAX_REQUEST_SIZE", "2048"))
     supports_batch = False
     normalize = True
 
@@ -413,6 +419,7 @@ class RerankResult(NamedTuple):
 
 class Reranker_Provider(ABC):
     type name = str
+    _registration_name: ClassVar[str]
     model: str
     max_documents: int = 200
     PROVIDERS: dict[name, type['Reranker_Provider']] = {}
@@ -426,6 +433,7 @@ class Reranker_Provider(ABC):
 def register_reranker_provider(name: str):
     """Class decorator to register a Reranker_Provider subclass by name."""
     def decorator(cls: type[Reranker_Provider]) -> type[Reranker_Provider]:
+        cls._registration_name = name
         Reranker_Provider.PROVIDERS[name] = cls
         return cls
     return decorator
@@ -473,11 +481,11 @@ class OpenAI_Reranker_Provider(Reranker_Provider):
         )
 
 
-@register_reranker_provider("fw.qwen3-reranker-8b")
-class Qwen3_Reranker_8B_by_Fireworks(OpenAI_Reranker_Provider):
-    base_url = "https://api.fireworks.ai/inference"
-    api_key: str | None = os.getenv("FIREWORKS_API_KEY")
-    model = "fireworks/qwen3-reranker-8b"
+@register_reranker_provider("qwen3-reranker-8b")
+class Qwen3_Reranker_8B(OpenAI_Reranker_Provider):
+    base_url = os.getenv("QWEN3_RERANKER_BASE_URL", "https://api.fireworks.ai/inference")
+    api_key: str | None = os.getenv("QWEN3_RERANKER_API_KEY")
+    model = os.getenv("QWEN3_RERANKER_MODEL", "fireworks/qwen3-reranker-8b")
     max_documents = 200
 
 
