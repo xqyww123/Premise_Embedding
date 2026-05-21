@@ -30,7 +30,6 @@ _schema = {
             "type": "object",
             "description":
                 "Parse the term under the proof context at this source position."
-                " Required for locale-local names."
                 " Omit to use the theory's global context.",
             "properties": {
                 "file": {
@@ -69,7 +68,7 @@ def mk_desugar_and_explain_tool(
     @tool(
         "desugar_and_explain",
         "Desugar an Isabelle term and annotate each constant"
-        " with its English meaning.",
+        " with its English semantic interpretation. **IMPORTANT:** Call this tool when you are uncertain about a syntax/notation!",
         input_schema=_schema,
     )
     async def desugar_and_explain_tool(args: dict[str, Any]) -> ToolCall_ret:
