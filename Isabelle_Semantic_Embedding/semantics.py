@@ -396,6 +396,49 @@ async def query_by_name_raw(
     return (sem, uk)
 
 
+async def _try_resolve_syntax_token(
+    connection: Connection, name: str, ctxt: Any,
+    with_pretty: bool, log: Any,
+) -> str | None:
+    """Try to resolve a name as a syntax/notation token via desugar_and_explain.
+
+    Returns a formatted result string if the token resolves to a known constant,
+    otherwise None.
+    """
+    _LHS = "syntax_probe_x"
+    _RHS = "syntax_probe_y"
+    syntax_patterns = [
+        (f"{_LHS} {name} {_RHS}", f"_ {name} _"),   # infix
+        (f"{name} {_LHS}", f"{name} _"),              # prefix unary
+        (f"{name} {_LHS} {_RHS}", f"{name} _ _"),    # prefix binary
+    ]
+    for pattern, display in syntax_patterns:
+        try:
+            compact_str, constants = await connection.callback(
+                "explain_term.desugar_and_explain", (ctxt, pattern))
+        except Exception:
+            continue
+        if not constants:
+            continue
+        const_name, uk_bytes = constants[0]
+        uk: universal_key = bytes(uk_bytes)
+        log.debug("resolved syntax token %r -> %s via pattern %r", name, const_name, pattern)
+        sem = Semantic_DB.query(uk, with_pretty=with_pretty)
+        if sem is not None:
+            return (
+                f'"{name}" is a notation (syntax: {display}).\n'
+                f'It desugars to: {compact_str}\n'
+                f'Underlying constant: {const_name}\n\n{sem}')
+        # Constant found but not yet interpreted — still report the resolution
+        return (
+            f'"{name}" is a notation (syntax: {display}).\n'
+            f'It desugars to: {compact_str}\n'
+            f'Underlying constant: {const_name}\n'
+            f'(Not yet interpreted. Use `query_by_name` with name="{const_name}" '
+            f'or `desugar_and_explain` for more details.)')
+    return None
+
+
 def mk_query_by_name_tool(
     connection: Connection, working_names: list[str], with_pretty: bool = True,
     file_path: str | None = None,
@@ -478,6 +521,12 @@ def mk_query_by_name_tool(
                     return _mk_ret(f"The {name} is undefined, but we find:\n{sem}")
                 except (IsabelleError, UndefinedEntity, LookupError):
                     pass
+            # Try resolving as a syntax/notation token via desugar
+            if tag == EntityKind.CONSTANT:
+                resolved = await _try_resolve_syntax_token(
+                    connection, name, ctxt, with_pretty, log)
+                if resolved is not None:
+                    return _mk_ret(resolved)
             log.warning("%s: %s", type(e).__name__, e)
             return _mk_ret(
                 str(e) + " Try using `mcp__proof__semantic_search` to find what you need.",
