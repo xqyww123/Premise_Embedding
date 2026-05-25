@@ -39,6 +39,7 @@ def is_thy_skipped(name: str) -> bool:
 
 
 migrate_on_hash_change: bool = False
+persist_wip: bool = os.getenv("SEMANTIC_PERSIST_WIP", "") != ""
 
 EXPR_DISPLAY_LIMIT = 500
 
@@ -137,8 +138,8 @@ class _Semantic_DB:
 
     def mark_interpreted(self, key: universal_key) -> None:
         """Mark a theory as interpreted (finished) in the semantic store.
-        Skips WIP (non-persistent) theories."""
-        if is_WIP(key):
+        Skips WIP (non-persistent) theories unless persist_wip is enabled."""
+        if is_WIP(key) and not persist_wip:
             return
         with self._ensure_env().begin(write=True) as txn:
             raw = txn.get(key)
@@ -474,6 +475,8 @@ def mk_query_by_name_tool(
             line = context_at.get("line")
             if isinstance(line, int) and line >= 1:
                 file = context_at.get("file") or file_path
+                if isinstance(file, str):
+                    file = _resolve_thy_path(file)
                 if file:
                     column = context_at.get("column")
                     if not isinstance(column, int) or column < 1:
@@ -738,8 +741,8 @@ class Semantic_Vector_Store(Vector_Store):
 
     def mark_thy_embedded(self, theory_key: universal_key, total_tokens: int = 0) -> None:
         """Mark a theory as fully embedded in this vector store, recording token usage.
-        Skips WIP (non-persistent) theories."""
-        if is_WIP(theory_key):
+        Skips WIP (non-persistent) theories unless persist_wip is enabled."""
+        if is_WIP(theory_key) and not persist_wip:
             return
         with self._env.begin(write=True) as txn:
             raw = txn.get(theory_key)
@@ -1068,7 +1071,7 @@ class Semantic_Vector_Store(Vector_Store):
             entries, _warnings = await entities_of(self.connection, EntityKind.ALL, # type: ignore
                                theory=thy_name, the_theory_only=True)
             keys = [k for k, _, _ in entries]
-            wip = is_WIP(thy_key)
+            wip = is_WIP(thy_key) and not persist_wip
             await self._embed_keys(keys, force=force)
             if not wip:
                 self.mark_thy_embedded(thy_key)

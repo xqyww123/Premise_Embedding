@@ -9,6 +9,7 @@ from Isabelle_RPC_Host.universal_key import universal_key
 from claude_agent_sdk import SdkMcpTool, tool
 
 from .base import ToolCall_ret, mk_ret as _mk_ret
+from .hover import _resolve_thy_path
 from .semantics import Semantic_DB, _end_of_line_column
 
 
@@ -84,6 +85,8 @@ def mk_desugar_and_explain_tool(
             line = context_at.get("line")
             if isinstance(line, int) and line >= 1:
                 file = context_at.get("file") or file_path
+                if isinstance(file, str):
+                    file = _resolve_thy_path(file)
                 if file:
                     column = context_at.get("column")
                     if not isinstance(column, int) or column < 1:

@@ -239,7 +239,7 @@ def cmd_remove(args: argparse.Namespace) -> None:
 
     # Delete from semantics DB
     total_deleted = 0
-    env = lmdb.open(SEMANTICS_DB_PATH, map_size=1 << 30)
+    env = lmdb.open(SEMANTICS_DB_PATH, map_size=1 << 33)
     with env.begin(write=True) as txn:
         to_delete: list[bytes] = []
         for key, _ in txn.cursor():
@@ -253,7 +253,7 @@ def cmd_remove(args: argparse.Namespace) -> None:
     # Delete from vector stores
     vec_deleted = 0
     for path in vec_paths:
-        venv = lmdb.open(path, map_size=1 << 30)
+        venv = lmdb.open(path, map_size=1 << 33)
         with venv.begin(write=True) as txn:
             to_delete = []
             for key, _ in txn.cursor():
@@ -301,15 +301,26 @@ def cmd_collect(args: argparse.Namespace) -> None:
     sem.migrate_on_hash_change = args.migrate_on_hash_change
     from IsaREPL import Client
 
-    logger = Isabelle_RPC_Host.mk_logger_(args.rpc_addr, None)
-    rpc_thread = threading.Thread(
-        target=Isabelle_RPC_Host.launch_server_,
-        args=(args.rpc_addr, logger), daemon=True)
-    rpc_thread.start()
-    time.sleep(1)
+    import socket
+    host, port = args.rpc_addr.split(":")
+    port = int(port)
+    rpc_already_running = False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        rpc_already_running = s.connect_ex((host, port)) == 0
+
+    if rpc_already_running:
+        print(f"RPC server already running on {args.rpc_addr}, reusing.", flush=True)
+    else:
+        logger = Isabelle_RPC_Host.mk_logger_(args.rpc_addr, None)
+        rpc_thread = threading.Thread(
+            target=Isabelle_RPC_Host.launch_server_,
+            args=(args.rpc_addr, logger), daemon=True)
+        rpc_thread.start()
+        time.sleep(1)
 
     async def main():
         async with Client(args.repl_addr, args.session, timeout=None) as c:
+            await c.set_register_thy(False)
             print("Loading theories...", flush=True)
             fullnames = await c.load_theory([args.theory, "Semantic_Embedding.Semantic_Collection_App"])
             print(f"Loaded: {fullnames}", flush=True)
