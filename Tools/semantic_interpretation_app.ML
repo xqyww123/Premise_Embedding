@@ -19,10 +19,18 @@ val _ = REPL_Server.register_app "Semantic_Store.collect" (fn (cin, cout, state)
     fun read unpacker =
       let val (ret, cin') = doUnpack unpacker (!cin)
       in cin := cin'; ret end
-    fun send msg = (REPL_Server.output cout packString msg;
-                    BinIO.StreamIO.flushOut cout)
-    fun done () = (REPL_Server.output cout packUnit ();
-                   BinIO.StreamIO.flushOut cout)
+    (* Serialize output: under -o threads>1 several interpret' worker threads
+       stream tracing concurrently through these channels; without the lock their
+       msgpack frames would interleave and corrupt the socket stream. *)
+    val send_lock = Synchronized.var "Semantic_Store.collect.send" ()
+    fun send msg =
+      Synchronized.change send_lock (fn () =>
+        (REPL_Server.output cout packString msg;
+         BinIO.StreamIO.flushOut cout))
+    fun done () =
+      Synchronized.change send_lock (fn () =>
+        (REPL_Server.output cout packUnit ();
+         BinIO.StreamIO.flushOut cout))
   in
     \<^try>\<open>
       let

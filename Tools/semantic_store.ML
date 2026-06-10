@@ -777,6 +777,88 @@ fun collect_uninterpreted (force : bool) thy =
       end
   in collect thy [] end
 
+(* Scheduler state for DAG-parallel interpretation (one Isabelle session).
+   See contrib/Semantic_Embedding plan: width N = Multithreading.max_threads (),
+   blocking interpret' runs on off-pool Isabelle_Thread workers, concurrency bounded
+   by `running < n`, a theory is admitted only after all its in-set ancestors are
+   `done` (so its agent can read their interpretations from LMDB). Failure policy is
+   HARD CRASH: the first error sets `failed`, all siblings are interrupted, and the
+   exception is reraised out of `interpret` (the pipeline is resume-by-design). *)
+type sched_state =
+  {running: int, completed: int, done: Intset.T,
+   failed: exn option, total: usage, hist: usage}
+
+fun interpret_parallel (n : int) (theories : theory list) : usage * usage =
+  let
+    val collected_ids = Intset.make (map Context.theory_identifier theories)
+    (* deps = transitive ancestors restricted to the collected set, so a skipped /
+       already-interpreted intermediate never drops a real prerequisite edge. *)
+    val nodes = map (fn thy =>
+      {id = Context.theory_identifier thy,
+       thy = thy,
+       deps =
+         Theory.ancestors_of thy
+         |> map Context.theory_identifier
+         |> filter (Intset.member collected_ids)
+         |> Intset.make}) theories
+    val total_count = length nodes
+
+    val st = Synchronized.var "Semantic_Store.interpret_sched"
+      ({running = 0, completed = 0, done = Intset.empty, failed = NONE,
+        total = zero_usage, hist = zero_usage} : sched_state)
+
+    fun admit {id = _, thy = _, deps} =
+      Synchronized.guarded_access st
+        (fn (s as {running, completed, done, failed, total, hist}) =>
+          if is_some failed then SOME (false, s)
+          else if running < n andalso Intset.subset (deps, done)
+          then SOME (true, {running = running + 1, completed = completed,
+                            done = done, failed = failed, total = total, hist = hist})
+          else NONE)
+
+    fun finish id (cur, cum) =
+      Synchronized.change st
+        (fn {running, completed, done, failed, total, hist} =>
+          {running = running - 1, completed = completed + 1,
+           done = Intset.insert id done, failed = failed,
+           total = add_usage (total, cur), hist = add_usage (hist, cum)})
+
+    fun set_failed exn =
+      Synchronized.change st
+        (fn {running, completed, done, failed, total, hist} =>
+          {running = running, completed = completed, done = done,
+           failed = SOME (the_default exn failed), total = total, hist = hist})
+
+    (* `\<^try> ... catch` re-raises interrupts and only routes genuine errors to
+       set_failed; bare `handle exn =>` would be a compile error here. *)
+    fun worker (node as {id, thy, deps = _}) () =
+      \<^try>\<open>
+        if admit node
+        then
+          let val (cur, cum) = interpret' (Context.Theory thy)
+              val _ = mark_interpreted thy
+          in finish id (cur, cum) end
+        else ()  (* failure already recorded: skip cleanly, no deadlock *)
+      catch exn => set_failed exn\<close>
+
+    val params =
+      Isabelle_Thread.interrupts (Isabelle_Thread.params "Semantic_Store.interpret")
+    val handles = map (fn node => Isabelle_Thread.fork params (worker node)) nodes
+
+    (* Wait until a failure occurs or all theories have finished. *)
+    val _ = Synchronized.guarded_access st
+      (fn (s as {failed, completed, running = _, done = _, total = _, hist = _}) =>
+        if is_some failed orelse completed = total_count
+        then SOME ((), s) else NONE)
+
+    val {failed, total, hist, running = _, completed = _, done = _} =
+      Synchronized.value st
+    val _ = if is_some failed
+            then List.app Isabelle_Thread.interrupt_thread handles else ()
+    val _ = List.app Isabelle_Thread.join handles
+    val _ = case failed of SOME e => Exn.reraise e | NONE => ()
+  in (total, hist) end
+
 fun interpret (force : bool) (context : Context.generic) : unit =
   let
     val thy = Context.theory_of context
@@ -787,12 +869,25 @@ fun interpret (force : bool) (context : Context.generic) : unit =
       tracing ("[Semantic_Store] interpreting " ^
                Int.toString (length contexts) ^ " theories")
 
+    val n = Multithreading.max_threads ()
     val (total, hist) =
-      fold (fn ctx => fn (acc, hacc) =>
-        let val (cur, cum) = interpret' ctx
-            val _ = Context.cases mark_interpreted (K ()) ctx
-        in (add_usage (acc, cur), add_usage (hacc, cum)) end)
-      contexts (zero_usage, zero_usage)
+      if n <= 1
+      then
+        fold (fn ctx => fn (acc, hacc) =>
+          let val (cur, cum) = interpret' ctx
+              val _ = Context.cases mark_interpreted (K ()) ctx
+          in (add_usage (acc, cur), add_usage (hacc, cum)) end)
+        contexts (zero_usage, zero_usage)
+      else
+        let
+          val (ttotal, thist) = interpret_parallel n theories
+          (* A trailing Proof context (if any) runs last, sequentially; like the
+             sequential path it is interpreted but not marked. *)
+          val (ptotal, phist) =
+            case context of
+              Context.Proof _ => interpret' context
+            | _ => (zero_usage, zero_usage)
+        in (add_usage (ttotal, ptotal), add_usage (thist, phist)) end
 
     val _ = tracing (String.concat [
         "[Semantic_Store] total: ", fmt_usage total,

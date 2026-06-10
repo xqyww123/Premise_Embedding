@@ -49,6 +49,21 @@ def trunc_expr(s: str, limit: int = EXPR_DISPLAY_LIMIT) -> str:
 
 
 class _Semantic_DB:
+    """Process-wide LMDB-backed store of semantic interpretations.
+
+    CONCURRENCY INVARIANT — keep write methods synchronous (no ``await`` inside a
+    ``with env.begin(write=True)`` block). LMDB allows only one open write
+    transaction per environment. Under ``-o threads>1`` the Isabelle scheduler runs
+    several ``interpret_file`` coroutines concurrently on this host's single event
+    loop; they remain safe ONLY because every write-txn body here runs to completion
+    without yielding, so the loop cannot interleave two write transactions. Inserting
+    an ``await`` between ``begin(write=True)`` and the block exit would let a second
+    coroutine open a concurrent write txn and raise ``lmdb.Error`` — which, under the
+    scheduler's hard-crash policy, aborts the whole run. (``_lock`` below only guards
+    env *creation*, not write transactions.) No async lock is needed while these
+    methods stay synchronous; if a writer ever must become async, add an
+    ``asyncio.Lock`` around the write path instead of relying on this property.
+    """
     _env: lmdb.Environment | None = None
     _lock = threading.Lock()
 
