@@ -50,9 +50,11 @@ val string_of_term : Proof.context -> term -> string
 
 end
 
-val _ = Pretty.margin_default := 100000
-
 structure Premise_Embedding_Context_Info : CONTEXT_INFO = struct
+
+(* wide margin: embedded/serialized strings must not be line-wrapped
+   (Pretty.margin_default was removed in Isabelle2025-2) *)
+val string_of_pretty = Pretty.string_of_ops (Pretty.output_ops (SOME 100000))
 
 type buffer = string list Unsynchronized.ref
 fun mk_buffer () = Unsynchronized.ref []
@@ -151,8 +153,8 @@ fun string_of_term ctxt =
               |> Config.put Printer.show_markup false
               |> Config.put Printer.show_structs false
               |> Config.put Printer.show_question_marks false
-              |> Config.put Printer.show_brackets false
-     in Syntax.string_of_term ctxt'
+     in Syntax.pretty_term ctxt'
+     #> string_of_pretty
      #> trim_markup
     end
 
@@ -191,11 +193,22 @@ fun string_of_typ ctxt =
               |> Config.put Printer.show_markup false
               |> Config.put Printer.show_structs false
               |> Config.put Printer.show_question_marks false
-              |> Config.put Printer.show_brackets false
-     in Syntax.string_of_typ ctxt'
+     in Syntax.pretty_typ ctxt'
+     #> string_of_pretty
      #> trim_markup
     end
 fun put_type ctxt buf typ = put buf (string_of_typ ctxt typ)
+
+(* Isabelle2025-2: Printer.prtabs became an abstract type; only the
+   approximative get_infix/get_prefix/get_binder queries remain, and there is
+   no interface to enumerate a constant's print productions or their arities,
+   which both functions below require (has_syntax's fallback test and
+   put_syntax's arity-directed template rendering).  The defctxt machinery is
+   not consumed by the live session (only the retired
+   sledgehammer_embedding.ML used it), so the two functions are disabled
+   rather than approximated.
+   TODO: re-implement when the defctxt embeddings are revived; the original
+   Isabelle2024 implementations are kept below.
 
 fun has_syntax ctxt =
   let val syn = Proof_Context.syntax_of ctxt
@@ -209,6 +222,11 @@ fun has_syntax ctxt =
         not (null (Symtab.lookup_list tab name'))
     end
   end
+*)
+fun has_syntax _ : string -> bool =
+  raise Fail "has_syntax: disabled under Isabelle2025-2 (prtabs is abstract; see TODO above)"
+
+(* Disabled under Isabelle2025-2 — see the comment at has_syntax above.
 
 fun put_syntax ctxt =
   let val syn = Proof_Context.syntax_of ctxt
@@ -246,6 +264,9 @@ fun put_syntax ctxt =
         end
    in pp
   end
+*)
+fun put_syntax _ : buffer -> string -> unit =
+  raise Fail "put_syntax: disabled under Isabelle2025-2 (prtabs is abstract; see TODO at has_syntax)"
 
 fun put_record ctxt buf name =
   let open Record
@@ -417,7 +438,7 @@ fun put_class ctxt00 buf locale_name =
           |> (fn L => fold (parse o Thm.prop_of) L [])
           |> distinct (op aconv)
       val (vars, typs) = Variable.constraints_of ctxt
-      val xname = Locale.extern thy locale_name
+      val xname = Locale.extern ctxt locale_name
    in put buf "class "
     ; put buf xname
     ; (if Vartab.is_empty typs then () else (

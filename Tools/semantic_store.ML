@@ -280,8 +280,9 @@ fun string_of_term ctxt =
               |> Config.put Printer.show_markup false
               |> Config.put Printer.show_structs false
               |> Config.put Printer.show_question_marks true
-              |> Config.put Printer.show_brackets false
-     in Syntax.string_of_term ctxt'
+     (* wide margin: embedded/serialized strings must not be line-wrapped *)
+     in Syntax.pretty_term ctxt'
+     #> Pretty.string_of_ops (Pretty.output_ops (SOME 100000))
      #> trim_markup
     end
 
@@ -289,7 +290,8 @@ fun string_of_typ ctxt =
     let val ctxt' = ctxt
               |> Config.put Printer.show_sorts true
               |> Config.put Printer.show_markup false
-     in Syntax.string_of_typ ctxt'
+     in Syntax.pretty_typ ctxt'
+     #> Pretty.string_of_ops (Pretty.output_ops (SOME 100000))
      #> trim_markup
     end
 
@@ -405,13 +407,17 @@ fun build_entries (context : Context.generic)
        uk, mk_prompt_hint (entity, pos)))
   end
 
+(* kind_is_elim also covers dest kinds, matching the old claset nets which
+   contained make_elim'd dest rules; the extra (?) kinds were not in the nets. *)
 fun extract_intro_rules ctx =
-  let val cs = Classical.rep_cs (Classical.get_cs ctx)
-  in map #1 (Item_Net.content (#safeIs cs) @ Item_Net.content (#unsafeIs cs)) end
+  let val ctxt = Context.cases Proof_Context.init_global I ctx
+  in map #1 (Classical.dest_decls ctxt (fn (_, {kind, ...}) =>
+       not (Bires.kind_is_elim kind) andalso not (Bires.kind_extra kind))) end
 
 fun extract_elim_rules ctx =
-  let val cs = Classical.rep_cs (Classical.get_cs ctx)
-  in map #1 (Item_Net.content (#safeEs cs) @ Item_Net.content (#unsafeEs cs)) end
+  let val ctxt = Context.cases Proof_Context.init_global I ctx
+  in map #1 (Classical.dest_decls ctxt (fn (_, {kind, ...}) =>
+       Bires.kind_is_elim kind andalso not (Bires.kind_extra kind))) end
 
 (* Query-time counterpart of Theory_Structure.get_induct_rules_with_positions:
    both sites surface the same rule set (Induct.dest_rules + suffix-matched
@@ -431,7 +437,7 @@ fun extract_induct_or_cases_rules selector suffixes ctx =
       |> map_filter (fn (_, thm) =>
           let val thm = Thm.transfer thy thm in
             if not (Thm.has_name_hint thm) then SOME thm
-            else let val n = Thm.get_name_hint thm in
+            else let val n = Thm_Name.print (Thm.get_name_hint thm) in
               if Strhashtab.defined seen n then NONE
               else (Strhashtab.update seen (n, ()); SOME thm)
             end
@@ -450,7 +456,8 @@ fun extract_induct_or_cases_rules selector suffixes ctx =
           if not (name_ends_in_any suffixes name) then []
           else map_filter (fn thm =>
             let val thm = Thm.transfer thy thm
-                val k = if Thm.has_name_hint thm then Thm.get_name_hint thm else name
+                val k = if Thm.has_name_hint thm
+                        then Thm_Name.print (Thm.get_name_hint thm) else name
             in if Strhashtab.defined seen k
                   orelse not (Theory_Structure.has_rule_shape thm) then NONE
                else (Strhashtab.update seen (k, ()); SOME thm)

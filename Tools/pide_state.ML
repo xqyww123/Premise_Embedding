@@ -174,7 +174,8 @@ fun hover_message_pide file_path symbol_offset =
     val yxml = Scala.function1 "pide_state.hover_message"
       (YXML.string_of_body input_body);
     val msg = if YXML.detect yxml
-      then (warning "hover_message: unexpected YXML markup in result"; YXML.content_of yxml)
+      then (warning "hover_message: unexpected YXML markup in result";
+            XML.content_of (YXML.parse_body yxml))
       else yxml;
   in
     if msg = "" then NONE

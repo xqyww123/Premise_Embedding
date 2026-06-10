@@ -207,7 +207,8 @@ fun get_theorems_with_positions context =
 
 (* Get introduction/elimination rules.
    Combines two sources:
-   1. Classical reasoner rules (safeIs/unsafeIs or safeEs/unsafeEs)
+   1. Classical reasoner rules (intro or elim/dest declarations, excluding
+      the "extra" intro?/elim?/dest? kinds)
    2. Name-based heuristic: facts whose base name ends with I (intro) or E (elim),
       where the preceding character is not an uppercase letter.
    Uses Thm.get_name_hint for names; rules without name hints are skipped. *)
@@ -221,7 +222,7 @@ fun has_rule_suffix suffix name =
      andalso not (Char.isUpper (String.sub (base, len - 2)))
   end
 
-fun get_rules_with_positions selector suffix context =
+fun get_rules_with_positions is_elim suffix context =
   let
     val thy = Context.theory_of context
     val thy_base = Context.theory_base_name thy
@@ -231,18 +232,22 @@ fun get_rules_with_positions selector suffix context =
     val seen : unit Strhashtab.table = Strhashtab.empty 128
 
     (* Source 1: classical reasoner *)
-    val cs = Classical.rep_cs (Classical.get_cs context)
-    val cs_results = map_filter (fn (thm, _, _) =>
+    val cs_rules = Classical.dest_decls ctxt (fn (_, {kind, ...}) =>
+      Bires.kind_is_elim kind = is_elim andalso not (Bires.kind_extra kind))
+    val cs_results = map_filter (fn (thm, _) =>
       let val thm = Thm.transfer thy thm
       in if not (Thm.has_name_hint thm) then NONE
-         else let val name = Thm.get_name_hint thm
+         else let val thm_name = Thm.get_name_hint thm
+                  val name = Thm_Name.print thm_name
       in if Strhashtab.defined seen name then NONE
          else if not (String.isPrefix thy_prefix name) then NONE
          else (Strhashtab.update seen (name, ());
-               let val pos = case try (Name_Space.the_entry fact_space) name of
+               (* the_entry is keyed on the bare fact name; the Thm_Name index
+                  selects a theorem within a fact and is not a name-space key. *)
+               let val pos = case try (Name_Space.the_entry fact_space) (#1 thm_name) of
                      SOME entry => #pos entry | NONE => Position.none
                in SOME (name, pos, thm) end)
-      end end) (selector cs)
+      end end) cs_rules
 
     (* Source 2: name-based heuristic from facts *)
     val (parent_facts, facts) = Context.cases
@@ -254,7 +259,7 @@ fun get_rules_with_positions selector suffix context =
       if not (has_rule_suffix suffix name) then []
       else map_filter (fn thm =>
         let val thm = Thm.transfer thy thm
-            val key = if Thm.has_name_hint thm then Thm.get_name_hint thm else name
+            val key = if Thm.has_name_hint thm then Thm_Name.print (Thm.get_name_hint thm) else name
         in if Strhashtab.defined seen key then NONE
            else (Strhashtab.update seen (key, ());
                  let val pos = case try (Name_Space.the_entry fact_space) name of
@@ -264,12 +269,8 @@ fun get_rules_with_positions selector suffix context =
   in cs_results @ name_results end
 
 in
-val get_introduction_rules_with_positions =
-  get_rules_with_positions (fn cs =>
-    Item_Net.content (#safeIs cs) @ Item_Net.content (#unsafeIs cs)) #"I"
-val get_elimination_rules_with_positions =
-  get_rules_with_positions (fn cs =>
-    Item_Net.content (#safeEs cs) @ Item_Net.content (#unsafeEs cs)) #"E"
+val get_introduction_rules_with_positions = get_rules_with_positions false #"I"
+val get_elimination_rules_with_positions  = get_rules_with_positions true #"E"
 end
 
 (* Get induction / case-split rules by unioning:
@@ -326,11 +327,13 @@ fun get_induct_rules_with_positions selector suffixes context =
       |> map_filter (fn (_, thm) =>
           let val thm = Thm.transfer thy thm in
             if not (Thm.has_name_hint thm) then NONE
-            else let val name = Thm.get_name_hint thm in
+            else let val thm_name = Thm.get_name_hint thm
+                     val name = Thm_Name.print thm_name in
               if Strhashtab.defined seen name
                  orelse not (String.isPrefix thy_prefix name) then NONE
               else (Strhashtab.update seen (name, ());
-                    SOME (name, pos_of name, thm))
+                    (* the name space is keyed on the bare fact name *)
+                    SOME (name, pos_of (#1 thm_name), thm))
             end
           end)
 
@@ -343,7 +346,7 @@ fun get_induct_rules_with_positions selector suffixes context =
           if not (name_ends_in_any suffixes name) then []
           else map_filter (fn thm =>
             let val thm = Thm.transfer thy thm
-                val key = if Thm.has_name_hint thm then Thm.get_name_hint thm else name
+                val key = if Thm.has_name_hint thm then Thm_Name.print (Thm.get_name_hint thm) else name
             in if Strhashtab.defined seen key
                   orelse not (String.isPrefix thy_prefix key)
                   orelse not (has_rule_shape_impl thm) then NONE
@@ -384,7 +387,7 @@ fun get_entities_with_positions context entities =
       in pos_of fact_space base end
     fun thm_name_pos thm =
       if Thm.has_name_hint thm
-      then let val name = Thm.get_name_hint thm in (name, fact_pos name) end
+      then let val name = Thm_Name.print (Thm.get_name_hint thm) in (name, fact_pos name) end
       else error "Anonymous theorem (no name hint)"
   in
     map (fn Universal_Key.Constant name => (name, pos_of const_space name)
@@ -422,8 +425,9 @@ fun get_theorems_with_positions_of context entities =
       let val thm = Thm.transfer thy thm
       in if not (Thm.has_name_hint thm)
          then error "Anonymous theorem (no name hint)"
-         else let val name = Thm.get_name_hint thm
-              in [(name, 0, pos_of name, thm, is_global name)] end
+         else let val thm_name = Thm.get_name_hint thm
+                  (* the fact space and Facts.defined are keyed on the bare fact name *)
+              in [(Thm_Name.print thm_name, 0, pos_of (#1 thm_name), thm, is_global (#1 thm_name))] end
       end
     fun from_name name =
       case Facts.lookup context facts name of
