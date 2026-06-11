@@ -22,13 +22,15 @@ object PIDE_Query {
   private def symbol_offset_to_range(
     snapshot: Document.Snapshot, offset: Int
   ): Text.Range = {
-    snapshot.snippet_command match {
-      case Some(command) =>
+    // Isabelle2025-2: snippet_command: Option[Command] became
+    // snippet_commands: List[Command]; our snippets carry one command.
+    snapshot.snippet_commands match {
+      case command :: _ =>
         // Snippet: convert from symbol offset to decoded text offset
         val start = command.chunk.decode(offset)
         val stop = command.chunk.decode(offset + 1)
         Text.Range(start, stop)
-      case None =>
+      case Nil =>
         // Live PIDE: offsets are already in the right coordinate system
         Text.Range(offset - 1, offset)
     }
@@ -123,8 +125,8 @@ object PIDE_Query {
 
     spans match {
       case Text.Info(_, Some(span_range)) :: _ =>
-        snapshot.snippet_command match {
-          case Some(command) =>
+        snapshot.snippet_commands match {
+          case command :: _ =>
             // DB snippet: ranges are in decoded text offsets, need to extract source substring
             val src = span_range.try_substring(command.source).getOrElse("")
             // Convert decoded text offsets back to symbol offsets for the return value
@@ -134,7 +136,7 @@ object PIDE_Query {
             val sym_start = symbol_offset_of_decoded(chunk, span_range.start)
             val sym_stop = symbol_offset_of_decoded(chunk, span_range.stop)
             (src, sym_start, sym_stop)
-          case None =>
+          case Nil =>
             // Live PIDE: shouldn't reach here, but handle gracefully
             ("", 0, 0)
         }
@@ -379,7 +381,7 @@ object Resolve_Positions extends Scala.Fun("pide_state.resolve_positions", threa
   override def invoke(session: Session, args: List[Bytes]): List[Bytes] = {
     val input =
       XML.Decode.list(XML.Decode.pair(XML.Decode.long, XML.Decode.int))(
-        YXML.parse_body(args.head.text))
+        YXML.parse_body(YXML.Source(args.head.text)))
 
     val snapshot = session.get_state().snapshot()
 
@@ -450,7 +452,7 @@ object Goto_Definition extends Scala.Fun("pide_state.goto_definition", thread = 
   override def invoke(session: Session, args: List[Bytes]): List[Bytes] = {
     val (file_path, offset) =
       XML.Decode.pair(XML.Decode.string, XML.Decode.int)(
-        YXML.parse_body(args.head.text))
+        YXML.parse_body(YXML.Source(args.head.text)))
 
     val state = session.get_state()
     val version = state.recent_finished.version.get_finished
@@ -495,7 +497,7 @@ object Hover_Message extends Scala.Fun("pide_state.hover_message", thread = true
   override def invoke(session: Session, args: List[Bytes]): List[Bytes] = {
     val (file_path, offset) =
       XML.Decode.pair(XML.Decode.string, XML.Decode.int)(
-        YXML.parse_body(args.head.text))
+        YXML.parse_body(YXML.Source(args.head.text)))
 
     val state = session.get_state()
     val version = state.recent_finished.version.get_finished
@@ -531,7 +533,7 @@ object Entity_At_Position extends Scala.Fun("pide_state.entity_at_position", thr
   override def invoke(session: Session, args: List[Bytes]): List[Bytes] = {
     val (file_path, offset) =
       XML.Decode.pair(XML.Decode.string, XML.Decode.int)(
-        YXML.parse_body(args.head.text))
+        YXML.parse_body(YXML.Source(args.head.text)))
 
     val state = session.get_state()
     val version = state.recent_finished.version.get_finished
@@ -566,7 +568,7 @@ object Command_At_Position extends Scala.Fun("pide_state.command_at_position", t
   override def invoke(session: Session, args: List[Bytes]): List[Bytes] = {
     val (file_path, offset) =
       XML.Decode.pair(XML.Decode.string, XML.Decode.int)(
-        YXML.parse_body(args.head.text))
+        YXML.parse_body(YXML.Source(args.head.text)))
 
     val state = session.get_state()
     val version = state.recent_finished.version.get_finished
@@ -632,7 +634,7 @@ object Probe_Command_Header extends Scala.Fun("pide_state.probe_command_header",
   override def invoke(session: Session, args: List[Bytes]): List[Bytes] = {
     val (file_path, offset) =
       XML.Decode.pair(XML.Decode.string, XML.Decode.int)(
-        YXML.parse_body(args.head.text))
+        YXML.parse_body(YXML.Source(args.head.text)))
 
     val state = session.get_state()
     val version = state.recent_finished.version.get_finished
@@ -712,7 +714,7 @@ object Command_ID_At_Position extends Scala.Fun("pide_state.command_id_at_positi
   override def invoke(session: Session, args: List[Bytes]): List[Bytes] = {
     val (file_path, offset) =
       XML.Decode.pair(XML.Decode.string, XML.Decode.int)(
-        YXML.parse_body(args.head.text))
+        YXML.parse_body(YXML.Source(args.head.text)))
 
     val state = session.get_state()
     val version = state.recent_finished.version.get_finished
