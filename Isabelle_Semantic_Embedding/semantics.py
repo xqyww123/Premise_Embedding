@@ -267,7 +267,10 @@ def clean_wip() -> int:
 
 # --- MCP tool factories ---
 
-_NAME_DESCRIPTION_BASE = "The short or full name of the entity to look up."
+_NAME_DESCRIPTION_BASE = (
+    "The short or full name of the entity to look up. "
+    "For type='constant', a notation token (e.g. an operator, infix, or binder "
+    "symbol such as '⊑') is also accepted and resolved to its underlying constant.")
 _NAME_DESCRIPTION_INTERP = (
     _NAME_DESCRIPTION_BASE +
     " For multi-variant theorems, include a '(idx)' suffix (e.g. 'conjI(2)').")
@@ -408,14 +411,30 @@ async def query_by_name_raw(
     return (sem, uk)
 
 
+async def _append_definition(
+    sem: str, connection: Connection, kind: EntityKind, uk: universal_key,
+    name: str, log: Any,
+) -> str:
+    """Append the source of the command defining *uk* to *sem* (best-effort)."""
+    try:
+        src = await _get_definition_source(connection, kind, uk)
+    except Exception:
+        log.debug("show_defs failed for %r", name, exc_info=True)
+        return sem
+    if src is None:
+        return sem
+    return sem + f"\n\nDefinition:\n{src}"
+
+
 async def _try_resolve_syntax_token(
     connection: Connection, name: str, ctxt: Any,
-    with_pretty: bool, log: Any,
+    with_pretty: bool, show_defs: bool, log: Any,
 ) -> str | None:
     """Try to resolve a name as a syntax/notation token via desugar_and_explain.
 
     Returns a formatted result string if the token resolves to a known constant,
-    otherwise None.
+    otherwise None. When *show_defs* is set, the defining command of the
+    underlying constant is appended.
     """
     _LHS = "syntax_probe_x"
     _RHS = "syntax_probe_y"
@@ -439,17 +458,22 @@ async def _try_resolve_syntax_token(
         log.debug("resolved syntax token %r -> %s via pattern %r", name, const_name, pattern)
         sem = Semantic_DB.query(uk, with_pretty=with_pretty)
         if sem is not None:
-            return (
+            result = (
                 f'"{name}" is a notation (syntax: {display}).\n'
                 f'It desugars to: {compact_str}\n'
                 f'Underlying constant: {const_name}\n\n{sem}')
-        # Constant found but not yet interpreted — still report the resolution
-        return (
-            f'"{name}" is a notation (syntax: {display}).\n'
-            f'It desugars to: {compact_str}\n'
-            f'Underlying constant: {const_name}\n'
-            f'(Not yet interpreted. Use `query` with name="{const_name}" '
-            f'or `desugar_and_explain` for more details.)')
+        else:
+            # Constant found but not yet interpreted — still report the resolution
+            result = (
+                f'"{name}" is a notation (syntax: {display}).\n'
+                f'It desugars to: {compact_str}\n'
+                f'Underlying constant: {const_name}\n'
+                f'(Not yet interpreted. Use `query` with name="{const_name}" '
+                f'or `desugar_and_explain` for more details.)')
+        if show_defs:
+            result = await _append_definition(
+                result, connection, EntityKind.CONSTANT, uk, const_name, log)
+        return result
     return None
 
 
@@ -515,13 +539,7 @@ def mk_query_by_name_tool(
                 )
             sem, uk = await query_by_name_raw(connection, tag, name, with_pretty=with_pretty, ctxt=ctxt)
             if args.get("show_defs", False):
-                try:
-                    src = await _get_definition_source(connection, tag, uk)
-                except Exception:
-                    log.debug("show_defs failed for %r", name, exc_info=True)
-                    src = None
-                if src is not None:
-                    sem += f"\n\nDefinition:\n{src}"
+                sem = await _append_definition(sem, connection, tag, uk, name, log)
             return _mk_ret(sem)
         except LookupError as e:
             return _mk_ret(str(e))
@@ -531,20 +549,15 @@ def mk_query_by_name_tool(
                 try:
                     sem, uk = await query_by_name_raw(connection, tag, short, with_pretty=with_pretty)
                     if args.get("show_defs", False):
-                        try:
-                            src = await _get_definition_source(connection, tag, uk)
-                        except Exception:
-                            log.debug("show_defs failed for %r", short, exc_info=True)
-                            src = None
-                        if src is not None:
-                            sem += f"\n\nDefinition:\n{src}"
+                        sem = await _append_definition(sem, connection, tag, uk, short, log)
                     return _mk_ret(f"The {name} is undefined, but we find:\n{sem}")
                 except (IsabelleError, UndefinedEntity, LookupError):
                     pass
             # Try resolving as a syntax/notation token via desugar
             if tag == EntityKind.CONSTANT:
                 resolved = await _try_resolve_syntax_token(
-                    connection, name, ctxt, with_pretty, log)
+                    connection, name, ctxt, with_pretty,
+                    args.get("show_defs", False), log)
                 if resolved is not None:
                     return _mk_ret(resolved)
             log.warning("%s: %s", type(e).__name__, e)

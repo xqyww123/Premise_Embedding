@@ -129,7 +129,9 @@ fun make_desugar_callback (fallback : Context.generic)
                    SOME ctx => ctx
                  | NONE => fallback)
         val ctxt = Context.proof_of context
-        val checked = Syntax.read_term ctxt term_string
+        (* mode_abbrev: type-check WITHOUT expanding abbreviations, so an
+           abbreviation resolves to its own constant, not its expansion *)
+        val checked = Proof_Context.read_term_abbrev ctxt term_string
         val compact = raw_lambda_printer ctxt checked
         val constants = extract_constants ctxt checked
       in (compact, constants) end,
