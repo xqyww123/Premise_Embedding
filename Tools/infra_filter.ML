@@ -337,10 +337,17 @@ fun gen_infra_filters (context : Context.generic)
          | NONE => Symtab.make_set (map Context.theory_long_name (thy :: ancs))
       end
     val method_space = Method.method_space context
+    (* Same concealed/hidden/shadowed guards as is_infra_named_theorems:
+       a method the agent cannot cite by name is useless to surface, and an
+       inaccessible name crashes Universal_Key.key_of_method (intern yields the
+       "??."-hidden form, the_entry then fails with "Inaccessible method"). *)
     fun is_infra_method name =
       (case try (Name_Space.the_entry method_space) name of
          SOME e => Symtab.defined main_anc_set (#theory_long_name e)
        | NONE => true)
+      orelse Name_Space.is_concealed method_space name
+      orelse is_hidden method_space name
+      orelse String.isPrefix "??." (Name_Space.extern ctxt method_space name)
 
     (* --- Named_theorems: HOL.no_atp + tool-internal collections (Step 0 dump) --- *)
     val named_theorems_blacklist = Symtab.make_set [
@@ -353,7 +360,18 @@ fun gen_infra_filters (context : Context.generic)
         "Lifting.relator_eq_onp",
         "Fun_Def.measure_function", "Fun_Def_Base.termination_simp",
         "Partial_Function.partial_function_mono"]
-    fun is_infra_named_theorems name = Symtab.defined named_theorems_blacklist name
+    (* Beyond the blacklist, drop collections the agent cannot cite by name,
+       mirroring the is_infra_thm checks above: concealed/private-scope entries
+       (e.g. Eisbach `method ... uses` parameter slots, declared concealed in a
+       private scope) and shadowed names ("??." extern).  Such names also crash
+       Universal_Key.key_of_named_theorems: Name_Space.intern yields the
+       "??."-hidden form and Name_Space.the_entry then fails with
+       "Inaccessible fact". *)
+    fun is_infra_named_theorems name =
+      Symtab.defined named_theorems_blacklist name
+      orelse Name_Space.is_concealed fact_space name
+      orelse is_hidden fact_space name
+      orelse String.isPrefix "??." (Facts.extern ctxt facts name)
   in
     {is_infra_const = is_infra_const, is_infra_thm = is_infra_thm,
      is_infra_induct_thm = is_infra_induct_thm,
