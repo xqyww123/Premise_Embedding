@@ -36,6 +36,16 @@ def is_thy_skipped(name: str) -> bool:
 migrate_on_hash_change: bool = False
 persist_wip: bool = os.getenv("SEMANTIC_PERSIST_WIP", "") != ""
 
+
+class Provenance(NamedTuple):
+    """Locale-interpretation provenance of an instance fact.
+
+    Serialized in the semantic DB as a msgpack map (None fields omitted);
+    None as a whole for ordinary entries."""
+    template_uk: 'bytes | None' = None
+    locale_uk: 'bytes | None' = None
+    qualifier: 'str | None' = None
+
 EXPR_DISPLAY_LIMIT = 500
 
 def trunc_expr(s: str, limit: int = EXPR_DISPLAY_LIMIT) -> str:
@@ -67,6 +77,9 @@ class _Semantic_DB:
         name: str
         expr: str | None
         interpretation: str | None
+        # locale-interpretation provenance; None for ordinary entries and for
+        # legacy 4-tuple records (read compatibly)
+        provenance: 'Provenance | None' = None
 
         @property
         def pretty_print(self) -> str:
@@ -97,13 +110,44 @@ class _Semantic_DB:
     def _dec(v: Any) -> str:
         return v.decode() if isinstance(v, bytes) else v
 
+    @staticmethod
+    def _decode(raw: bytes) -> 'Record':
+        """Decode a stored record; legacy 4-tuples read with provenance = None."""
+        vals = list(msgpack.unpackb(raw))
+        vals += [None] * (5 - len(vals))
+        kind, name, expr, sem, prov_raw = vals[:5]
+        d = _Semantic_DB._dec
+        prov = None
+        if isinstance(prov_raw, dict):
+            def g(k: str):
+                return prov_raw.get(k, prov_raw.get(k.encode()))
+            tuk, luk, qual = g("template_uk"), g("locale_uk"), g("qualifier")
+            prov = Provenance(
+                bytes(tuk) if tuk is not None else None,
+                bytes(luk) if luk is not None else None,
+                d(qual) if qual is not None else None)
+        return _Semantic_DB.Record(EntityKind(kind), d(name), d(expr), d(sem), prov)
+
+    @staticmethod
+    def _encode(record: 'Record') -> bytes:
+        prov_map = None
+        if record.provenance is not None:
+            prov_map = {}
+            if record.provenance.template_uk is not None:
+                prov_map["template_uk"] = record.provenance.template_uk
+            if record.provenance.locale_uk is not None:
+                prov_map["locale_uk"] = record.provenance.locale_uk
+            if record.provenance.qualifier is not None:
+                prov_map["qualifier"] = record.provenance.qualifier
+        return msgpack.packb((int(record.kind), record.name, record.expr,
+                              record.interpretation, prov_map))  # type: ignore[return-value]
+
     def __getitem__(self, key: universal_key) -> 'Record | None':
         with self._ensure_env().begin() as txn:
             raw = txn.get(key)
         if raw is None:
             return None
-        kind, name, expr, sem = msgpack.unpackb(raw)
-        return _Semantic_DB.Record(EntityKind(kind), self._dec(name), self._dec(expr), self._dec(sem))
+        return self._decode(raw)
 
     def __contains__(self, key: universal_key) -> bool:
         with self._ensure_env().begin() as txn:
@@ -116,16 +160,17 @@ class _Semantic_DB:
 
     def __setitem__(self, key: universal_key, record: 'Record') -> None:
         with self._ensure_env().begin(write=True) as txn:
-            txn.put(key, msgpack.packb(tuple(record))) # type: ignore
+            txn.put(key, self._encode(record))
 
     def update_expr(self, key: universal_key, new_expr: str) -> None:
-        """Update the expr field of an existing record, leaving interpretation intact."""
+        """Update the expr field of an existing record, leaving all other fields intact."""
         with self._ensure_env().begin(write=True) as txn:
             raw = txn.get(key)
             if raw is None:
                 return
-            kind, name, _old_expr, sem = msgpack.unpackb(raw)
-            txn.put(key, msgpack.packb((kind, name, new_expr, sem)))  # type: ignore
+            vals = list(msgpack.unpackb(raw))
+            vals[2] = new_expr
+            txn.put(key, msgpack.packb(vals))  # type: ignore
 
     def query(self, key: universal_key, with_pretty: bool = False) -> str | None:
         """Look up a semantic interpretation by universal key."""

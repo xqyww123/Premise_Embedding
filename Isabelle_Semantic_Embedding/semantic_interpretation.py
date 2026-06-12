@@ -35,7 +35,7 @@ from claude_agent_sdk.types import (
 
 from .base import ToolCall_ret, mk_ret as _mk_ret
 from .desugar import mk_desugar_and_explain_tool
-from .semantics import Semantic_DB, SemanticRecord
+from .semantics import Provenance, Semantic_DB, SemanticRecord
 
 # --- Module-level configuration ---
 
@@ -91,7 +91,11 @@ class Entry(NamedTuple):
     line_number: int     # source line (-1 if unavailable)
     universal_key: universal_key
     prompt_extra: str = ""  # extra context shown to the agent only, NOT stored as expr
-                            # (e.g. current members of a named_theorems collection)
+                            # (e.g. current members of a named_theorems collection,
+                            # or locale-interpretation provenance)
+    # locale-interpretation provenance (None for ordinary entries); stored
+    # alongside the interpretation in the semantic DB
+    provenance: "Provenance | None" = None
 
 
 class CostSummary(NamedTuple):
@@ -144,7 +148,8 @@ class InterpretationTask:
         """Write a single answer to the LMDB store."""
         entry = self.entries[task_idx]
         Semantic_DB[entry.universal_key] = SemanticRecord(
-            EntityKind(entry.kind), entry.name, entry.prop_str, sem)
+            EntityKind(entry.kind), entry.name, entry.prop_str, sem,
+            entry.provenance)
 
     def historical_cost(self) -> tuple[int, int, int, int, float]:
         """Read cumulative cost from LMDB (without modifying it)."""
@@ -688,8 +693,13 @@ async def _interpret_file(arg: Any, connection: Connection) -> InterpretationRes
             line_number=lineno,
             universal_key=bytes(uk),
             prompt_extra=pretty_unicode(hint),
+            provenance=(Provenance(
+                template_uk=bytes(prov[0]) if prov[0] is not None else None,
+                locale_uk=bytes(prov[1]) if prov[1] is not None else None,
+                qualifier=prov[2],
+            ) if prov is not None else None),
         )
-        for kind, name, prop, lineno, uk, hint in raw_entries
+        for kind, name, prop, lineno, uk, hint, prov in raw_entries
     ]
     return await interpret_file(
         connection, file_path, theory_longname, bytes(theory_key), entries
