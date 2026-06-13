@@ -440,7 +440,17 @@ fun build_entries (context : Context.generic)
     val provss =
       (case context of
          Context.Theory thy' =>
-           Locale_Instance.detect thy' (map (fn (_, name, _, uk) => (name, uk)) raw)
+           let
+             val pfacts = Context.cases Global_Theory.facts_of Proof_Context.facts_of context
+             val detected =
+               Locale_Instance.detect thy' (map (fn (_, name, _, uk) => (name, uk)) raw)
+           in
+             (* Dynamic-collection members (name = a dynamic collection) are not
+                locale instances: bypass detection so they never carry provenance. *)
+             map2 (fn (_, name, _, _) => fn d =>
+                     if Facts.is_dynamic pfacts name then [] else d)
+                  raw detected
+           end
        | Context.Proof _ => map (K []) raw)
 
     fun template_uk_of (p : Locale_Instance.provenance) =
@@ -673,20 +683,77 @@ fun process_facts_into_cache (context : Context.generic)
                 Long_Name.is_hidden (Name_Space.intern fact_space name)
              then []
              else let
-               val ethy = #theory_long_name e
                val epos = Context_Callbacks.entry_def_pos e
              in map_filter (fn thm =>
                let val thm' = Thm.transfer thy thm
                in if is_infra_thm (name, thm') then NONE
                   else SOME {
                     uk = Universal_Key.key_of_theorem' NONE context thm',
-                    name = name, thy_name = ethy,
+                    name = Context_Callbacks.Fixed (name, 0),
                     pos = epos,
-                    thm = thm'
+                    thm = thm',
+                    theories = map #1 (#2 (Universal_Key.thm_constituents context thm'))
                   } : Context_Callbacks.cached_thm_entry option
                end) thms
              end
       end) facts_to_process
+  end
+
+(* Enumerate the members of all visible non-infra dynamic collections
+   (named_theorems + raw add_thms_dynamic collections such as
+   derivative_eq_intros) as cached_thm_entry.  Members carry
+   name = Member_of_Dynamic (collection full name) and NO position; identity is
+   the content-addressed uk.  A plain single pass (runs once per AoA prep,
+   inside make_entity_callbacks) — no internal cache. *)
+fun process_dynamic_facts_into_cache (context : Context.generic)
+    (is_infra_dynamic_fact : string -> bool)
+    (is_infra_thm : string * thm -> bool)
+    : (Context_Callbacks.cached_thm_entry * int) list =
+  let
+    val thy = Context.theory_of context
+    val facts = Context.cases Global_Theory.facts_of Proof_Context.facts_of context
+    val space = Facts.space_of facts
+    val coll_names =
+      Name_Space.get_names space
+      |> filter (Facts.is_dynamic facts)
+      |> filter (not o is_infra_dynamic_fact)
+  in
+    (* Dedup members by uk, keeping the first occurrence (and its position):
+       identical theorems within a collection, or a theorem shared by several
+       collections, share a uk; keeping one avoids duplicate same-name entries
+       reaching the interpretation answer endpoint (which matches by name). *)
+    let val seen = Bytehashtab.empty 256 in
+    maps (fn coll =>
+      case Context_Callbacks.dynamic_fact_members context facts coll of
+        NONE => []
+      | SOME thms =>
+          (* index j+1 = the member's 1-based position in Facts.lookup's list
+             (numbered BEFORE infra filtering). This is the collect-time index,
+             carried out-of-band (not in the ADT) only to give members distinct
+             coll(i) names so the interpretation answer endpoint (name-keyed)
+             cannot collapse them. It is NOT authoritative for citation: the
+             query path recomputes the index live via `resolve_name`, and if the
+             collection holds aconv-duplicate props the live `coll(i)` may point
+             at the first such member rather than this exact one. That is
+             recall-only, not a correctness hazard: a whole-collection / coll(i)
+             reference is always re-resolved by Isabelle against the live
+             collection content at use time. *)
+          map_index (fn (j, thm) =>
+            let val thm' = Thm.transfer thy thm
+            in if is_infra_thm (coll, thm') then NONE
+               else SOME ({
+                 uk = Universal_Key.key_of_theorem' NONE context thm',
+                 name = Context_Callbacks.Member_of_Dynamic coll,
+                 pos = ("", 0, 0),
+                 thm = thm',
+                 theories = map #1 (#2 (Universal_Key.thm_constituents context thm'))
+               } : Context_Callbacks.cached_thm_entry, j + 1)
+            end) thms
+          |> map_filter I) coll_names
+    |> filter (fn (e, _) =>
+         if Bytehashtab.defined seen (#uk e) then false
+         else (Bytehashtab.update seen (#uk e, ()); true))
+    end
   end
 
 (* Dedup new_entries against existing entries by universal key. *)
@@ -718,12 +785,19 @@ fun make_entity_callbacks (init_context: Context.generic) (ctxt_unpack: Context_
       (* Process uncached facts now, so callbacks see 0 uncached *)
       val current_facts = Context.cases Global_Theory.facts_of Proof_Context.facts_of init_context
       val uncached_facts = Facts.dest_static false [cached_facts] current_facts
-      val combined_entries =
+      val static_combined =
         if null uncached_facts then cached_entries
         else let
           val new_entries = process_facts_into_cache init_context is_infra_thm uncached_facts
           val unique_new = dedup_against cached_entries new_entries
         in cached_entries @ unique_new end
+      (* Dynamic-collection members: snapshot once here (never enter the
+         persistent Thm_Cache).  Deduped against the static set so a member that
+         is also a static fact keeps the static (Fixed) name/position. *)
+      val member_entries =
+        dedup_against static_combined
+          (map #1 (process_dynamic_facts_into_cache init_context is_infra_dynamic_fact is_infra_thm))
+      val combined_entries = static_combined @ member_entries
       val thm_cache = SOME (combined_entries, current_facts)
   in {
     constants = Context_Callbacks.make_constants_callback (SOME (not o is_infra_const)) ctxt_unpack,
@@ -815,6 +889,28 @@ fun interpret' (context : Context.generic) : usage * usage =
         (Universal_Key.Theorem thm, name, pos, uk) :: acc)
       best_thms []
 
+    (* 5a''. Dynamic-collection members as Theorem entities, deduped against the
+       static theorems by uk (static name/pos wins).  Members carry the BARE
+       collection name into build_entries (so the locale-provenance bypass, which
+       keys on Facts.is_dynamic of the name, still fires); the unique coll(i) name
+       is applied to build_entries' OUTPUT in a post-pass below, keyed by uk.
+       `member_pos` records uk -> enumeration index for that post-pass. *)
+    val member_pos : int Bytehashtab.table = Bytehashtab.empty 256
+    val member_entries =
+      let
+        val seen = Bytehashtab.empty 256
+        val _ = List.app (fn (_, _, _, uk) => Bytehashtab.update seen (uk, ()))
+                  deduped_thm_entries
+      in
+        process_dynamic_facts_into_cache context is_infra_dynamic_fact is_infra_thm
+        |> map_filter (fn (e, i) =>
+             if Bytehashtab.defined seen (#uk e) then NONE
+             else (Bytehashtab.update member_pos (#uk e, i);
+                   SOME (Universal_Key.Theorem (#thm e),
+                         Context_Callbacks.bare_name (#name e),
+                         Position.none, #uk e)))
+      end
+
     (* 5. Extract types, classes, and locales *)
     val type_entries = Theory_Structure.get_types_with_positions context
       |> map_filter (fn (name, pos) =>
@@ -884,13 +980,23 @@ fun interpret' (context : Context.generic) : usage * usage =
 
     (* 6. Build entries list, sorted by source position. *)
     val all_entries_with_pos =
-      (const_entries @ deduped_thm_entries
+      (const_entries @ deduped_thm_entries @ member_entries
        @ type_entries @ class_entries @ locale_entries
        @ named_theorems_entries @ method_entries
        @ intro_entries @ elim_entries
        @ induct_entries @ case_split_entries)
       |> sort entry_ord
-    val entries = build_entries context all_entries_with_pos
+    val entries0 = build_entries context all_entries_with_pos
+    (* Post-pass: rename dynamic members to a unique coll(i) (i = enumeration
+       index), keyed by uk.  Applied AFTER build_entries so the locale-provenance
+       bypass (keyed on the bare collection name being dynamic) still fires; the
+       unique name is required so the interpretation answer endpoint can match
+       per-member translations back to entities (it indexes entries by name). *)
+    val entries =
+      entries0 |> map (fn (ent, nm, prop, line, uk, hint, prov, cons) =>
+        case Bytehashtab.lookup member_pos uk of
+          SOME i => (ent, nm ^ "(" ^ string_of_int i ^ ")", prop, line, uk, hint, prov, cons)
+        | NONE => (ent, nm, prop, line, uk, hint, prov, cons))
   in
     if null entries then (zero_usage, zero_usage)
     else let
@@ -1095,6 +1201,12 @@ fun make_interpret_theory_callback (ctxt_unpack : Context_Callbacks.context_unpa
     timeout = NONE
   }
 
+(* NB: unlike `interpret'`, this path does NOT enumerate dynamic-collection
+   members nor run the member_pos coll(i) post-pass — it interprets exactly the
+   `entities` it is given, under their bare names. It is currently dead (its only
+   caller in agent_server.ML is commented out), so no member entity can reach it.
+   If it is ever re-enabled with dynamic-member entities, mirror interpret's
+   member handling here. *)
 fun interpret_entities (context : Context.generic) (entities : Universal_Key.entity list) : unit =
   let
     (* 1. Compute universal keys *)

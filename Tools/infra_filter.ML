@@ -21,6 +21,15 @@ fun is_infra_session thy =
   member (op =) infra_session_names
     (Long_Name.qualifier (Context.theory_long_name thy))
 
+(* Theory base-names whose own entities are infrastructure (filtered out of
+   retrieval).  Minilang.thy defines internal proof-language plumbing
+   (TAG/GOAL/PROTECT/ISO_* constants + their _def lemmas, and helper lemmas
+   like Ball_*_comm); `hide_const (open)` only hides their short names, so the
+   fully-qualified `Minilang.*` names still leak — matched here by prefix.
+   `"Minilang."` does not match sibling theories like `Minilang_Agent.` (the
+   char after `Minilang` is `.` vs `_`). *)
+val infra_base_theory_names = ["Minilang"]
+
 fun gen_infra_filters (context : Context.generic)
     : {is_infra_const: string -> bool,
        is_infra_thm: string * thm -> bool,
@@ -193,7 +202,10 @@ fun gen_infra_filters (context : Context.generic)
     val internal_prefixes = ["Lifting.", "BNF_Def.", "Transfer.", "BNF_Cardinal_Order_Relation.",
           "HOL.equal", "ATP.", "Code_Evaluation."] @ infra_session_thy_prefixes
 
-    val infra_theory_prefixes = ["Code_Evaluation.", "Num."] @ infra_session_thy_prefixes
+    val infra_theory_prefixes =
+      ["Code_Evaluation.", "Num."]
+      @ map (fn n => n ^ ".") infra_base_theory_names
+      @ infra_session_thy_prefixes
     fun is_from_infra_theory name =
       exists (fn pfx => String.isPrefix pfx name) infra_theory_prefixes
 
@@ -228,6 +240,7 @@ fun gen_infra_filters (context : Context.generic)
             andalso (
             Name_Space.is_concealed const_space name
             orelse is_hidden const_space name
+            orelse is_from_infra_theory name  (* e.g. Minilang.* internal consts *)
             orelse exists (fn pfx => String.isPrefix pfx name) internal_prefixes
             orelse exists (fn pfx => String.isPrefix pfx name) pre_prefixes
             orelse exists (fn infix_ => String.isSubstring infix_ name) inst_infixes

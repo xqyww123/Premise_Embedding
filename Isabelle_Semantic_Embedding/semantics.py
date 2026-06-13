@@ -497,7 +497,7 @@ async def _get_definition_with_pos(
     """
     from Isabelle_RPC_Host.context import entities_of
     from .hover import command_at_position
-    entries, _ = await entities_of(connection, [kind], ctxt=ctxt)
+    entries, _, _ = await entities_of(connection, [kind], ctxt=ctxt)
     pos = None
     for key, _, p in entries:
         if key == uk:
@@ -731,6 +731,14 @@ _RERANK_FETCH_MULTIPLIER = 4
 
 class Semantic_Vector_Store(Vector_Store):
 
+    class ExtraKey(NamedTuple):
+        """A caller-supplied extra search key for ContextExtended: its universal
+        key, display name, and whether it is local (proof-context-local) to the
+        query. `is_local` drives the no-embedding default score in lookup."""
+        key: universal_key
+        name: str
+        is_local: bool = False
+
     class Domain:
         """Domain of entities to search over in lookup."""
         pass
@@ -746,11 +754,10 @@ class Semantic_Vector_Store(Vector_Store):
     ContextAll = _ContextAll()  # singleton instance
 
     class ContextExtended(Domain):
-        """All available entities at the connection's context, plus additional keys."""
-        def __init__(self, extra: list[universal_key],
-                     extra_names: dict[universal_key, str] | None = None):
+        """All available entities at the connection's context, plus additional keys.
+        Each extra is an ExtraKey carrying its name and locality."""
+        def __init__(self, extra: 'list[Semantic_Vector_Store.ExtraKey]'):
             self.extra = extra
-            self.extra_names = extra_names or {}
     @staticmethod
     def clean_all_wip_in_created_dbs() -> None:
         """Remove all WIP (non-persistent) entries from every vector store on disk."""
@@ -980,11 +987,15 @@ class Semantic_Vector_Store(Vector_Store):
             return [], warnings, 0
         # candidate_names: uk → full name (for synthesizing placeholder records)
         candidate_names: dict[universal_key, str] = {}
+        # is_local_map: uk → proof-context-local? Drives the no-embedding default
+        # score below. Theorems get it from the ML callback (via entities_of);
+        # ContextExtended.extra records carry their own; everything else non-local.
+        is_local_map: dict[universal_key, bool] = {}
         if domain is Semantic_Vector_Store.ContextAll:
             if self.connection is None:
                 return [], warnings, 0
             from Isabelle_RPC_Host.context import entities_of
-            entries, warnings = await entities_of(self.connection, kinds,
+            entries, branch_local, warnings = await entities_of(self.connection, kinds,
                                      theories_not_include=_SKIP_THEORY_LONG_NAMES,
                                      term_patterns=term_patterns,
                                      type_patterns=type_patterns,
@@ -995,11 +1006,12 @@ class Semantic_Vector_Store(Vector_Store):
             candidates = [uk for uk, _, _ in entries]
             for uk, name, _ in entries:
                 candidate_names[uk] = name
+            is_local_map.update(branch_local)
         elif isinstance(domain, Semantic_Vector_Store.ContextExtended):
             if self.connection is None:
                 return [], warnings, 0
             from Isabelle_RPC_Host.context import entities_of
-            entries, warnings = await entities_of(self.connection, kinds,
+            entries, branch_local, warnings = await entities_of(self.connection, kinds,
                                      theories_not_include=_SKIP_THEORY_LONG_NAMES,
                                      term_patterns=term_patterns,
                                      type_patterns=type_patterns,
@@ -1010,23 +1022,25 @@ class Semantic_Vector_Store(Vector_Store):
             candidates = [uk for uk, _, _ in entries]
             for uk, name, _ in entries:
                 candidate_names[uk] = name
+            is_local_map.update(branch_local)
             seen = set(candidates)
             kind_set = set(kinds)
-            for ek in domain.extra:
+            for rec in domain.extra:
+                ek = rec.key
                 if ek not in seen and destruct_key(ek).kind in kind_set:
                     candidates.append(ek)
                     seen.add(ek)
-                    if ek in domain.extra_names:
-                        candidate_names[ek] = domain.extra_names[ek]
-                    else:
-                        extra_rec = Semantic_DB[ek]
-                        if extra_rec is not None:
-                            candidate_names[ek] = extra_rec.name
-                        else:
-                            entity = destruct_key(ek)
-                            if isinstance(entity.name, str):
-                                candidate_names[ek] = entity.name
+                    candidate_names[ek] = rec.name
+                    is_local_map[ek] = rec.is_local
         elif isinstance(domain, Semantic_Vector_Store.Restricted):
+            # NB: this branch does NOT populate `candidate_names`, so results
+            # here display the DB-stored name (no live `coll(i)` override, and no
+            # drop of a stale dynamic-collection member). That is safe only
+            # because the Restricted domain is never constructed on the AoA query
+            # path (model.py builds only ContextAll / ContextExtended), so
+            # dynamic-collection-member uks cannot reach here. If a caller ever
+            # routes member uks through Restricted, populate `candidate_names`
+            # from a live ML enumeration here, mirroring the Context* branches.
             kind_set = set(kinds)
             candidates = [dk for dk in domain.keys if destruct_key(dk).kind in kind_set]
         else:
@@ -1035,15 +1049,30 @@ class Semantic_Vector_Store(Vector_Store):
             return [], warnings, 0
         total = len(candidates)
 
+        def _apply_live_name(uk: universal_key, rec: SemanticRecord) -> SemanticRecord:
+            """Prefer the live, context-resolved name (e.g. 'coll(i)' for a member
+            of a dynamic collection, computed at enumeration time) over the stored
+            bare name. For static facts the live name equals the stored name."""
+            name = candidate_names.get(uk)
+            return rec._replace(name=name) if name is not None else rec
+
         def _resolve(uk: universal_key) -> SemanticRecord | None:
             """Look up SemanticRecord, falling back to a placeholder if name is known."""
             rec = Semantic_DB[uk]
             if rec is not None:
-                return rec
+                return _apply_live_name(uk, rec)
             name = candidate_names.get(uk)
             if name is not None:
                 return SemanticRecord(EntityKind(uk[16]), name, None, None)
             return None
+
+        def _default_score(uk: universal_key) -> float:
+            """Fallback score for an entity with no embedding vector (no
+            interpretation): provider-supplied, higher for proof-context-local
+            entities. Replaces the old hardcoded 0.0; values are model-dependent."""
+            prov = self.emb_provider
+            return (prov.default_local_score if is_local_map.get(uk, False)
+                    else prov.default_score)
 
         # Save original query string for potential reranking (topk embeds it)
         query_str = query if isinstance(query, str) else None
@@ -1058,7 +1087,7 @@ class Semantic_Vector_Store(Vector_Store):
                 if rec is not None:
                     doc_text = Semantic_DB.query(uk, with_pretty=True)
                     if doc_text:
-                        doc_entries.append((uk, rec, doc_text))
+                        doc_entries.append((uk, _apply_live_name(uk, rec), doc_text))
             if doc_entries:
                 try:
                     rr = await reranker.rerank(
@@ -1078,27 +1107,40 @@ class Semantic_Vector_Store(Vector_Store):
                 except Exception as e:
                     import logging
                     logging.getLogger(__name__).warning("Reranker failed, falling back to embedding scores: %s", e)
-        results: list[tuple[float, SemanticRecord] | None] = [None] * k
-        n = 0
-        for uk, score in top:
-            if n >= k:
-                break
+        # Non-reranker path: merge embedded entities (real KNN score) with
+        # no-embedding entities (provider default score by locality), then sort by
+        # final score and take top-k ("全量按最终分重排"). Embedded entities keep their
+        # real score — the default only replaces the old 0.0 fallback, never floors a
+        # real score. Bounded resolve: at most k embedded + k local + k non-local
+        # no-embedding records are materialized (each no-embedding tier is tied at one
+        # default value, so the first k of each in candidate order suffice for top-k).
+        top_scores = dict(top)
+        scored: list[tuple[float, SemanticRecord]] = []
+        for uk, score in top:                       # embedded: real KNN scores (≤ k)
             rec = _resolve(uk)
             if rec is not None:
-                results[n] = (score, rec)
-                n += 1
-        if n < k:
-            # Pad with entities that had no embedding, assigned score 0
-            top_set = {uk for uk, _ in top}
-            for uk in candidates:
-                if n >= k:
-                    break
-                if uk not in top_set:
-                    rec = _resolve(uk)
-                    if rec is not None:
-                        results[n] = (0.0, rec)
-                        n += 1
-        return results[:n], warnings, total  # type: ignore[list-item]
+                scored.append((score, rec))
+        local_quota = nonlocal_quota = k
+        for uk in candidates:                       # no-embedding: default by locality
+            if local_quota <= 0 and nonlocal_quota <= 0:
+                break
+            if uk in top_scores:
+                continue
+            is_loc = is_local_map.get(uk, False)
+            if is_loc and local_quota <= 0:
+                continue
+            if not is_loc and nonlocal_quota <= 0:
+                continue
+            rec = _resolve(uk)
+            if rec is None:
+                continue
+            scored.append((_default_score(uk), rec))
+            if is_loc:
+                local_quota -= 1
+            else:
+                nonlocal_quota -= 1
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[:k], warnings, total
 
     async def _embed_keys(self, keys: list[universal_key], *,
                           force: bool = False) -> int:
@@ -1174,7 +1216,7 @@ class Semantic_Vector_Store(Vector_Store):
                         f"the theory may not be loaded")
             if not force and self.is_thy_embedded(thy_key):
                 continue
-            entries, _warnings = await entities_of(self.connection, EntityKind.ALL, # type: ignore
+            entries, _is_local, _warnings = await entities_of(self.connection, EntityKind.ALL, # type: ignore
                                theory=thy_name, the_theory_only=True)
             keys = [k for k, _, _ in entries]
             wip = is_WIP(thy_key) and not persist_wip
@@ -1265,10 +1307,10 @@ async def _query_knn(arg: Any, connection: Connection) -> tuple[
     if domain_tag == 0:
         domain: Semantic_Vector_Store.Domain = Semantic_Vector_Store.ContextAll
     elif domain_tag == 1:
-        extras = [(bytes(k_), name) for k_, name in domain_payload]
+        # Wire-supplied extras carry (key, name); they are not known to be local.
         domain = Semantic_Vector_Store.ContextExtended(
-            [k_ for k_, _ in extras],
-            extra_names={k_: name for k_, name in extras})
+            [Semantic_Vector_Store.ExtraKey(key=bytes(k_), name=name, is_local=False)
+             for k_, name in domain_payload])
     elif domain_tag == 2:
         domain = Semantic_Vector_Store.Restricted([bytes(uk) for uk in domain_payload])
     else:
