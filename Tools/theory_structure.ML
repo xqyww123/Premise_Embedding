@@ -210,17 +210,26 @@ fun get_theorems_with_positions context =
    Combines two sources:
    1. Classical reasoner rules (intro or elim/dest declarations, excluding
       the "extra" intro?/elim?/dest? kinds)
-   2. Name-based heuristic: facts whose base name ends with I (intro) or E (elim),
-      where the preceding character is not an uppercase letter.
+   2. Name-based heuristic: either the camelCase convention (base name ends
+      with I/E and the preceding char is not uppercase, e.g. conjI/exE), or the
+      word suffixes _intro/.intro/_intros/.intros (intro) and
+      _elim/.elim/_elims/.elims/_dest/.dest (elim), mirroring
+      auto_sledgehammer's infer_type_of_rule. dest names fold into elim,
+      matching source 1 where Bires.kind_is_elim also covers dest.
    Uses Thm.get_name_hint for names; rules without name hints are skipped. *)
 local
 
-fun has_rule_suffix suffix name =
+(* char_suffix: the camelCase last-char convention (I/E), checked on the base
+   name. word_suffixes: full-name suffixes (_intro/.intro/...), checked against
+   the long name so the dotted ".intros" form matches (its base name is just
+   "intros"). *)
+fun has_rule_suffix (char_suffix, word_suffixes) name =
   let val base = Long_Name.base_name name
       val len = size base
-  in len >= 2
-     andalso String.sub (base, len - 1) = suffix
-     andalso not (Char.isUpper (String.sub (base, len - 2)))
+  in (len >= 2
+      andalso String.sub (base, len - 1) = char_suffix
+      andalso not (Char.isUpper (String.sub (base, len - 2))))
+     orelse exists (fn s => String.isSuffix s name) word_suffixes
   end
 
 fun get_rules_with_positions is_elim suffix context =
@@ -270,8 +279,10 @@ fun get_rules_with_positions is_elim suffix context =
   in cs_results @ name_results end
 
 in
-val get_introduction_rules_with_positions = get_rules_with_positions false #"I"
-val get_elimination_rules_with_positions  = get_rules_with_positions true #"E"
+val get_introduction_rules_with_positions =
+  get_rules_with_positions false (#"I", ["_intro", ".intro", "_intros", ".intros"])
+val get_elimination_rules_with_positions  =
+  get_rules_with_positions true  (#"E", ["_elim", ".elim", "_elims", ".elims", "_dest", ".dest"])
 end
 
 (* Get induction / case-split rules by unioning:
