@@ -7,7 +7,7 @@ signature THEORY_STRUCTURE = sig
   val get_types_with_positions : Context.generic -> (string * Position.T) list
   val get_classes_with_positions : Context.generic -> (string * Position.T) list
   val get_locales_with_positions : Context.generic -> (string * Position.T) list
-  val get_named_theorems_with_positions : Context.generic -> (string * Position.T) list
+  val get_theorem_collections_with_positions : Context.generic -> (string * Position.T) list
   val get_methods_with_positions : Context.generic -> (string * Position.T) list
   val parse_thm_name : string -> string * int option
   val get_introduction_rules_with_positions : Context.generic -> (string * Position.T * thm) list
@@ -101,11 +101,12 @@ fun get_locales_with_positions context =
         else SOME (name, #pos (Name_Space.the_entry space name)))
   end
 
-(* Get named_theorems collections with positions (local definitions only).
-   Named_Theorems are registered as dynamic facts, so Facts.is_dynamic (cheap,
-   no content forcing) prefilters candidates; Named_Theorems.get then confirms
-   (only run on the few dynamic facts new to this theory). *)
-fun get_named_theorems_with_positions context =
+(* Get theorem collections with positions (local definitions only).
+   A theorem collection is any dynamic fact: a named_theorems or a raw
+   add_thms_dynamic collection (e.g. derivative_eq_intros).  Facts.is_dynamic
+   (cheap, no content forcing) identifies them all.  Infra collections are
+   filtered downstream by the caller (is_infra_dynamic_fact). *)
+fun get_theorem_collections_with_positions context =
   let
     val ctxt = Context.cases Proof_Context.init_global I context
     val facts = Proof_Context.facts_of ctxt
@@ -118,7 +119,7 @@ fun get_named_theorems_with_positions context =
     Name_Space.get_names space
     |> map_filter (fn name =>
         if Symtab.defined parent_names name then NONE
-        else if Facts.is_dynamic facts name andalso can (Named_Theorems.get ctxt) name
+        else if Facts.is_dynamic facts name
         then SOME (name, #pos (Name_Space.the_entry space name))
         else NONE)
   end
@@ -394,7 +395,7 @@ fun get_entities_with_positions context entities =
           | Universal_Key.Type name => (name, pos_of type_space name)
           | Universal_Key.Class name => (name, pos_of class_space name)
           | Universal_Key.Locale name => (name, pos_of locale_space name)
-          | Universal_Key.Named_Theorems name => (name, fact_pos name)
+          | Universal_Key.Theorem_Collection name => (name, fact_pos name)
           | Universal_Key.Method name => (name, pos_of method_space name)
           | Universal_Key.Named_Theorem name => (name, fact_pos name)
           | Universal_Key.Named_Introduction_Rule name => (name, fact_pos name)

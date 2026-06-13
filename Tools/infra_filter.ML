@@ -8,7 +8,7 @@ signature INFRA_FILTER = sig
      is_infra_type: string -> bool,
      is_infra_class: string -> bool,
      is_infra_locale: string -> bool,
-     is_infra_named_theorems: string -> bool,
+     is_infra_dynamic_fact: string -> bool,
      is_infra_method: string -> bool}
 end
 
@@ -27,7 +27,7 @@ fun gen_infra_filters (context : Context.generic)
        is_infra_induct_thm: string * thm -> bool,
        is_infra_type: string -> bool, is_infra_class: string -> bool,
        is_infra_locale: string -> bool,
-       is_infra_named_theorems: string -> bool, is_infra_method: string -> bool} =
+       is_infra_dynamic_fact: string -> bool, is_infra_method: string -> bool} =
   let
     val type_space = Context.cases Sign.type_space Proof_Context.type_space context
     val consts = Context.cases Sign.consts_of Proof_Context.consts_of context
@@ -337,7 +337,7 @@ fun gen_infra_filters (context : Context.generic)
          | NONE => Symtab.make_set (map Context.theory_long_name (thy :: ancs))
       end
     val method_space = Method.method_space context
-    (* Same concealed/hidden/shadowed guards as is_infra_named_theorems:
+    (* Same concealed/hidden/shadowed guards as is_infra_dynamic_fact:
        a method the agent cannot cite by name is useless to surface, and an
        inaccessible name crashes Universal_Key.key_of_method (intern yields the
        "??."-hidden form, the_entry then fails with "Inaccessible method"). *)
@@ -349,8 +349,12 @@ fun gen_infra_filters (context : Context.generic)
       orelse is_hidden method_space name
       orelse String.isPrefix "??." (Name_Space.extern ctxt method_space name)
 
-    (* --- Named_theorems: HOL.no_atp + tool-internal collections (Step 0 dump) --- *)
-    val named_theorems_blacklist = Symtab.make_set [
+    (* --- Theorem collections (dynamic facts): tool-internal blacklist --- *)
+    (* A theorem collection is any dynamic fact (named_theorems or raw
+       add_thms_dynamic).  The blacklist keys by fact name; it covers known
+       tool-internal collections regardless of which kind they are, so it can be
+       extended with non-named_theorems names as needed. *)
+    val dynamic_fact_blacklist = Symtab.make_set [
         "HOL.no_atp", "HOL.atomize_elim",
         "HOL.nitpick_simp", "HOL.nitpick_psimp", "HOL.nitpick_unfold", "HOL.nitpick_choice_spec",
         "HOL.code_pred_def", "HOL.code_pred_inline", "HOL.code_pred_simp",
@@ -360,15 +364,31 @@ fun gen_infra_filters (context : Context.generic)
         "Lifting.relator_eq_onp",
         "Fun_Def.measure_function", "Fun_Def_Base.termination_simp",
         "Partial_Function.partial_function_mono"]
-    (* Beyond the blacklist, drop collections the agent cannot cite by name,
-       mirroring the is_infra_thm checks above: concealed/private-scope entries
-       (e.g. Eisbach `method ... uses` parameter slots, declared concealed in a
-       private scope) and shadowed names ("??." extern).  Such names also crash
-       Universal_Key.key_of_named_theorems: Name_Space.intern yields the
+    (* Theory prefixes whose dynamic facts are all tool-internal (Transfer/Lifting
+       relators, SMT proof rules, Pure method_facts).  None of these four packages
+       emits a dynamic collection worth retrieving, so filter the whole prefix
+       rather than maintaining a per-name list.  NB: this is local to the
+       dynamic-fact filter, NOT the shared is_from_infra_theory (which also gates
+       constants/types/classes/locales). *)
+    val infra_dynamic_thy_prefixes = ["Transfer.", "Lifting.", "SMT.", "Pure."]
+    (* Codatatype packages auto-generate, per codatatype, coinduction-upto
+       congruence collections (<codatatype>.cong_* and <codatatype>.coinduct_upto)
+       as raw dynamic facts.  These are machinery, not user-facing rule sets, and
+       recur for every codatatype, so match them structurally on the base name. *)
+    fun is_codatatype_cong name =
+      let val base = Long_Name.base_name name
+      in String.isPrefix "cong_" base orelse base = "coinduct_upto" end
+    (* Beyond the blacklist/prefixes, drop collections the agent cannot cite by
+       name, mirroring the is_infra_thm checks above: concealed/private-scope
+       entries (e.g. Eisbach `method ... uses` parameter slots, declared concealed
+       in a private scope) and shadowed names ("??." extern).  Such names also
+       crash Universal_Key.key_of_theorem_collection: Name_Space.intern yields the
        "??."-hidden form and Name_Space.the_entry then fails with
        "Inaccessible fact". *)
-    fun is_infra_named_theorems name =
-      Symtab.defined named_theorems_blacklist name
+    fun is_infra_dynamic_fact name =
+      Symtab.defined dynamic_fact_blacklist name
+      orelse exists (fn pfx => String.isPrefix pfx name) infra_dynamic_thy_prefixes
+      orelse is_codatatype_cong name
       orelse Name_Space.is_concealed fact_space name
       orelse is_hidden fact_space name
       orelse String.isPrefix "??." (Facts.extern ctxt facts name)
@@ -384,7 +404,7 @@ fun gen_infra_filters (context : Context.generic)
      is_infra_locale = fn name => Name_Space.is_concealed locale_space name
                                   orelse is_hidden locale_space name
                                   orelse is_from_infra_theory name,
-     is_infra_named_theorems = is_infra_named_theorems,
+     is_infra_dynamic_fact = is_infra_dynamic_fact,
      is_infra_method = is_infra_method}
   end
 

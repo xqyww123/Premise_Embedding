@@ -323,7 +323,7 @@ local
     | entity_kind_rank (Locale _) = 1
     | entity_kind_rank (Type _) = 2
     | entity_kind_rank (Constant _) = 3
-    | entity_kind_rank (Named_Theorems _) = 4
+    | entity_kind_rank (Theorem_Collection _) = 4
     | entity_kind_rank (Method _) = 4
     | entity_kind_rank (Introduction_Rule _) = 5
     | entity_kind_rank (Named_Introduction_Rule _) = 5
@@ -405,14 +405,20 @@ fun build_entries (context : Context.generic)
       | Universal_Key.Type _ => source_at_pos pos
       | Universal_Key.Class _ => source_at_pos pos
       | Universal_Key.Locale _ => source_at_pos pos
-      | Universal_Key.Named_Theorems _ => source_at_pos pos
+      | Universal_Key.Theorem_Collection _ => source_at_pos pos
       | Universal_Key.Method _ => source_at_pos pos
       | _ => ""
-    (* Extra prompt-only context (never stored as expr).  For a named_theorems,
-       show up to 10 current member propositions so the agent can describe the
-       collection's purpose; members are deliberately kept out of expr/key. *)
-    fun mk_prompt_hint (Universal_Key.Named_Theorems nt_name, _) =
-          (case try (Named_Theorems.get ctxt) nt_name of
+    (* Extra prompt-only context (never stored as expr).  For a theorem
+       collection, show up to 10 current member propositions so the agent can
+       describe the collection's purpose; members are deliberately kept out of
+       expr/key. *)
+    fun mk_prompt_hint (Universal_Key.Theorem_Collection nt_name, _) =
+          (case \<^try>\<open>Context_Callbacks.dynamic_fact_members (Context.Proof ctxt)
+                          (Proof_Context.facts_of ctxt) nt_name
+                  catch exn =>
+                    (warning ("build_entries: theorem-collection member fetch failed for "
+                      ^ quote nt_name ^ ", member preview omitted: " ^ Runtime.exn_message exn);
+                     NONE)\<close> of
              NONE => ""
            | SOME [] => ""
            | SOME thms =>
@@ -705,7 +711,7 @@ fun make_entity_callbacks (init_context: Context.generic) (ctxt_unpack: Context_
         "Extended_Nonnegative_Real.ennreal"]
       val {is_infra_const, is_infra_thm, is_infra_induct_thm,
            is_infra_type, is_infra_class, is_infra_locale,
-           is_infra_named_theorems, is_infra_method} =
+           is_infra_dynamic_fact, is_infra_method} =
         Infra_Filter.gen_infra_filters init_context
       val {entries = cached_entries, facts = cached_facts} =
         Thm_Cache.get (Context.theory_of init_context)
@@ -725,7 +731,7 @@ fun make_entity_callbacks (init_context: Context.generic) (ctxt_unpack: Context_
     types = Context_Callbacks.make_types_callback (SOME (not o is_infra_type)) ctxt_unpack,
     classes = Context_Callbacks.make_classes_callback (SOME (not o is_infra_class)) ctxt_unpack,
     locales = Context_Callbacks.make_locales_callback (SOME (not o is_infra_locale)) ctxt_unpack,
-    named_theorems = Context_Callbacks.make_named_theorems_callback (SOME (not o is_infra_named_theorems)) ctxt_unpack,
+    named_theorems = Context_Callbacks.make_theorem_collection_callback (SOME (not o is_infra_dynamic_fact)) ctxt_unpack,
     methods = Context_Callbacks.make_methods_callback (SOME (not o is_infra_method)) ctxt_unpack,
     introduction_rules = Context_Callbacks.make_introduction_rules_callback
       extract_intro_rules (SOME (not o is_infra_thm)) ctxt_unpack,
@@ -745,7 +751,7 @@ fun interpret' (context : Context.generic) : usage * usage =
     val thy_file_path = Theory_Structure.get_theory_file_path thy
     (* 2. Extract constants and theorems, filtering infrastructure *)
     val {is_infra_const, is_infra_thm, is_infra_type, is_infra_class, is_infra_locale,
-         is_infra_named_theorems, is_infra_method, ...} =
+         is_infra_dynamic_fact, is_infra_method, ...} =
       Infra_Filter.gen_infra_filters context
 
     val const_entries = Theory_Structure.get_constants_with_positions context
@@ -832,10 +838,10 @@ fun interpret' (context : Context.generic) : usage * usage =
                     Universal_Key.key_of NONE context entity) end)
 
     (* 5a'. Extract named_theorems collections and proof methods *)
-    val named_theorems_entries = Theory_Structure.get_named_theorems_with_positions context
+    val named_theorems_entries = Theory_Structure.get_theorem_collections_with_positions context
       |> map_filter (fn (name, pos) =>
-          if is_infra_named_theorems name then NONE
-          else let val entity = Universal_Key.Named_Theorems name
+          if is_infra_dynamic_fact name then NONE
+          else let val entity = Universal_Key.Theorem_Collection name
                in SOME (entity, name, pos,
                     Universal_Key.key_of NONE context entity) end)
 

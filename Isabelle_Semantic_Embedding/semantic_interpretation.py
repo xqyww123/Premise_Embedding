@@ -49,7 +49,7 @@ _KIND_THEOREM = 2
 _KIND_TYPE = 3
 _KIND_CLASS = 4
 _KIND_LOCALE = 5
-_KIND_NAMED_THEOREMS = 6
+_KIND_THEOREM_COLLECTION = 6
 _KIND_METHOD = 7
 _KIND_INTRODUCTION_RULE = 0x12
 _KIND_ELIMINATION_RULE = 0x22
@@ -65,7 +65,7 @@ _KIND_PROMPT_LABELS = {
     _KIND_TYPE: "type",
     _KIND_CLASS: "typeclass",
     _KIND_LOCALE: "locale",
-    _KIND_NAMED_THEOREMS: "named theorems",
+    _KIND_THEOREM_COLLECTION: "named theorem bundles",
     _KIND_METHOD: "proof method",
     _KIND_INTRODUCTION_RULE: "introduction rule",
     _KIND_ELIMINATION_RULE: "elimination rule",
@@ -262,7 +262,7 @@ Prefer plain English over formulas. Wrap formulas in backticks (e.g., `x`, `x + 
 When a lemma/rule/term has a well-known name (e.g., proof by contradiction), you MUST mention it explicitly in the translation. \
 Any nonstandard notation must be briefly explained.
 
-- For a `named theorems` entry, describe what kind of facts the collection gathers and its purpose; \
+- For a `named theorem bundles` entry, describe what kind of facts the collection gathers and its purpose; \
 you may use the listed current members to infer this, but do NOT enumerate the members in your answer. \
 The declared comment in the command (if any) is often terse, inaccurate, or incomplete, so check it \
 against the members: copy it verbatim only when it is genuinely complete and accurate, otherwise \
@@ -277,7 +277,7 @@ Examples of good translations:
 - lemma List.map_comp: Mapping `f` then `g` over a list is the same as mapping their composition `g \u2218 f`.
 - type Prod: The product type, consisting of a pair of two values of possibly different types.
 - introduction rule notI `(P \u27f9 False) \u27f9 \u00acP`: The rule of proof by contradiction \u2014 to prove `\u00acP`, assume `P` and derive `False`.
-- named theorems Groups.algebra_simps: A collection of rewrite rules that normalise expressions over groups, rings and related structures — multiplying products out and ordering sums and products into a canonical form — so the simplifier can decide algebraic equalities and help discharge inequalities.
+- named theorem bundles Groups.algebra_simps: A collection of rewrite rules that normalise expressions over groups, rings and related structures — multiplying products out and ordering sums and products into a canonical form — so the simplifier can decide algebraic equalities and help discharge inequalities.
 - proof method Presburger.presburger: An automatic decision procedure for first-order linear arithmetic over integers and naturals (Presburger arithmetic) — it eliminates quantifiers and handles divisibility and modulo constraints via Cooper's algorithm.
 
 Translation hints:
@@ -309,7 +309,7 @@ _answer_schema = {
                     "type": {
                         "type": "string",
                         "enum": ["constant", "lemma", "type", "typeclass", "locale",
-                                 "named theorems", "proof method",
+                                 "named theorem bundles", "proof method",
                                  "introduction rule", "elimination rule",
                                  "induction rule", "case-split rule"]
                     },
