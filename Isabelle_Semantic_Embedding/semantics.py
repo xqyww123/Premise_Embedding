@@ -13,7 +13,7 @@ from Isabelle_RPC_Host import Connection, isabelle_remote_procedure
 from Isabelle_RPC_Host.rpc import IsabelleError
 from Isabelle_RPC_Host.position import AsciiPosition, IsabellePosition
 from Isabelle_RPC_Host.unicode import pretty_unicode, ascii_of_unicode
-from Isabelle_RPC_Host.universal_key import EntityKind, UndefinedEntity, universal_key, universal_key_of, destruct_key, is_WIP
+from Isabelle_RPC_Host.universal_key import EntityKind, UndefinedEntity, universal_key, universal_key_of, destruct_key, is_WIP, RULE_ONLY_TAG_BYTES
 from claude_agent_sdk import SdkMcpTool, tool
 
 from .semantic_embedding import Vector_Store, Embedding_Provider, embedding_provider, Reranker_Provider, reranker_provider, key
@@ -1027,11 +1027,21 @@ class Semantic_Vector_Store(Vector_Store):
             kind_set = set(kinds)
             for rec in domain.extra:
                 ek = rec.key
-                if ek not in seen and destruct_key(ek).kind in kind_set:
-                    candidates.append(ek)
-                    seen.add(ek)
-                    candidate_names[ek] = rec.name
-                    is_local_map[ek] = rec.is_local
+                if ek in seen or destruct_key(ek).kind not in kind_set:
+                    continue
+                # Honor the query-aware cross-kind dedup (decision 8): entities_of has
+                # already suppressed the Theorem(0x02) sibling of every rule member it
+                # surfaced as a rule.  If this extra is that suppressed Theorem face
+                # (its rule sibling is already present), do NOT re-add it as a theorem —
+                # otherwise the member would surface twice (rule face + theorem face).
+                if (len(ek) == 32 and ek[16] == int(EntityKind.THEOREM)
+                        and any(ek[:16] + bytes([t]) + ek[17:] in seen
+                                for t in RULE_ONLY_TAG_BYTES)):
+                    continue
+                candidates.append(ek)
+                seen.add(ek)
+                candidate_names[ek] = rec.name
+                is_local_map[ek] = rec.is_local
         elif isinstance(domain, Semantic_Vector_Store.Restricted):
             # NB: this branch does NOT populate `candidate_names`, so results
             # here display the DB-stored name (no live `coll(i)` override, and no
