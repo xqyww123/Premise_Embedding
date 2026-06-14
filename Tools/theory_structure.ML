@@ -18,6 +18,13 @@ signature THEORY_STRUCTURE = sig
      and some premise tail both end in the same schematic variable (possibly
      0-ary, for case-split rules whose conclusion is a bare Boolean). *)
   val has_rule_shape : thm -> bool
+  (* Name-suffix rule-kind classifiers (the SAME suffix tests the static
+     get_*_rules_with_positions Source-2 scan uses), exposed so the dynamic-
+     collection path can classify a bin by its name.  At most one fires. *)
+  val is_introduction_rule_name : string -> bool
+  val is_elimination_rule_name : string -> bool
+  val is_induction_rule_name : string -> bool
+  val is_case_split_rule_name : string -> bool
   val get_entities_with_positions : Context.generic -> Universal_Key.entity list ->
     (string * Position.T) list
   val get_theorems_with_positions_of : Context.generic -> Universal_Key.entity list ->
@@ -289,10 +296,12 @@ fun get_rules_with_positions is_elim suffix context =
   in cs_results @ name_results end
 
 in
-val get_introduction_rules_with_positions =
-  get_rules_with_positions false (#"I", ["_intro", ".intro", "_intros", ".intros"])
-val get_elimination_rules_with_positions  =
-  get_rules_with_positions true  (#"E", ["_elim", ".elim", "_elims", ".elims", "_dest", ".dest"])
+val intro_suffix = (#"I", ["_intro", ".intro", "_intros", ".intros"])
+val elim_suffix  = (#"E", ["_elim", ".elim", "_elims", ".elims", "_dest", ".dest"])
+val get_introduction_rules_with_positions = get_rules_with_positions false intro_suffix
+val get_elimination_rules_with_positions  = get_rules_with_positions true  elim_suffix
+val is_introduction_rule_name = has_rule_suffix intro_suffix
+val is_elimination_rule_name  = has_rule_suffix elim_suffix
 end
 
 (* Get induction / case-split rules by unioning:
@@ -385,12 +394,14 @@ in
 
 val has_rule_shape = has_rule_shape_impl
 
+val induct_suffix = ["_induct", "_ind"]
+val case_suffix   = ["_cases", "_case"]
 val get_induction_rules_with_positions =
-  get_induct_rules_with_positions
-    (fn r => #type_induct r @ #pred_induct r) ["_induct", "_ind"]
+  get_induct_rules_with_positions (fn r => #type_induct r @ #pred_induct r) induct_suffix
 val get_case_split_rules_with_positions =
-  get_induct_rules_with_positions
-    (fn r => #type_cases r @ #pred_cases r) ["_cases", "_case"]
+  get_induct_rules_with_positions (fn r => #type_cases r @ #pred_cases r) case_suffix
+val is_induction_rule_name  = name_ends_in_any induct_suffix
+val is_case_split_rule_name = name_ends_in_any case_suffix
 
 end
 

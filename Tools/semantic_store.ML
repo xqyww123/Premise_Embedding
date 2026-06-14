@@ -730,8 +730,9 @@ fun process_facts_into_cache (context : Context.generic)
 fun process_dynamic_facts_into_cache (context : Context.generic)
     (is_infra_dynamic_fact : string -> bool)
     (is_infra_thm : string * thm -> bool)
+    (is_infra_induct_thm : string * thm -> bool)
     (only_new : bool)
-    : (Context_Callbacks.cached_thm_entry * int) list =
+    : (Context_Callbacks.cached_thm_entry * int * Universal_Key.entity) list =
   let
     val thy = Context.theory_of context
     val facts = Context.cases Global_Theory.facts_of Proof_Context.facts_of context
@@ -764,6 +765,24 @@ fun process_dynamic_facts_into_cache (context : Context.generic)
            end) parents;
          tab
       end
+    (* A2.1: a rule-suffixed bin yields, per member, the Theorem (0x02) entry AND
+       a rule-kind entry.  The kind is fixed by the bin NAME (at most one fires).
+       intro/elim use is_infra_thm; induct/case additionally require has_rule_shape
+       on the member and use is_infra_induct_thm — mirroring the static path. *)
+    fun rule_kind_of coll =
+      if Theory_Structure.is_introduction_rule_name coll
+        then SOME (Universal_Key.Introduction_Rule, Universal_Key.key_of_introduction_rule',
+                   is_infra_thm, false)
+      else if Theory_Structure.is_elimination_rule_name coll
+        then SOME (Universal_Key.Elimination_Rule, Universal_Key.key_of_elimination_rule',
+                   is_infra_thm, false)
+      else if Theory_Structure.is_induction_rule_name coll
+        then SOME (Universal_Key.Induction_Rule, Universal_Key.key_of_induction_rule',
+                   is_infra_induct_thm, true)
+      else if Theory_Structure.is_case_split_rule_name coll
+        then SOME (Universal_Key.Case_Split_Rule, Universal_Key.key_of_case_split_rule',
+                   is_infra_induct_thm, true)
+      else NONE
   in
     (* Dedup members by uk, keeping the first occurrence (and its position):
        identical theorems within a collection, or a theorem shared by several
@@ -771,7 +790,8 @@ fun process_dynamic_facts_into_cache (context : Context.generic)
        reaching the interpretation answer endpoint (which matches by name). *)
     let val seen = Bytehashtab.empty 256 in
     maps (fn coll =>
-      let val pset = parent_uks coll in
+      let val pset = parent_uks coll
+          val rk = rule_kind_of coll in
       case Context_Callbacks.dynamic_fact_members context facts coll of
         NONE => []
       | SOME thms =>
@@ -786,20 +806,28 @@ fun process_dynamic_facts_into_cache (context : Context.generic)
              by Isabelle against the live collection content at use time. *)
           map_index (fn (j, thm) =>
             let val thm' = Thm.transfer thy thm
-                val uk = Universal_Key.key_of_theorem' NONE context thm'
-            in if is_infra_thm (coll, thm') then NONE
-               else if Bytehashtab.defined pset uk then NONE  (* only_new: inherited *)
-               else SOME ({
-                 uk = uk,
-                 name = Context_Callbacks.Member_of_Dynamic coll,
-                 pos = ("", 0, 0),
-                 thm = thm',
-                 theories = map #1 (#2 (Universal_Key.thm_constituents context thm'))
-               } : Context_Callbacks.cached_thm_entry, j + 1)
+                val uk0 = Universal_Key.key_of_theorem' NONE context thm'
+                val theories = map #1 (#2 (Universal_Key.thm_constituents context thm'))
+                fun entry (entity, uk) =
+                  ({uk = uk, name = Context_Callbacks.Member_of_Dynamic coll,
+                    pos = ("", 0, 0), thm = thm', theories = theories}
+                   : Context_Callbacks.cached_thm_entry, j + 1, entity)
+            in
+              if Bytehashtab.defined pset uk0 then []  (* only_new: inherited -> drop all kinds *)
+              else
+                (if is_infra_thm (coll, thm') then []
+                 else [entry (Universal_Key.Theorem thm', uk0)])
+                @ (case rk of
+                     NONE => []
+                   | SOME (con, key_of, infra, needs_shape) =>
+                       if infra (coll, thm')
+                          orelse (needs_shape andalso not (Theory_Structure.has_rule_shape thm'))
+                       then []
+                       else [entry (con thm', key_of NONE context thm')])
             end) thms
-          |> map_filter I
+          |> flat
       end) coll_names
-    |> filter (fn (e, _) =>
+    |> filter (fn (e, _, _) =>
          if Bytehashtab.defined seen (#uk e) then false
          else (Bytehashtab.update seen (#uk e, ()); true))
     end
@@ -845,7 +873,8 @@ fun make_entity_callbacks (init_context: Context.generic) (ctxt_unpack: Context_
          is also a static fact keeps the static (Fixed) name/position. *)
       val member_entries =
         dedup_against static_combined
-          (map #1 (process_dynamic_facts_into_cache init_context is_infra_dynamic_fact is_infra_thm false))
+          (map #1 (process_dynamic_facts_into_cache init_context is_infra_dynamic_fact
+                     is_infra_thm is_infra_induct_thm false))
       val combined_entries = static_combined @ member_entries
       val thm_cache = SOME (combined_entries, current_facts)
   in {
@@ -873,8 +902,8 @@ fun interpret' (context : Context.generic) : usage * usage =
     val thy_name = Context.theory_long_name thy
     val thy_file_path = Theory_Structure.get_theory_file_path thy
     (* 2. Extract constants and theorems, filtering infrastructure *)
-    val {is_infra_const, is_infra_thm, is_infra_type, is_infra_class, is_infra_locale,
-         is_infra_dynamic_fact, is_infra_method, ...} =
+    val {is_infra_const, is_infra_thm, is_infra_induct_thm, is_infra_type, is_infra_class,
+         is_infra_locale, is_infra_dynamic_fact, is_infra_method, ...} =
       Infra_Filter.gen_infra_filters context
 
     val const_entries = Theory_Structure.get_constants_with_positions context
@@ -954,10 +983,15 @@ fun interpret' (context : Context.generic) : usage * usage =
         val _ = List.app (fn (_, _, _, uk) => Bytehashtab.update seen (uk, ()))
                   deduped_thm_entries
       in
-        process_dynamic_facts_into_cache context is_infra_dynamic_fact is_infra_thm true
-        |> map_filter (fn (e, i) =>
+        process_dynamic_facts_into_cache context is_infra_dynamic_fact is_infra_thm
+          is_infra_induct_thm true
+        |> map_filter (fn (e, i, entity) =>
+             (* `entity` is the per-kind entity (Theorem 0x02 or a rule kind);
+                its #uk matches.  Dedup only against static THEOREMS here (seen
+                holds 0x02 uks); a rule member equal to a static rule is resolved
+                later by the global keep-first (static wins). *)
              if Bytehashtab.defined seen (#uk e) then NONE
-             else SOME (Universal_Key.Theorem (#thm e),
+             else SOME (entity,
                         Context_Callbacks.bare_name (#name e),
                         Position.none, #uk e, SOME i))
       end
