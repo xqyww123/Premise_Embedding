@@ -730,6 +730,7 @@ fun process_facts_into_cache (context : Context.generic)
 fun process_dynamic_facts_into_cache (context : Context.generic)
     (is_infra_dynamic_fact : string -> bool)
     (is_infra_thm : string * thm -> bool)
+    (only_new : bool)
     : (Context_Callbacks.cached_thm_entry * int) list =
   let
     val thy = Context.theory_of context
@@ -739,6 +740,30 @@ fun process_dynamic_facts_into_cache (context : Context.generic)
       Name_Space.get_names space
       |> filter (Facts.is_dynamic facts)
       |> filter (not o is_infra_dynamic_fact)
+    (* A2.0 only_new (collect): a member is "new in this theory" iff its content-
+       addressed 0x02 uk is NOT among the SAME bin's members as seen from any
+       parent theory's own context (Proof_Context.init_global p).  Because the uk
+       is content-addressed (collector-independent), the parent re-eval yields the
+       same uk for an inherited member, so current \ parent leaves exactly this
+       theory's additions.  Done per bin (`parent_uks coll`), never as a global
+       set.  query passes only_new = false, making parents = [] and parent_uks
+       empty, so nothing is dropped (all reachable members surface). *)
+    val parents = if only_new then Theory.parents_of thy else []
+    fun parent_uks coll =
+      let val tab = Bytehashtab.empty 256
+      in List.app (fn p =>
+           let val pctxt = Context.Proof (Proof_Context.init_global p)
+               val pfacts = Global_Theory.facts_of p
+           in case Context_Callbacks.dynamic_fact_members pctxt pfacts coll of
+                NONE => ()
+              | SOME pthms =>
+                  List.app (fn pthm =>
+                    Bytehashtab.update tab
+                      (Universal_Key.key_of_theorem' NONE pctxt (Thm.transfer p pthm), ()))
+                    pthms
+           end) parents;
+         tab
+      end
   in
     (* Dedup members by uk, keeping the first occurrence (and its position):
        identical theorems within a collection, or a theorem shared by several
@@ -746,32 +771,34 @@ fun process_dynamic_facts_into_cache (context : Context.generic)
        reaching the interpretation answer endpoint (which matches by name). *)
     let val seen = Bytehashtab.empty 256 in
     maps (fn coll =>
+      let val pset = parent_uks coll in
       case Context_Callbacks.dynamic_fact_members context facts coll of
         NONE => []
       | SOME thms =>
           (* index j+1 = the member's 1-based position in Facts.lookup's list
-             (numbered BEFORE infra filtering). This is the collect-time index,
-             carried out-of-band (not in the ADT) only to give members distinct
-             coll(i) names so the interpretation answer endpoint (name-keyed)
-             cannot collapse them. It is NOT authoritative for citation: the
-             query path recomputes the index live via `resolve_name`, and if the
-             collection holds aconv-duplicate props the live `coll(i)` may point
-             at the first such member rather than this exact one. That is
-             recall-only, not a correctness hazard: a whole-collection / coll(i)
-             reference is always re-resolved by Isabelle against the live
-             collection content at use time. *)
+             (numbered BEFORE infra filtering and BEFORE the only_new drop, so j
+             stays the FULL-bin position — collect and query agree on coll(i)).
+             It is NOT authoritative for citation: the query path recomputes the
+             index live via `resolve_name`, and if the collection holds aconv-
+             duplicate props the live `coll(i)` may point at the first such member
+             rather than this exact one. That is recall-only, not a correctness
+             hazard: a whole-collection / coll(i) reference is always re-resolved
+             by Isabelle against the live collection content at use time. *)
           map_index (fn (j, thm) =>
             let val thm' = Thm.transfer thy thm
+                val uk = Universal_Key.key_of_theorem' NONE context thm'
             in if is_infra_thm (coll, thm') then NONE
+               else if Bytehashtab.defined pset uk then NONE  (* only_new: inherited *)
                else SOME ({
-                 uk = Universal_Key.key_of_theorem' NONE context thm',
+                 uk = uk,
                  name = Context_Callbacks.Member_of_Dynamic coll,
                  pos = ("", 0, 0),
                  thm = thm',
                  theories = map #1 (#2 (Universal_Key.thm_constituents context thm'))
                } : Context_Callbacks.cached_thm_entry, j + 1)
             end) thms
-          |> map_filter I) coll_names
+          |> map_filter I
+      end) coll_names
     |> filter (fn (e, _) =>
          if Bytehashtab.defined seen (#uk e) then false
          else (Bytehashtab.update seen (#uk e, ()); true))
@@ -818,7 +845,7 @@ fun make_entity_callbacks (init_context: Context.generic) (ctxt_unpack: Context_
          is also a static fact keeps the static (Fixed) name/position. *)
       val member_entries =
         dedup_against static_combined
-          (map #1 (process_dynamic_facts_into_cache init_context is_infra_dynamic_fact is_infra_thm))
+          (map #1 (process_dynamic_facts_into_cache init_context is_infra_dynamic_fact is_infra_thm false))
       val combined_entries = static_combined @ member_entries
       val thm_cache = SOME (combined_entries, current_facts)
   in {
@@ -915,17 +942,19 @@ fun interpret' (context : Context.generic) : usage * usage =
        static theorems by uk (static name/pos wins).  A6: each member carries the
        BARE collection name + member_idx = SOME i (the carried full-bin position
        from process_dynamic).  build_entries renders coll(i) at the record-write
-       and uses member_idx (not a Facts.is_dynamic name test) for the locale-
-       provenance bypass.  No member_pos / post-pass: the global keep-first below
-       resolves member-vs-static by uk (static, with a real line, wins; a dropped
-       member takes its SOME i with it, so no surviving static entry is renamed). *)
+       from member_idx; the locale-provenance bypass stays keyed on
+       Facts.is_dynamic of the (bare) name (covers both members and the
+       Theorem_Collection entity, which a member_idx-only test would miss).
+       No member_pos / post-pass: the global keep-first below resolves
+       member-vs-static by uk (static, with a real line, wins; a dropped member
+       takes its SOME i with it, so no surviving static entry is renamed). *)
     val member_entries =
       let
         val seen = Bytehashtab.empty 256
         val _ = List.app (fn (_, _, _, uk) => Bytehashtab.update seen (uk, ()))
                   deduped_thm_entries
       in
-        process_dynamic_facts_into_cache context is_infra_dynamic_fact is_infra_thm
+        process_dynamic_facts_into_cache context is_infra_dynamic_fact is_infra_thm true
         |> map_filter (fn (e, i) =>
              if Bytehashtab.defined seen (#uk e) then NONE
              else SOME (Universal_Key.Theorem (#thm e),
