@@ -39,6 +39,14 @@ sig
      Tries live PIDE state first, falls back to session export DB. *)
   val command_at_position: Position.T -> (string * int * int) option
 
+  (* Cut the command spans of a (possibly WIP) theory file locally with
+     Outer_Syntax, returning (source, start_sym_off, end_sym_off) for each real
+     command span.  Offsets are 1-based file-global symbol offsets.  This backs
+     the WIP fallback of command_at_position for files not covered by live PIDE
+     state or a session export DB. *)
+  val command_spans_of_file: string -> (string * int * int) list
+  val command_at_position_wip: string -> int -> (string * int * int) option
+
   (* Convert between symbol offset and line:column via Python RPC.
      Requires the Isabelle_RPC Python host to be running. *)
   val offset_to_line_column: string -> int -> int * int
@@ -64,6 +72,9 @@ sig
      at that position.
      Fallback chain: live PIDE -> (if re_eval_cache) re-evaluation cache -> NONE *)
   val context_at_position: context_at_position_cfg -> string -> int -> Context.generic option
+
+  (* Find the loaded theory whose master .thy file matches the given path. *)
+  val theory_of_file: string -> string option
 
   (* Msgpack unpacker that reads an optional (file, offset) pair from the wire.
      NONE -> returns the fallback context.
@@ -273,12 +284,8 @@ fun command_at_position_pide file_path symbol_offset =
     else SOME (source, start_offset, end_offset)
   end;
 
-fun command_at_position pos =
-  let val (file, offset) = pos_file_offset pos
-  in
-    if file = "" orelse offset = 0 then NONE
-    else command_at_position_pide file offset
-  end;
+(* command_at_position is defined further below, after theory_of_file, so that
+   it can fall back to the WIP (local Outer_Syntax) command-span path. *)
 
 val get_session_databases : unit -> (string * string) list =
   let
@@ -341,6 +348,119 @@ fun theory_of_file file_path =
         catch _ => false
       \<close>
   in List.find matches (Thy_Info.get_names ()) end;
+
+
+(* --- WIP command-span path (B1 cross-line completion) ---
+
+   For a "work in progress" .thy file that is NOT covered by a live PIDE node
+   nor by a session export DB, Scala's command_at_position returns NONE and the
+   Python side degrades to single-line spans.  Here we re-cut the command spans
+   locally with Outer_Syntax, so command_at_position can return a full,
+   possibly multi-line, command span.
+
+   Coordinate contract: the returned (start, end) are 1-based, file-global
+   *symbol* offsets, matching the live branch (src/scala/pide_state.scala:104
+   uses var pos = 1).  We obtain this by lexing with Position.file file_path,
+   whose offset starts at 1 (Pure/General/position.ML:163). *)
+
+(* Keywords for lexing the WIP file:
+     1. preferred: the real theory matched by theory_of_file, via
+        Thy_Header.get_keywords (Thy_Info.get_theory name);
+     2. fallback: read the file header, merge the keywords of its (loaded)
+        import theories with the header's own keyword declarations
+        (cf. Pure/Thy/thy_info.ML:297-299). *)
+fun keywords_of_wip_file file_path text =
+  case theory_of_file file_path of
+    SOME thy_name => Thy_Header.get_keywords (Thy_Info.get_theory thy_name)
+  | NONE =>
+      let
+        val text_pos = Position.file file_path
+        val header = Thy_Header.read text_pos text
+        (* resolve each import to a loaded theory by base-name match *)
+        val loaded = Thy_Info.get_names ()
+        fun resolve_import (imp, _) =
+          let val base = Long_Name.base_name imp in
+            case Thy_Info.lookup_theory imp of
+              SOME thy => SOME thy
+            | NONE =>
+                (* base-name fallback: only when it is unambiguous.  If several
+                   loaded theories share the base name we cannot tell which one
+                   is meant, so we skip (warning) rather than silently pick one
+                   and risk merging the wrong keywords. *)
+                (case filter (fn n => Long_Name.base_name n = base) loaded of
+                   [n] => Thy_Info.lookup_theory n
+                 | [] => NONE
+                 | ns =>
+                     (warning ("PIDE_State.keywords_of_wip_file: ambiguous import " ^
+                        quote imp ^ " matches multiple loaded theories " ^
+                        commas_quote ns ^ "; skipping"); NONE))
+          end
+        val parents = map_filter resolve_import (#imports header)
+        val base_kws =
+          fold (curry Keyword.merge_keywords o Thy_Header.get_keywords) parents
+            Keyword.empty_keywords
+      in
+        Keyword.add_keywords (#keywords header) base_kws
+      end;
+
+(* Cut the command spans of a WIP file.
+   Returns (source, start_sym_off, end_sym_off) for each real Command_Span,
+   where start/end are 1-based file-global symbol offsets.
+   Malformed_Span and Ignored_Span are dropped: a half-typed WIP file produces
+   Malformed_Span frequently, and matching by kind avoids mis-hitting them.
+   NOTE: this differs from the live PIDE path, which builds a Command for every
+   span (Ignored ones too).  An offset landing in inter-command whitespace thus
+   resolves to that Ignored command under live, but yields NONE here (the caller
+   then degrades to a single-line search).  Harmless in practice: query offsets
+   land inside commands and hover/definition never probe whitespace. *)
+fun command_spans_of_file file_path : (string * int * int) list =
+  \<^try>\<open>
+    let
+      val text = File.read (Path.explode file_path)
+      val tpos = Position.file file_path
+      val kws = keywords_of_wip_file file_path text
+      val toks = Token.explode kws tpos text
+      val spans = Outer_Syntax.parse_spans toks
+      fun is_command span =
+        case Command_Span.kind span of Command_Span.Command_Span _ => true | _ => false
+      fun span_entry span =
+        let
+          val span_toks = Command_Span.content span
+          val (p1, p2) = Token.range_of span_toks
+          val start_off = the_default 0 (Position.offset_of p1)
+          (* end uses the span's own token range (Command_Span.range); the
+             Python consumer currently keys off start only, so trailing
+             whitespace from Command_Span.command_ranges is not needed here. *)
+          val end_off = the_default 0 (Position.offset_of p2)
+          (* reconstruct the verbatim source: source_of yields each token's
+             original text (symbols intact), and whitespace/comments are
+             themselves tokens in the span content, so concatenation restores
+             the original slice faithfully *)
+          val source =
+            implode (map Token.source_of span_toks)
+        in
+          if start_off > 0 then SOME (source, start_off, end_off) else NONE
+        end
+    in
+      map_filter (fn span => if is_command span then span_entry span else NONE) spans
+    end
+    catch exn =>
+      (warning ("PIDE_State.command_spans_of_file: " ^ Runtime.exn_message exn); [])
+  \<close>;
+
+fun command_at_position_wip file off =
+  List.find (fn (_, s, e) => off >= s andalso off < e) (command_spans_of_file file);
+
+fun command_at_position pos =
+  let val (file, offset) = pos_file_offset pos
+  in
+    if file = "" orelse offset = 0 then NONE
+    else
+      case command_at_position_pide file offset of
+        SOME r => SOME r
+      | NONE => command_at_position_wip file offset
+  end;
+
 
 fun build_reeval_cache file_path =
   case theory_of_file file_path of

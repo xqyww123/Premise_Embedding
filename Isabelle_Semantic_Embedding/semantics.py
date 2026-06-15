@@ -11,7 +11,7 @@ import numpy as np
 import platformdirs
 from Isabelle_RPC_Host import Connection, isabelle_remote_procedure
 from Isabelle_RPC_Host.rpc import IsabelleError
-from Isabelle_RPC_Host.position import AsciiPosition, IsabellePosition
+from Isabelle_RPC_Host.position import IsabellePosition
 from Isabelle_RPC_Host.unicode import pretty_unicode, ascii_of_unicode
 from Isabelle_RPC_Host.universal_key import EntityKind, UndefinedEntity, universal_key, universal_key_of, destruct_key, is_WIP, RULE_ONLY_TAG_BYTES
 from claude_agent_sdk import SdkMcpTool, tool
@@ -19,7 +19,7 @@ from claude_agent_sdk import SdkMcpTool, tool
 from .semantic_embedding import Vector_Store, Embedding_Provider, embedding_provider, Reranker_Provider, reranker_provider, key
 
 from .base import ToolCall_ret, mk_ret as _mk_ret
-from .hover import _resolve_thy_path
+from .hover import resolve_context_at
 
 # Long theory names to exclude from interpretation and entity enumeration.
 _SKIP_THEORY_LONG_NAMES = ["Pure", "Tools.Code_Generator", "HOL.Code_Evaluation", "HOL.Typerep"]
@@ -447,28 +447,18 @@ def _mk_query_by_name_schema(working_names: list[str]) -> dict:
                         "type": "integer",
                         "description": "1-based line number.",
                     },
-                    "column": {
-                        "type": "integer",
-                        "description": "1-based column number. If omitted, uses the end of the line.",
+                    "symbol": {
+                        "type": "string",
+                        "description": "A token on that line to pin the context to "
+                                       "(ASCII or Unicode). If omitted, uses the end of the line.",
                     },
                 },
                 "required": ["line"],
+                "additionalProperties": False,
             },
         },
         "required": ["type", "name"],
     }
-
-
-def _end_of_line_column(file_path: str, line: int) -> int:
-    """Return the last column (1-based) of the given line in the file."""
-    try:
-        with open(file_path, 'r') as f:
-            for i, text in enumerate(f, 1):
-                if i == line:
-                    return max(1, len(text.rstrip('\n')))
-        return 1
-    except OSError:
-        return 1
 
 
 import re as _re
@@ -652,25 +642,10 @@ def mk_query_by_name_tool(
         name = ascii_of_unicode(name)
 
         # Resolve optional context_at position to (file, symbol_offset)
-        ctxt = None
-        context_at = args.get("context_at")
-        if isinstance(context_at, dict):
-            line = context_at.get("line")
-            if isinstance(line, int) and line >= 1:
-                file = context_at.get("file") or file_path
-                if isinstance(file, str):
-                    file = _resolve_thy_path(file)
-                if file:
-                    column = context_at.get("column")
-                    if not isinstance(column, int) or column < 1:
-                        column = _end_of_line_column(file, line)
-                    try:
-                        from Isabelle_RPC_Host.position import AsciiPosition
-                        isa_pos = AsciiPosition(line, column, file).to_isabelle_position()
-                        ctxt = (isa_pos.file, isa_pos.raw_offset)
-                    except Exception:
-                        log.debug("position conversion failed for %s:%d:%d",
-                                  file, line, column, exc_info=True)
+        ctxt, ctxt_note = resolve_context_at(args.get("context_at"), file_path, log)
+
+        def _noted(s: str) -> str:
+            return f"{ctxt_note}\n\n{s}" if ctxt_note else s
 
         try:
             if working_names and name in working_names:
@@ -683,9 +658,9 @@ def mk_query_by_name_tool(
             if args.get("show_defs", False):
                 sem = await _append_definition(sem, connection, tag, uk, name, log,
                                                ctxt=ctxt)
-            return _mk_ret(sem)
+            return _mk_ret(_noted(sem))
         except LookupError as e:
-            return _mk_ret(str(e))
+            return _mk_ret(_noted(str(e)))
         except UndefinedEntity as e:
             if "." in name:
                 short = name.rsplit(".", 1)[1]
@@ -693,7 +668,7 @@ def mk_query_by_name_tool(
                     sem, uk = await query_by_name_raw(connection, tag, short, with_pretty=with_pretty)
                     if args.get("show_defs", False):
                         sem = await _append_definition(sem, connection, tag, uk, short, log)
-                    return _mk_ret(f"The {name} is undefined, but we find:\n{sem}")
+                    return _mk_ret(_noted(f"The {name} is undefined, but we find:\n{sem}"))
                 except (IsabelleError, UndefinedEntity, LookupError):
                     pass
             # Try resolving as a syntax/notation token via resolve_notation
@@ -702,15 +677,15 @@ def mk_query_by_name_tool(
                     connection, name, ctxt, with_pretty,
                     args.get("show_defs", False), log)
                 if resolved is not None:
-                    return _mk_ret(resolved)
+                    return _mk_ret(_noted(resolved))
             log.warning("%s: %s", type(e).__name__, e)
             return _mk_ret(
-                str(e) + " Try using `mcp__proof__semantic_search` to find what you need.",
+                _noted(str(e) + " Try using `mcp__proof__semantic_search` to find what you need."),
                 is_error=True,
             )
         except IsabelleError as e:
             log.warning("%s: %s", type(e).__name__, e)
-            return _mk_ret(str(e), is_error=True)
+            return _mk_ret(_noted(str(e)), is_error=True)
         except Exception:
             log.exception("query_by_name: error")
             raise

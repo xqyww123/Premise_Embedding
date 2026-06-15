@@ -4,14 +4,13 @@ import re
 from typing import Any
 
 from Isabelle_RPC_Host import Connection
-from Isabelle_RPC_Host.position import AsciiPosition
 from Isabelle_RPC_Host.universal_key import universal_key
 from Isabelle_RPC_Host.unicode import ascii_of_unicode
 from claude_agent_sdk import SdkMcpTool, tool
 
 from .base import ToolCall_ret, mk_ret as _mk_ret
-from .hover import _resolve_thy_path
-from .semantics import Semantic_DB, _end_of_line_column
+from .hover import resolve_context_at
+from .semantics import Semantic_DB
 
 
 def _clean_error(msg: str) -> str:
@@ -44,14 +43,15 @@ _schema = {
                     "type": "integer",
                     "description": "1-based line number.",
                 },
-                "column": {
-                    "type": "integer",
+                "symbol": {
+                    "type": "string",
                     "description":
-                        "1-based column number."
-                        " Defaults to end of line.",
+                        "A token on that line to pin the context to (ASCII or"
+                        " Unicode). Defaults to the end of the line.",
                 },
             },
             "required": ["line"],
+            "additionalProperties": False,
         },
     },
     "required": ["term"],
@@ -83,24 +83,7 @@ def mk_desugar_and_explain_tool(
         # ASCII-escape form; Syntax.read_term does not recognize raw UTF-8.
         term_str = ascii_of_unicode(term_str)
 
-        ctxt: tuple[str, int] | None = None
-        context_at = args.get("context_at")
-        if isinstance(context_at, dict):
-            line = context_at.get("line")
-            if isinstance(line, int) and line >= 1:
-                file = context_at.get("file") or file_path
-                if isinstance(file, str):
-                    file = _resolve_thy_path(file)
-                if file:
-                    column = context_at.get("column")
-                    if not isinstance(column, int) or column < 1:
-                        column = _end_of_line_column(file, line)
-                    try:
-                        isa_pos = AsciiPosition(line, column, file).to_isabelle_position()
-                        ctxt = (isa_pos.file, isa_pos.raw_offset)
-                    except Exception:
-                        log.debug("position conversion failed for %s:%d:%d",
-                                  file, line, column, exc_info=True)
+        ctxt, ctxt_note = resolve_context_at(args.get("context_at"), file_path, log)
 
         try:
             compact_str, constants = await connection.callback(
@@ -108,9 +91,15 @@ def mk_desugar_and_explain_tool(
         except Exception as e:
             msg = _clean_error(str(e))
             log.debug("desugar_and_explain: error: %s", msg)
+            if ctxt_note is not None:
+                msg = f"{ctxt_note}\n\n{msg}"
             return _mk_ret(msg, is_error=True)
 
-        lines: list[str] = [compact_str]
+        lines: list[str] = []
+        if ctxt_note is not None:
+            lines.append(ctxt_note)
+            lines.append("")
+        lines.append(compact_str)
         new_annotations: list[str] = []
         for full_name, uk_bytes in constants:
             uk: universal_key = bytes(uk_bytes)
