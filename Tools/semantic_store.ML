@@ -23,6 +23,7 @@ signature SEMANTIC_STORE = sig
      plus the current proof context if applicable. Calls Python via RPC
      to generate plain-English translations using a Claude agent. *)
   val interpret : bool -> Context.generic -> unit
+  val interpret_with_parallel : int option -> bool -> Context.generic -> unit
 
   (* Remove all LMDB entries whose theory hashes are non-persistent
      (i.e., from non-loaded theories). Returns the number of entries deleted. *)
@@ -1232,7 +1233,8 @@ fun collect_uninterpreted (force : bool) thy =
   in collect thy [] end
 
 (* Scheduler state for DAG-parallel interpretation (one Isabelle session).
-   See contrib/Semantic_Embedding plan: width N = Multithreading.max_threads (),
+   Default width N = Multithreading.max_threads (), optionally overridden by
+   callers such as semantics_manage.py.
    blocking interpret' runs on off-pool Isabelle_Thread workers, concurrency bounded
    by `running < n`, a theory is admitted only after all its in-set ancestors are
    `done` (so its agent can read their interpretations from LMDB). Failure policy is
@@ -1313,7 +1315,7 @@ fun interpret_parallel (n : int) (theories : theory list) : usage * usage =
     val _ = case failed of SOME e => Exn.reraise e | NONE => ()
   in (total, hist) end
 
-fun interpret (force : bool) (context : Context.generic) : unit =
+fun interpret_with_parallel parallel (force : bool) (context : Context.generic) : unit =
   let
     val thy = Context.theory_of context
     val theories = collect_uninterpreted force thy
@@ -1323,7 +1325,12 @@ fun interpret (force : bool) (context : Context.generic) : unit =
       tracing ("[Semantic_Store] interpreting " ^
                Int.toString (length contexts) ^ " theories")
 
-    val n = Multithreading.max_threads ()
+    val n =
+      (case parallel of
+        NONE => Multithreading.max_threads ()
+      | SOME n =>
+          if n >= 1 then n
+          else error "Semantic_Store.interpret: parallel worker count must be positive")
     val (total, hist) =
       if n <= 1
       then
@@ -1349,6 +1356,8 @@ fun interpret (force : bool) (context : Context.generic) : unit =
   in
     ()
   end
+
+fun interpret force context = interpret_with_parallel NONE force context
 
 fun mk_interpret_theory (context : Context.generic) (names : string list) : unit =
   let

@@ -7,6 +7,7 @@
                   models (msgpack string list, may be empty)
                   force (msgpack bool – when true, re-interpret already-finished theories)
                   re_embed_only (msgpack bool – when true, skip interpretation and only re-embed)
+                  parallel (msgpack int option – NONE uses Isabelle worker count)
     Server streams: packString messages during interpretation/embedding (from tracing)
     Server sends:   packUnit when done successfully
     On error:       sends packString "ERROR: ..." then packUnit
@@ -38,6 +39,7 @@ val _ = REPL_Server.register_app "Semantic_Store.collect" (fn (cin, cout, state)
         val models = read (unpackList unpackString)
         val force = read unpackBool
         val re_embed_only = read unpackBool
+        val parallel = read (unpackOption unpackInt)
         val thy = Thy_Info.get_theory thy_name
         val _ = Theory_Hash.store_theory_hash thy
         val _ = Remote_Procedure_Calling.load ["Isabelle_Semantic_Embedding"]
@@ -71,7 +73,7 @@ val _ = REPL_Server.register_app "Semantic_Store.collect" (fn (cin, cout, state)
         val context = Context.Theory thy
         val theories = thy :: Theory.ancestors_of thy
         val _ = if re_embed_only then ()
-                else \<^try>\<open>Semantic_Store.interpret force context
+                else \<^try>\<open>Semantic_Store.interpret_with_parallel parallel force context
                        catch exn => (restore_channels (); Exn.reraise exn)\<close>
         val embed_force = force orelse re_embed_only
         val _ = List.app (fn model =>

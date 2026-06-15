@@ -39,6 +39,16 @@ def _record_constituent_hashes(raw: bytes) -> 'set[bytes] | None':
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _positive_int(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return n
+
+
 def _load_theory_names() -> dict[bytes, str]:
     """Load hash→name mapping from theory_hash.lmdb."""
     if not os.path.exists(THEORY_HASH_DB_PATH):
@@ -378,7 +388,7 @@ def cmd_collect(args: argparse.Namespace) -> None:
             print("Running app...", flush=True)
             await c.run_app("Semantic_Store.collect")
             models = [m.strip() for m in args.embed_models.split(",") if m.strip()] if args.embed_models else []
-            await c._write(args.theory, models, args.reinterpret, args.re_embed)
+            await c._write(args.theory, models, args.reinterpret, args.re_embed, args.parallel)
 
             has_error = False
             try:
@@ -445,6 +455,8 @@ p_collect.add_argument("--migrate-on-hash-change", action="store_true",
     help="Copy old data to new hash instead of re-interpreting when hash changes")
 p_collect.add_argument("--re-embed", action="store_true",
     help="Re-embed vectors without re-interpreting (requires --embed-models)")
+p_collect.add_argument("--parallel", type=_positive_int, metavar="N",
+    help="Override semantic interpretation parallelism (default: Isabelle worker count)")
 
 # list
 p_list = sub.add_parser("list", help="List all theories in the semantic database")
