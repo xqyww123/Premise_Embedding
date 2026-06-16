@@ -21,6 +21,25 @@ from .semantic_embedding import Vector_Store, Embedding_Provider, embedding_prov
 from .base import ToolCall_ret, mk_ret as _mk_ret
 from .hover import resolve_context_at
 
+
+def unpack_thy_status(raw: bytes) -> dict:
+    """Unpack a 16-byte theory-status record, normalizing every key to ``bytes``.
+
+    Theory-status records (cost / token counts / ``finished`` / ``model`` / embed
+    ``total_tokens``) are keyed by ``bytes`` (``d[b"cost_usd"]``) throughout this
+    module.  Historically some were written with str keys (``packb`` of
+    str-literal dicts) and some read-modify-write paths injected bytes keys into
+    str-keyed dicts, leaving str-only or mixed records on disk.  Decode through
+    this helper and index by bytes everywhere: str keys are encoded to bytes so
+    legacy str/mixed records still read correctly, and re-packing the normalized
+    dict rewrites the record with clean bytes keys on its next write.
+
+    NOTE: entity/interpretation records are positional msgpack tuples, NOT keyed
+    dicts, so they are unaffected by the key type and never pass through here."""
+    d = msgpack.unpackb(raw)
+    return {(k.encode() if isinstance(k, str) else k): v for k, v in d.items()}
+
+
 # Long theory names to exclude from interpretation and entity enumeration.
 _SKIP_THEORY_LONG_NAMES = ["Pure", "Tools.Code_Generator", "HOL.Code_Evaluation", "HOL.Typerep"]
 
@@ -200,7 +219,7 @@ class _Semantic_DB:
             raw = txn.get(key)
         if raw is None:
             return False
-        return msgpack.unpackb(raw).get(b"finished", False)
+        return unpack_thy_status(raw).get(b"finished", False)
 
     def mark_interpreted(self, key: universal_key) -> None:
         """Mark a theory as interpreted (finished) in the semantic store.
@@ -210,15 +229,15 @@ class _Semantic_DB:
         with self._ensure_env().begin(write=True) as txn:
             raw = txn.get(key)
             if raw is not None:
-                data = msgpack.unpackb(raw)
+                data = unpack_thy_status(raw)
                 data[b"finished"] = True
                 txn.put(key, msgpack.packb(data))  # type: ignore
             else:
                 txn.put(key, msgpack.packb({
-                    "input_tokens": 0, "cache_creation_tokens": 0,
-                    "cache_read_tokens": 0, "output_tokens": 0,
-                    "cost_usd": 0.0, "finished": True,
-                    "model": "",
+                    b"input_tokens": 0, b"cache_creation_tokens": 0,
+                    b"cache_read_tokens": 0, b"output_tokens": 0,
+                    b"cost_usd": 0.0, b"finished": True,
+                    b"model": "",
                 }))  # type: ignore
 
     def clean_wip(self) -> int:
@@ -361,7 +380,7 @@ class _Semantic_DB:
         for candidate_hash, _ in candidates:
             with sem_env.begin() as txn:
                 raw = txn.get(candidate_hash)
-            if raw is not None and msgpack.unpackb(raw).get(b"finished", False):
+            if raw is not None and unpack_thy_status(raw).get(b"finished", False):
                 old_hash = candidate_hash
                 break
 
@@ -808,7 +827,7 @@ class Semantic_Vector_Store(Vector_Store):
             raw = txn.get(theory_key)
         if raw is None:
             return False
-        return msgpack.unpackb(raw).get(b"finished", False)
+        return unpack_thy_status(raw).get(b"finished", False)
 
     def thy_embed_tokens(self, theory_key: universal_key) -> int | None:
         """Look up the total tokens used to embed a theory. Returns None if not found."""
@@ -816,7 +835,7 @@ class Semantic_Vector_Store(Vector_Store):
             raw = txn.get(theory_key)
         if raw is None:
             return None
-        return msgpack.unpackb(raw).get(b"total_tokens", 0)
+        return unpack_thy_status(raw).get(b"total_tokens", 0)
 
     def mark_thy_embedded(self, theory_key: universal_key, total_tokens: int = 0) -> None:
         """Mark a theory as fully embedded in this vector store, recording token usage.
@@ -826,7 +845,7 @@ class Semantic_Vector_Store(Vector_Store):
         with self._env.begin(write=True) as txn:
             raw = txn.get(theory_key)
             if raw is not None:
-                data = msgpack.unpackb(raw)
+                data = unpack_thy_status(raw)
             else:
                 data = {}
             data[b"finished"] = True

@@ -35,7 +35,7 @@ from claude_agent_sdk.types import (
 
 from .base import ToolCall_ret, mk_ret as _mk_ret
 from .desugar import mk_desugar_and_explain_tool
-from .semantics import Provenance, Semantic_DB, SemanticRecord
+from .semantics import Provenance, Semantic_DB, SemanticRecord, unpack_thy_status
 
 # --- Module-level configuration ---
 
@@ -217,13 +217,12 @@ class InterpretationTask:
 
     def historical_cost(self) -> tuple[int, int, int, int, float]:
         """Read cumulative cost from LMDB (without modifying it)."""
-        import msgpack
         env = Semantic_DB._ensure_env()
         with env.begin() as txn:
             raw = txn.get(self.theory_key)
         if raw is None:
             return (0, 0, 0, 0, 0.0)
-        prev = msgpack.unpackb(raw)
+        prev = unpack_thy_status(raw)
         return (prev.get(b"input_tokens", 0),
                 prev.get(b"cache_creation_tokens", 0),
                 prev.get(b"cache_read_tokens", 0),
@@ -238,7 +237,7 @@ class InterpretationTask:
             raw = txn.get(self.theory_key)
             prev_in, prev_cw, prev_cr, prev_out, prev_cost, finished = 0, 0, 0, 0, 0.0, False
             if raw is not None:
-                prev = msgpack.unpackb(raw)
+                prev = unpack_thy_status(raw)
                 prev_in = prev.get(b"input_tokens", 0)
                 prev_cw = prev.get(b"cache_creation_tokens", 0)
                 prev_cr = prev.get(b"cache_read_tokens", 0)
@@ -251,13 +250,13 @@ class InterpretationTask:
                      prev_out + self.total_output_tokens,
                      prev_cost + self.total_cost_usd)
             packed: bytes = msgpack.packb({  # type: ignore[assignment]
-                "input_tokens": total[0],
-                "cache_creation_tokens": total[1],
-                "cache_read_tokens": total[2],
-                "output_tokens": total[3],
-                "cost_usd": total[4],
-                "finished": finished,
-                "model": interpretation_model,
+                b"input_tokens": total[0],
+                b"cache_creation_tokens": total[1],
+                b"cache_read_tokens": total[2],
+                b"output_tokens": total[3],
+                b"cost_usd": total[4],
+                b"finished": finished,
+                b"model": interpretation_model,
             })
             txn.put(self.theory_key, packed)
         self.total_input_tokens = 0
