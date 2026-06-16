@@ -91,6 +91,61 @@ assert set(_KIND_PROMPT_LABELS) == {
 
 _BATCH_SIZE = 20
 
+# Standing instructions for the interpretation agent.  These are batch- and
+# file-independent, so they live in the system prompt rather than the per-batch
+# user messages: the system prompt is re-sent verbatim on every request and is
+# never folded into a context-compaction summary, so the agent keeps the full
+# translation spec even after the original batch prompts have been compacted
+# away.  Only the per-batch work (which theory/file, which entries) stays in
+# the user messages built by `build_prompt`.
+_SYSTEM_PROMPT = """\
+You informalize entities from Isabelle theory files: you translate each formal \
+statement you are given into a thorough, self-contained plain-English description.
+
+For each entry, aim for 2–5 sentences. \
+State only what the entity defines or asserts. \
+Do NOT explain how it is derived or why it is useful. \
+The formal statement is already shown; describe its meaning **rather than** transcribing it. \
+Prefer plain English over formulas. Wrap formulas in backticks (e.g., `x`, `x + 1`). \
+When a lemma/rule/term has a well-known name (e.g., proof by contradiction), you MUST mention it explicitly in the translation. \
+Every translation must be **self-contained**: assume the reader has no prior context and knows no notation. \
+Do not assume they know what any symbol means — for instance, do not assume they know that `x # l` prepends `x` \
+to the list `l`; spell out such notation wherever you use it. \
+Make sure that every nonstandard notion has been clearly explained somewhere in each of your translations. \
+Be thorough rather than terse: fully unfold what the statement means — name and explain every variable, symbol, \
+and sub-expression it involves — instead of compressing it into a single line (still without explaining its \
+derivation or usefulness).
+
+- For a `named theorem bundles` entry, describe what kind of facts the collection gathers and its purpose; \
+you may use the listed current members to infer this, but do NOT enumerate the members in your answer. \
+The declared comment in the command (if any) is often terse, inaccurate, or incomplete, so check it \
+against the members: copy it verbatim only when it is genuinely complete and accurate, otherwise \
+correct and expand it into a full description using the members. \
+- For a `proof method` entry, describe the proof strategy or tactic it performs, when it should be used, \
+and what kinds of proof goals it is meant to solve; if its description is empty, \
+draw on the surrounding context and its uses in other files to learn what it does.
+
+Line numbers in brackets (e.g. [line 42]) indicate where each entity appears in the source file.
+
+Examples of good translations:
+- constant Nat.add: The addition operator on natural numbers, taking two natural numbers and returning their sum.
+- lemma List.length_append: The length of the concatenation of two lists equals the sum of their individual lengths.
+- lemma List.map_comp: Mapping `f` then `g` over a list is the same as mapping their composition `g ∘ f`.
+- type Prod: The product type, consisting of a pair of two values of possibly different types.
+- introduction rule notI `(P ⟹ False) ⟹ ¬P`: The rule of proof by contradiction — to prove `¬P`, assume `P` and derive `False`.
+- named theorem bundles Groups.algebra_simps: A collection of rewrite rules that normalise expressions over groups, rings and related structures — multiplying products out and ordering sums and products into a canonical form — so the simplifier can decide algebraic equalities and help discharge inequalities.
+- proof method Presburger.presburger: An automatic decision procedure for first-order linear arithmetic over integers and naturals (Presburger arithmetic) — it eliminates quantifiers and handles divisibility and modulo constraints via Cooper's algorithm.
+
+Translation hints:
+- Suc n → "the successor of n" or "n + 1"
+
+When you encounter an entity whose meaning is unclear, use `mcp__isabelle_semantics__query`, \
+`mcp__isabelle_semantics__hover`, or \
+`mcp__isabelle_semantics__definition` to look it up before translating. \
+However, you cannot query entries you have been asked to translate — do it yourself.
+
+Submit all translations via `mcp__isabelle_semantics__answer`."""
+
 
 def _label(e: Entry) -> str:
     """The agent-facing addressing label for an entry: kind-title + name.
@@ -294,73 +349,17 @@ class InterpretationTask:
 
         if indices.start != 0:
             return (
-                f"Continue to translate the following entities into thorough, self-contained plain English "
-                f"(aim for 3–6 sentences each). "
-                f"State only what the entity defines or asserts. "
-                f"Do NOT explain how it is derived or why it is useful. "
-                f"The formal statement is already shown; describe its meaning rather than transcribing it. "
-                f"Prefer plain English over formulas. Wrap formulas in backticks (like `x`, `x + 1`). "
-                f"Every translation must be **self-contained**: assume the reader has no prior context and "
-                f"knows no notation. Do not assume they know what any symbol means — for instance, do not "
-                f"assume they know that `x # l` prepends `x` to the list `l`; spell out such notation wherever "
-                f"you use it. Make sure that every nonstandard notion has been clearly explained somewhere in "
-                f"each of your translations. Be thorough rather than terse: fully unfold what the statement "
-                f"means — name and explain every variable, symbol, and sub-expression it involves — instead of "
-                f"compressing it into a single line (still without explaining its derivation or usefulness).\n\n"
+                f'Continue with the following entities from theory "{theory_longname}".\n\n'
                 f"Entries:\n{entries_text}\n\n"
                 f"Submit translations via `mcp__isabelle_semantics__answer`."
             )
 
-        return f"""\
-Load the skills `isabelle-intro-elim-rules`, `isabelle-datatype`, and `isabelle-record`.
-Informalize the following entities from Isabelle theory "{theory_longname}" (location: {file_path})
-
-Entries:
-{entries_text}
-
-Line numbers in brackets (e.g. [line 42]) indicate where each entity appears in the source file.
-
-For each entry, translate the formal statement into a thorough, self-contained plain-English description (aim for 3\u20136 sentences). \
-State only what the entity defines or asserts. \
-Do NOT explain how it is derived or why it is useful. \
-The formal statement is already shown; describe its meaning **rather than** transcribing it. \
-Prefer plain English over formulas. Wrap formulas in backticks (e.g., `x`, `x + 1`). \
-When a lemma/rule/term has a well-known name (e.g., proof by contradiction), you MUST mention it explicitly in the translation. \
-Every translation must be **self-contained**: assume the reader has no prior context and knows no notation. \
-Do not assume they know what any symbol means — for instance, do not assume they know that `x # l` prepends `x` \
-to the list `l`; spell out such notation wherever you use it. \
-Make sure that every nonstandard notion has been clearly explained somewhere in each of your translations. \
-Be thorough rather than terse: fully unfold what the statement means — name and explain every variable, symbol, \
-and sub-expression it involves — instead of compressing it into a single line (still without explaining its \
-derivation or usefulness).
-
-- For a `named theorem bundles` entry, describe what kind of facts the collection gathers and its purpose; \
-you may use the listed current members to infer this, but do NOT enumerate the members in your answer. \
-The declared comment in the command (if any) is often terse, inaccurate, or incomplete, so check it \
-against the members: copy it verbatim only when it is genuinely complete and accurate, otherwise \
-correct and expand it into a full description using the members. \
-- For a `proof method` entry, describe the proof strategy or tactic it performs, when it should be used, \
-and what kinds of proof goals it is meant to solve; if its description is empty, \
-draw on the surrounding context and its uses in other files to learn what it does.
-
-Examples of good translations:
-- constant Nat.add: The addition operator on natural numbers, taking two natural numbers and returning their sum.
-- lemma List.length_append: The length of the concatenation of two lists equals the sum of their individual lengths.
-- lemma List.map_comp: Mapping `f` then `g` over a list is the same as mapping their composition `g \u2218 f`.
-- type Prod: The product type, consisting of a pair of two values of possibly different types.
-- introduction rule notI `(P \u27f9 False) \u27f9 \u00acP`: The rule of proof by contradiction \u2014 to prove `\u00acP`, assume `P` and derive `False`.
-- named theorem bundles Groups.algebra_simps: A collection of rewrite rules that normalise expressions over groups, rings and related structures — multiplying products out and ordering sums and products into a canonical form — so the simplifier can decide algebraic equalities and help discharge inequalities.
-- proof method Presburger.presburger: An automatic decision procedure for first-order linear arithmetic over integers and naturals (Presburger arithmetic) — it eliminates quantifiers and handles divisibility and modulo constraints via Cooper's algorithm.
-
-Translation hints:
-- Suc n \u2192 "the successor of n" or "n + 1"
-
-When you encounter an entity whose meaning is unclear, use `mcp__isabelle_semantics__query`, \
-`mcp__isabelle_semantics__hover`, or \
-`mcp__isabelle_semantics__definition` to look it up before translating. \
-However, you cannot query entries you have been asked to translate \u2014 do it yourself.
-
-Submit all translations via `mcp__isabelle_semantics__answer` for each entry."""
+        return (
+            f"Load the skills `isabelle-intro-elim-rules`, `isabelle-datatype`, and `isabelle-record`.\n"
+            f'Informalize the following entities from Isabelle theory "{theory_longname}" (location: {file_path}).\n\n'
+            f"Entries:\n{entries_text}\n\n"
+            f"Submit translations via `mcp__isabelle_semantics__answer`."
+        )
 
 _local_task: contextvars.ContextVar[InterpretationTask] = contextvars.ContextVar('_local_task')
 
@@ -739,6 +738,7 @@ async def interpret_file(
 
             options = ClaudeAgentOptions(
                 model=interpretation_model,
+                system_prompt=_SYSTEM_PROMPT,
                 cwd=str(Path(__file__).parent / "Agent_Interpretation_Dir"),
                 setting_sources=["project"],
                 permission_mode="default",
