@@ -349,7 +349,7 @@ class InterpretationTask:
 
         if indices.start != 0:
             return (
-                f'Continue with the following entities from theory "{theory_longname}".\n\n'
+                f'Continue with the following entities from Isabelle theory "{theory_longname}" (location: {file_path}).\n\n'
                 f"Entries:\n{entries_text}\n\n"
                 f"Submit translations via `mcp__isabelle_semantics__answer`."
             )
@@ -615,7 +615,8 @@ async def _run_agent(options: ClaudeAgentOptions) -> None:
                           len(chunk), len(missing_idx))
                 missing_text = task.format_entries(chunk)
                 header = (
-                    f"You still have {len(missing_idx)} unanswered entries"
+                    f"You still have {len(missing_idx)} unanswered entries from theory "
+                    f'"{task.theory_longname}" (location: {task.file_path})'
                     + (f"; here are the first {len(chunk)}"
                        if len(missing_idx) > len(chunk) else "")
                 )
