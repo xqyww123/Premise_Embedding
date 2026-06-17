@@ -413,10 +413,12 @@ fun keywords_of_wip_file file_path text =
    resolves to that Ignored command under live, but yields NONE here (the caller
    then degrades to a single-line search).  Harmless in practice: query offsets
    land inside commands and hover/definition never probe whitespace. *)
-fun command_spans_of_file file_path : (string * int * int) list =
+(* Cut a theory source TEXT into command spans (source, start_sym_off,
+   end_sym_off) via local Outer_Syntax.  Pure function of (file_path, text):
+   file_path only seeds the lexing Position and the keyword resolution. *)
+fun command_spans_of_text file_path text : (string * int * int) list =
   \<^try>\<open>
     let
-      val text = File.read (Path.explode file_path)
       val tpos = Position.file file_path
       val kws = keywords_of_wip_file file_path text
       val toks = Token.explode kws tpos text
@@ -445,11 +447,57 @@ fun command_spans_of_file file_path : (string * int * int) list =
       map_filter (fn span => if is_command span then span_entry span else NONE) spans
     end
     catch exn =>
+      (warning ("PIDE_State.command_spans_of_text: " ^ Runtime.exn_message exn); [])
+  \<close>;
+
+(* Memo cache for command_spans_of_file, keyed by (file_path, content digest).
+   The cut is reused across the degeneracy check + the WIP fallback + repeated
+   queries, but a content change (digest mismatch — e.g. a WIP file being edited)
+   forces a fresh cut, so it never serves stale spans. *)
+val command_spans_cache : (string * (string * int * int) list) Symtab.table Synchronized.var =
+  Synchronized.var "PIDE_State.command_spans_cache" Symtab.empty;
+
+fun command_spans_of_file file_path : (string * int * int) list =
+  \<^try>\<open>
+    let
+      val text = File.read (Path.explode file_path)
+      val digest = SHA1.rep (SHA1.digest text)
+    in
+      case Symtab.lookup (Synchronized.value command_spans_cache) file_path of
+        SOME (d, spans) => if d = digest then spans
+                           else
+                             let val spans' = command_spans_of_text file_path text in
+                               Synchronized.change command_spans_cache
+                                 (Symtab.update (file_path, (digest, spans')));
+                               spans'
+                             end
+      | NONE =>
+          let val spans = command_spans_of_text file_path text in
+            Synchronized.change command_spans_cache
+              (Symtab.update (file_path, (digest, spans)));
+            spans
+          end
+    end
+    catch exn =>
       (warning ("PIDE_State.command_spans_of_file: " ^ Runtime.exn_message exn); [])
   \<close>;
 
 fun command_at_position_wip file off =
   List.find (fn (_, s, e) => off >= s andalso off < e) (command_spans_of_file file);
+
+(* Detect a DEGENERATE snapshot result.  A healthy command_at_position_pide
+   returns exactly ONE command's span [s,e].  A degenerate DB snapshot
+   (Build.read_theory rebuilds the whole theory as one Command.unparsed; a
+   whole-file COMMAND_SPAN then makes try_substring return the ENTIRE file)
+   returns a span covering many commands.  We test this against the trusted,
+   snapshot-independent local Outer_Syntax cut: count command STARTS that lie
+   STRICTLY inside (s,e).  Healthy -> 0; whole-file -> ~all other starts.  This
+   is robust and threshold-free (1-vs-many on exact symbol offsets); it does NOT
+   re-lex the returned source (re-lexing an isolated structured Isar statement
+   like `lemma .. if .. for ..` spuriously yields >1 command — verified offline,
+   ~9% of real commands, which is why a re-lex/count==1 check is NOT used). *)
+fun snapshot_result_is_degenerate file (s, e) =
+  exists (fn (_, ls, _) => ls > s andalso ls < e) (command_spans_of_file file);
 
 fun command_at_position pos =
   let val (file, offset) = pos_file_offset pos
@@ -457,7 +505,19 @@ fun command_at_position pos =
     if file = "" orelse offset = 0 then NONE
     else
       case command_at_position_pide file offset of
-        SOME r => SOME r
+        SOME (r as (_, s, e)) =>
+          if not (snapshot_result_is_degenerate file (s, e)) then SOME r
+          else
+            (* Snapshot merged many commands into one span (whole-file dump).
+               Repair via the local cut when the theory is loaded (authoritative
+               keywords -> faithful span); otherwise degrade to NONE rather than
+               return the whole file or risk a header-keyword mislex. *)
+            (warning ("PIDE_State.command_at_position: degenerate snapshot for " ^
+               file ^ " (span " ^ string_of_int s ^ ".." ^ string_of_int e ^
+               " spans multiple commands); using local command cut");
+             case theory_of_file file of
+               SOME _ => command_at_position_wip file offset
+             | NONE => NONE)
       | NONE => command_at_position_wip file offset
   end;
 
