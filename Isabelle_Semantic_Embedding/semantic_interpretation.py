@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 import logging
 import os
+import re
 from pathlib import Path
 from collections.abc import Iterable
 from typing import Any, NamedTuple, cast
@@ -90,6 +91,17 @@ assert set(_KIND_PROMPT_LABELS) == {
     "ints (all kinds except THEORY); it has drifted from Universal_Key.entity_kind_int")
 
 _BATCH_SIZE = 20
+
+# Upper bound on how many times _run_agent may recycle its client for the SAME
+# file on hard-failure paths (poisoned session, or an unexpected transport
+# exception) before giving up — these paths make no progress on their own, so
+# without a cap they spin.  Usage-limit / rate-limit waits do NOT consume this
+# budget (they are throttled and resume legitimately).
+_MAX_AGENT_RECYCLES = 8
+
+# Consecutive retry rounds with no newly-answered entry after which the retry
+# loop abandons the still-missing entries (left as None) rather than spinning.
+_MAX_STALLED_RETRIES = 3
 
 # Standing instructions for the interpretation agent.  These are batch- and
 # file-independent, so they live in the system prompt rather than the per-batch
@@ -420,13 +432,20 @@ async def _answer_tool(args: dict[str, Any]) -> ToolCall_ret:
         if key not in task.results:
             errors.append(f"Unknown entry: {key!r}")
             continue
-        task.results[key] = item["translation"]
+        # Strip lone UTF-16 surrogates the model occasionally emits mid math-
+        # alphanumeric glyph (e.g. a bare U+D835 with no low half).  They crash
+        # msgpack's strict-UTF-8 packb in write_answer (semantics.py) — so the
+        # answer would be silently lost on exactly the entry that glitched — and,
+        # left in the conversation, make every subsequent API request fail with
+        # 400 "no low surrogate in string", wedging the whole file.
+        trans = re.sub(r"[\ud800-\udfff]", "", item["translation"])
+        task.results[key] = trans
         # Address by the precomputed label->entry-index map (O(1), and indexes
         # the FULL `entries` list correctly).  The old `_keys.index(key)` indexed
         # the deduped key list against the full entries list — the misalignment
         # that wrote translations onto neighbouring entries' universal_keys.
-        task.write_answer(task._label_to_idx[key], item["translation"])
-        _log.info("answer: %s = %s", key, item["translation"])
+        task.write_answer(task._label_to_idx[key], trans)
+        _log.info("answer: %s = %s", key, trans)
         count += 1
     batch_remaining = sum(1 for i in task.batch_range if task.results[task._keys[i]] is None)
     cs = "" if count == 1 else "s"
@@ -565,7 +584,55 @@ class RateLimitError(Exception):
     """API rate limit (429)."""
     pass
 
-async def _run_agent(options: ClaudeAgentOptions) -> None:
+class PoisonedSessionError(Exception):
+    """The conversation carries content the API rejects on every request
+    (HTTP 400) — e.g. a lone UTF-16 surrogate the model emitted in an earlier
+    answer is now pinned in the subprocess transcript.  Recoverable only by
+    discarding the session, so `_run_agent` recycles the client (fresh, no
+    resume) and continues with the still-missing entries."""
+    pass
+
+def _handle_message(task: InterpretationTask, message: Any) -> None:
+    """Process one message from a `receive_response` loop: log it, accumulate
+    usage for ResultMessages, and raise ReachLimitError/RateLimitError on a
+    usage-cap or rate-limit signal so `_run_agent`'s handlers apply the 20-min
+    wait / backoff.
+
+    Shared by BOTH the batch-0 loop and the missing-entry retry loop.  The
+    retry loop used to inline only `_log_message` + `_accumulate_usage`,
+    swallowing the limit/rate signals — so a usage cap hit during retries
+    span instantly (thousands of "You've hit your limit" rounds with no wait)
+    instead of sleeping until the reset."""
+    if RateLimitEvent is not None and isinstance(message, RateLimitEvent):
+        if message.rate_limit_info.status == "rejected":
+            raise ReachLimitError()
+        return
+    _log_message(message)
+    content = getattr(message, "content", None)
+    if content is not None and isinstance(content, list) and content:
+        block = content[0]
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            if text.startswith("You've hit your limit"):
+                raise ReachLimitError()
+            if "Rate limit" in text:
+                raise RateLimitError()
+    if isinstance(message, ResultMessage):
+        # A hard request-level rejection (e.g. 400 from a lone surrogate in the
+        # transcript) carries its text in `errors`, NOT `result` (which is None
+        # here), so the result-string checks below would miss it.  Detect via
+        # the language-independent api_error_status, and raise BEFORE
+        # _accumulate_usage so the poisoned round does not flush cost.
+        if message.is_error and getattr(message, "api_error_status", None) == 400:
+            raise PoisonedSessionError()
+        _accumulate_usage(task, message)
+        if message.is_error and message.result:
+            if message.result.startswith("You've hit your limit"):
+                raise ReachLimitError()
+            if "Rate limit" in message.result:
+                raise RateLimitError()
+
+async def _run_agent(options: ClaudeAgentOptions, depth: int = 0) -> None:
     task = _local_task.get()
     first_prompt, task.batch_range = task.batches[0]
     try:
@@ -574,27 +641,7 @@ async def _run_agent(options: ClaudeAgentOptions) -> None:
                     task.batch_range.start, task.batch_range.stop - 1)
             await client.query(first_prompt)
             async for message in client.receive_response():
-                if RateLimitEvent is not None and isinstance(message, RateLimitEvent):
-                    if message.rate_limit_info.status == "rejected":
-                        raise ReachLimitError()
-                    continue
-                _log_message(message)
-                content = getattr(message, "content", None)
-                if content is not None and isinstance(content, list) and content:
-                    block = content[0]
-                    text = getattr(block, "text", None)
-                    if isinstance(text, str):
-                        if text.startswith("You've hit your limit"):
-                            raise ReachLimitError()
-                        if "Rate limit" in text:
-                            raise RateLimitError()
-                if isinstance(message, ResultMessage):
-                    _accumulate_usage(task, message)
-                    if message.is_error and message.result:
-                        if message.result.startswith("You've hit your limit"):
-                            raise ReachLimitError()
-                        if "Rate limit" in message.result:
-                            raise RateLimitError()
+                _handle_message(task, message)
             # Retry any globally missing entries.  Re-send the full entry text
             # (line, kind, name, proposition) via format_entries, NOT bare names:
             # after context compaction the original batch prompts are gone, and
@@ -605,11 +652,26 @@ async def _run_agent(options: ClaudeAgentOptions) -> None:
             # hundreds of entries unanswered, and a single message carrying all
             # their propositions + provenance hints would dwarf the normal
             # batch prompts and immediately re-trigger compaction.
+            prev_missing: int | None = None
+            stall = 0
             while True:
                 missing_idx = [i for i, k in enumerate(task._keys)
                                if task.results[k] is None]
                 if not missing_idx:
                     break
+                # Give up if the retry loop makes no progress: a chunk the agent
+                # cannot (or will not) answer — refusal, an undetected request
+                # error — must not spin forever.  Leave those entries None.
+                if prev_missing is not None and len(missing_idx) >= prev_missing:
+                    stall += 1
+                    if stall >= _MAX_STALLED_RETRIES:
+                        _log.error("agent: giving up %d entries after %d stalled "
+                                   "retry rounds: %s", len(missing_idx),
+                                   stall, [task._keys[i] for i in missing_idx])
+                        break
+                else:
+                    stall = 0
+                prev_missing = len(missing_idx)
                 chunk = missing_idx[:_BATCH_SIZE]
                 _log.info("agent: retrying %d of %d missing entries",
                           len(chunk), len(missing_idx))
@@ -627,20 +689,46 @@ async def _run_agent(options: ClaudeAgentOptions) -> None:
                     f"Each translation must describe the formal statement shown above next to that exact name."
                 )
                 async for message in client.receive_response():
-                    _log_message(message)
-                    if isinstance(message, ResultMessage):
-                        _accumulate_usage(task, message)
+                    _handle_message(task, message)
         _log.info("total usage: input=%d cache_write=%d cache_read=%d output=%d tokens, cost=$%.4f",
                 task.total_input_tokens, task.total_cache_creation_tokens,
                 task.total_cache_read_tokens, task.total_output_tokens, task.total_cost_usd)
     except ReachLimitError:
+        # Throttled, legitimate retry — does not consume the recycle budget.
         _log.info("agent: reached usage limit, waiting 20min to retry")
         await asyncio.sleep(1200)
-        return await _run_agent(options)
+        return await _run_agent(options, depth)
     except RateLimitError:
+        # Throttled, legitimate retry — does not consume the recycle budget.
         _log.info("agent: API rate limit, waiting 2s to retry")
         await asyncio.sleep(2)
-        return await _run_agent(options)
+        return await _run_agent(options, depth)
+    except PoisonedSessionError:
+        # The conversation is irrecoverably rejected by the API (e.g. a lone
+        # surrogate pinned in the transcript).  Recycle with a FRESH client
+        # (these options carry no resume/session keys, so the bad history is
+        # dropped) and continue with the still-missing entries — answers
+        # already written persist in `task.results`, so we do not redo them.
+        if depth >= _MAX_AGENT_RECYCLES:
+            _log.error("agent: poisoned session persisted after %d recycles; "
+                       "giving up remaining entries", depth)
+            return
+        _log.warning("agent: poisoned session (API 400); recycling client "
+                     "(recycle %d/%d)", depth + 1, _MAX_AGENT_RECYCLES)
+        return await _run_agent(options, depth + 1)
+    except Exception:
+        # An unexpected transport/SDK failure can escape receive_response with
+        # no preceding error ResultMessage, bypassing the loops above and
+        # killing the whole file.  Recycle a bounded number of times, then
+        # re-raise so genuine bugs still surface.
+        if depth >= _MAX_AGENT_RECYCLES:
+            _log.exception("agent: unexpected failure persisted after %d "
+                           "recycles; re-raising", depth)
+            raise
+        _log.exception("agent: unexpected failure; recycling client "
+                       "(recycle %d/%d)", depth + 1, _MAX_AGENT_RECYCLES)
+        await asyncio.sleep(2)
+        return await _run_agent(options, depth + 1)
 
 
 # --- Public API ---
