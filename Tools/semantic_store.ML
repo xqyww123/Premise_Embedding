@@ -499,6 +499,25 @@ fun build_entries (context : Context.generic)
       catch exn =>
         warning ("build_entries: provenance availability check failed, " ^
           "hints degrade to name + proposition: " ^ Runtime.exn_message exn)\<close>
+    (* Stored interpretations are free-form agent prose and may carry embedded
+       newlines.  Such a newline would split a single provenance segment (head /
+       Locale "..." line) across several physical lines, breaking the per-line
+       collapse on the Python side (semantic_interpretation.format_entries).
+       Scan first (cheap, early-exit, no allocation) and only rebuild when a
+       newline is actually present — the common case is newline-free. *)
+    fun single_line s =
+      let
+        val n = size s
+        val i = Unsynchronized.ref 0
+        val has_nl = Unsynchronized.ref false
+      in
+        while !i < n andalso not (!has_nl) do
+          (if String.sub (s, !i) = #"\n" then has_nl := true else ();
+           i := !i + 1);
+        if !has_nl
+        then String.map (fn c => if c = #"\n" then #" " else c) s
+        else s
+      end
     val sem_cache : string option Bytehashtab.table = Bytehashtab.empty 64
     fun sem_of NONE = NONE
       | sem_of (SOME uk) =
@@ -507,10 +526,12 @@ fun build_entries (context : Context.generic)
                   SOME r => r
                 | NONE =>
                     let
-                      val r = \<^try>\<open>query_semantics_by_key uk false
-                        catch exn =>
-                          (warning ("build_entries: stored interpretation lookup failed: " ^
-                             Runtime.exn_message exn); NONE)\<close>
+                      val r =
+                        \<^try>\<open>query_semantics_by_key uk false
+                          catch exn =>
+                            (warning ("build_entries: stored interpretation lookup failed: " ^
+                               Runtime.exn_message exn); NONE)\<close>
+                        |> Option.map single_line
                       val _ = Bytehashtab.update sem_cache (uk, r)
                     in r end)
 
