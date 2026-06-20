@@ -911,11 +911,32 @@ fun make_entity_callbacks (init_context: Context.generic) (ctxt_unpack: Context_
         "Extended_Nonnegative_Real.ennreal"]
       val {is_infra_const, is_infra_thm, is_infra_induct_thm,
            is_infra_type, is_infra_class, is_infra_locale,
-           is_infra_dynamic_fact, is_infra_method} =
+           is_infra_dynamic_fact, is_infra_method,
+           is_declared_infra_thm, has_infra_decls} =
         Infra_Filter.gen_infra_filters init_context
-      val {entries = cached_entries, intro = cached_intro, elim = cached_elim,
-           induct = cached_induct, case_ = cached_case, facts = cached_facts} =
+      val {entries = cached_entries0, intro = cached_intro0, elim = cached_elim0,
+           induct = cached_induct0, case_ = cached_case0, facts = cached_facts} =
         Thm_Cache.get (Context.theory_of init_context)
+      (* Drop user-declared infra entries from the persistent caches.  The live KNN
+         CACHED pass (context.ML make_thm_like_callback) does NOT re-apply the infra
+         filter — it trusts entries were filtered at build time — so a declaration made
+         after a fact was cached would otherwise still surface.  is_declared_infra_thm
+         adds exactly the decl-driven drops (name match + const-mention cascade).  Gated
+         on has_infra_decls, so without any `declare` this is a no-op and runs are
+         byte-identical.  The delta/dynamic-member lists below are recomputed live this
+         run through is_infra_thm/is_infra_induct_thm, which already see declarations. *)
+      fun fact_base_name (Context_Callbacks.Fixed (nm, _)) = nm
+        | fact_base_name (Context_Callbacks.Member_of_Dynamic coll) = coll
+      fun drop_declared es =
+        if has_infra_decls
+        then filter (fn (e : Context_Callbacks.cached_thm_entry) =>
+               not (is_declared_infra_thm (fact_base_name (#name e), #thm e))) es
+        else es
+      val cached_entries = drop_declared cached_entries0
+      val cached_intro = drop_declared cached_intro0
+      val cached_elim = drop_declared cached_elim0
+      val cached_induct = drop_declared cached_induct0
+      val cached_case = drop_declared cached_case0
       (* Process uncached facts now, so callbacks see 0 uncached.  Option A: the
          proof-local theorem delta is folded into BOTH the theorem cache and the
          four rule buckets (via classify_rule_entries), with snapshot = current_facts,

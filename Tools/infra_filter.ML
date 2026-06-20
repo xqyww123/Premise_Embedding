@@ -9,7 +9,9 @@ signature INFRA_FILTER = sig
      is_infra_class: string -> bool,
      is_infra_locale: string -> bool,
      is_infra_dynamic_fact: string -> bool,
-     is_infra_method: string -> bool}
+     is_infra_method: string -> bool,
+     is_declared_infra_thm: string * thm -> bool,
+     has_infra_decls: bool}
 end
 
 structure Infra_Filter : INFRA_FILTER = struct
@@ -30,14 +32,58 @@ fun is_infra_session thy =
    char after `Minilang` is `.` vs `_`). *)
 val infra_base_theory_names = ["Minilang"]
 
+(* User-declared infrastructure entities (via `declare [[infra_constant/infra_thm/
+   infra_type ...]]`).  Three name sets — constants, theorems (canonical full fact
+   names), types — consulted by `gen_infra_filters` below.  A declared infra constant
+   behaves identically to a built-in infra constant (e.g. `Minilang.*`): it is filtered
+   AND cascades to every theorem whose statement mentions it (via `is_internal_constant`
+   feeding `is_infra_thm`). *)
+structure Infra_Decl = Generic_Data (
+  type T = Symtab.set * Symtab.set * Symtab.set   (* consts, thms, types *)
+  val empty = (Symtab.empty, Symtab.empty, Symtab.empty)
+  fun merge ((c1,t1,y1),(c2,t2,y2)) =
+    (Symtab.merge (K true) (c1,c2),
+     Symtab.merge (K true) (t1,t2),
+     Symtab.merge (K true) (y1,y2))
+)
+
+(* The declaration attributes ignore the theorem (they only mutate context data), so
+   they are used in the `declare [[ ... ]]` no-fact form. *)
+fun infra_decl_attr add = Thm.declaration_attribute (K (Infra_Decl.map add))
+
+val _ = Theory.setup (
+  Attrib.setup \<^binding>\<open>infra_constant\<close>
+    (Scan.repeat1 (Args.const {proper = true, strict = false}) >>
+      (fn ns => infra_decl_attr (fn (c,t,y) => (fold Symtab.insert_set ns c, t, y))))
+    "declare constants as semantic-retrieval infrastructure" #>
+  Attrib.setup \<^binding>\<open>infra_type\<close>
+    (Scan.repeat1 (Args.type_name {proper = true, strict = false}) >>
+      (fn ns => infra_decl_attr (fn (c,t,y) => (c, t, fold Symtab.insert_set ns y))))
+    "declare types as semantic-retrieval infrastructure" #>
+  Attrib.setup \<^binding>\<open>infra_thm\<close>
+    (Scan.lift (Scan.repeat1 Parse.name_position) >>
+      (fn nps => Thm.declaration_attribute (fn _ => fn context =>
+         let val facts =
+               Context.cases Global_Theory.facts_of Proof_Context.facts_of context
+             val ns = map (Facts.check context facts) nps
+         in Infra_Decl.map
+              (fn (c,t,y) => (c, fold Symtab.insert_set ns t, y)) context end)))
+    "declare theorems as semantic-retrieval infrastructure")
+
 fun gen_infra_filters (context : Context.generic)
     : {is_infra_const: string -> bool,
        is_infra_thm: string * thm -> bool,
        is_infra_induct_thm: string * thm -> bool,
        is_infra_type: string -> bool, is_infra_class: string -> bool,
        is_infra_locale: string -> bool,
-       is_infra_dynamic_fact: string -> bool, is_infra_method: string -> bool} =
+       is_infra_dynamic_fact: string -> bool, is_infra_method: string -> bool,
+       is_declared_infra_thm: string * thm -> bool, has_infra_decls: bool} =
   let
+    (* User-declared infra entities (see `Infra_Decl` above). *)
+    val (decl_consts, decl_thms, decl_types) = Infra_Decl.get context
+    val has_infra_decls =
+      not (Symtab.is_empty decl_consts) orelse not (Symtab.is_empty decl_thms)
+      orelse not (Symtab.is_empty decl_types)
     val type_space = Context.cases Sign.type_space Proof_Context.type_space context
     val consts = Context.cases Sign.consts_of Proof_Context.consts_of context
     val const_space = Consts.space_of consts
@@ -236,7 +282,9 @@ fun gen_infra_filters (context : Context.generic)
         SOME result => result
       | NONE =>
           let val result =
-            not (Strhashtab.defined preserved_set name)
+            (* explicit declaration takes precedence over `preserved_set` *)
+            Symtab.defined decl_consts name
+            orelse (not (Strhashtab.defined preserved_set name)
             andalso (
             Name_Space.is_concealed const_space name
             orelse is_hidden const_space name
@@ -255,7 +303,7 @@ fun gen_infra_filters (context : Context.generic)
                     andalso returns_prop (case typ_opt of
                               SOME T => T
                             | NONE => (case try (Consts.the_constraint consts) name of
-                                         SOME T => T | NONE => dummyT))))
+                                         SOME T => T | NONE => dummyT)))))
               val _ = Strhashtab.update infra_const_cache (name, result)
           in result end
     fun is_infra_const name = is_infra_const' name NONE
@@ -318,7 +366,8 @@ fun gen_infra_filters (context : Context.generic)
     fun is_internal_constant (name, T) = is_infra_const' name (SOME T)
 
     fun is_infra_thm (full_name, thm) =
-        Name_Space.is_concealed fact_space full_name
+        Symtab.defined decl_thms full_name   (* user-declared infra theorem *)
+        orelse Name_Space.is_concealed fact_space full_name
         orelse is_hidden fact_space full_name
         (* No accessible short name in this context (e.g. shadowed, or a
            class-localized fact outside its locale): the agent cannot cite it by
@@ -399,16 +448,28 @@ fun gen_infra_filters (context : Context.generic)
        "??."-hidden form and Name_Space.the_entry then fails with
        "Inaccessible fact". *)
     fun is_infra_dynamic_fact name =
-      Symtab.defined dynamic_fact_blacklist name
+      Symtab.defined decl_thms name   (* user-declared infra (symmetric with is_infra_thm) *)
+      orelse Symtab.defined dynamic_fact_blacklist name
       orelse exists (fn pfx => String.isPrefix pfx name) infra_dynamic_thy_prefixes
       orelse is_codatatype_cong name
       orelse Name_Space.is_concealed fact_space name
       orelse is_hidden fact_space name
       orelse String.isPrefix "??." (Facts.extern ctxt facts name)
+
+    (* Exactly the decl-driven drops `is_infra_thm` adds — name match + const-mention
+       cascade — and nothing else.  Used by the caller (make_entity_callbacks) to drop
+       declared-infra entries from the persistent thm/rule caches, which the live KNN
+       CACHED pass does not re-filter. *)
+    fun is_declared_infra_thm (name, thm) =
+      Symtab.defined decl_thms name
+      orelse (not (Symtab.is_empty decl_consts)
+              andalso Term.exists_Const
+                        (fn (n,_) => Symtab.defined decl_consts n) (Thm.prop_of thm))
   in
     {is_infra_const = is_infra_const, is_infra_thm = is_infra_thm,
      is_infra_induct_thm = is_infra_induct_thm,
-     is_infra_type = fn name => Name_Space.is_concealed type_space name
+     is_infra_type = fn name => Symtab.defined decl_types name
+                                orelse Name_Space.is_concealed type_space name
                                 orelse is_hidden type_space name
                                 orelse is_from_infra_theory name,
      is_infra_class = fn name => Name_Space.is_concealed class_space name
@@ -418,7 +479,9 @@ fun gen_infra_filters (context : Context.generic)
                                   orelse is_hidden locale_space name
                                   orelse is_from_infra_theory name,
      is_infra_dynamic_fact = is_infra_dynamic_fact,
-     is_infra_method = is_infra_method}
+     is_infra_method = is_infra_method,
+     is_declared_infra_thm = is_declared_infra_thm,
+     has_infra_decls = has_infra_decls}
   end
 
 end
