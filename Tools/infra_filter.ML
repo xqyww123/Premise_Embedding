@@ -32,18 +32,23 @@ fun is_infra_session thy =
    char after `Minilang` is `.` vs `_`). *)
 val infra_base_theory_names = ["Minilang"]
 
-(* User-declared infrastructure entities (via `declare [[infra_constant/infra_thm/
-   infra_type ...]]`).  Three name sets — constants, theorems (canonical full fact
-   names), types — consulted by `gen_infra_filters` below.  A declared infra constant
-   behaves identically to a built-in infra constant (e.g. `Minilang.*`): it is filtered
-   AND cascades to every theorem whose statement mentions it (via `is_internal_constant`
-   feeding `is_infra_thm`). *)
+(* User-declared infrastructure entities (via `declare [[infra_constant c ...]]`,
+   `declare [[infra_type T ...]]`, `declare some_lemma[infra_thm]`), consulted by
+   `gen_infra_filters` below.  Constants and types are name sets (single global entities).
+   Theorems are stored as the *thm itself* in an `iNet` discrimination net keyed by
+   proposition (NOT by name): a fact attribute receives the morphism-transformed thm at
+   each locale interpretation, so storing the thm records the per-interpretation EXPORTED
+   theorem `I.foo` — which a name (the stale `local.foo` hint, never re-stamped by the
+   morphism) cannot.  Matching is by proposition (`Thm.eq_thm_prop`), exactly as Isabelle's
+   own `named_theorems`.  A declared infra constant behaves identically to a built-in infra
+   constant (e.g. `Minilang.*`): filtered AND cascading to every theorem whose statement
+   mentions it (via `is_internal_constant` feeding `is_infra_thm`). *)
 structure Infra_Decl = Generic_Data (
-  type T = Symtab.set * Symtab.set * Symtab.set   (* consts, thms, types *)
-  val empty = (Symtab.empty, Symtab.empty, Symtab.empty)
+  type T = Symtab.set * thm iNet.net * Symtab.set   (* consts, thms, types *)
+  val empty = (Symtab.empty, iNet.empty, Symtab.empty)
   fun merge ((c1,t1,y1),(c2,t2,y2)) =
     (Symtab.merge (K true) (c1,c2),
-     Symtab.merge (K true) (t1,t2),
+     iNet.merge Thm.eq_thm_prop (t1,t2),
      Symtab.merge (K true) (y1,y2))
 )
 
@@ -51,11 +56,26 @@ structure Infra_Decl = Generic_Data (
    c ...]]`): constants/types cannot carry attributes, and `Args.const`/`Args.type_name`
    resolve the GLOBAL entity at parse time, closing over the interned name — immune to
    locale morphism replay.  `infra_thm`, by contrast, is an ordinary fact attribute
-   (`declare some_lemma[infra_thm]`): it reads the theorem's own name hint, so it is safe
-   inside locales (a `[[infra_thm name]]` arg form would store a fact-name token that
-   locale interpretation re-resolves in the global target context, aborting on any
-   locale-local fact). *)
+   (`declare some_lemma[infra_thm]`): the locale morphism transforms the *thm* (not its
+   name tag), so storing the thm itself records the per-interpretation exported theorem and
+   is locale-safe.  The declaration is always honoured; since matching is by proposition we
+   additionally WARN on a trivially-shaped proposition (reflexivity / `True`), which would
+   also suppress every same-statement lemma from retrieval.  (An earlier `[[infra_thm name]]`
+   arg form stored a fact-name token that locale interpretation re-resolves globally and
+   aborted on locale-local facts; and a name-hint variant silently recorded the stale
+   `local.foo` and did nothing on interpretation.) *)
 fun infra_decl_attr add = Thm.declaration_attribute (K (Infra_Decl.map add))
+
+(* A proposition whose retrieval value is nil and which would over-match by proposition:
+   `True`, reflexive HOL equality `t = t`, reflexive Pure `t \<equiv> t` / `A \<Longrightarrow> A`. *)
+fun is_trivial_prop t =
+  (case t of
+     Const(\<^const_name>\<open>Trueprop\<close>, _) $ Const(\<^const_name>\<open>True\<close>, _) => true
+   | Const(\<^const_name>\<open>Trueprop\<close>, _) $ (Const(\<^const_name>\<open>HOL.eq\<close>, _) $ a $ b) =>
+       a aconv b
+   | Const(\<^const_name>\<open>Pure.eq\<close>, _) $ a $ b => a aconv b
+   | Const(\<^const_name>\<open>Pure.imp\<close>, _) $ a $ b => a aconv b
+   | _ => false)
 
 val _ = Theory.setup (
   Attrib.setup \<^binding>\<open>infra_constant\<close>
@@ -68,12 +88,19 @@ val _ = Theory.setup (
     "declare types as semantic-retrieval infrastructure" #>
   Attrib.setup \<^binding>\<open>infra_thm\<close>
     (Scan.succeed (Thm.declaration_attribute (fn th => fn context =>
-       (* base fact name (drop the multi-thm index), matching the keys is_infra_thm
-          compares against; skip unnamed/unknown thms rather than recording junk *)
-       let val name = #1 (Thm.get_name_hint th)
-       in if name = "" orelse name = "??.unknown" then context
-          else Infra_Decl.map
-                 (fn (c,t,y) => (c, Symtab.insert_set name t, y)) context
+       let val th' = Thm.trim_context th
+           (* honour the declaration either way; just warn when the proposition is trivially
+              shaped, since matching is by proposition (it would also suppress every
+              same-statement lemma from retrieval) *)
+           val _ = if is_trivial_prop (Thm.prop_of th')
+                   then warning ("infra_thm on a trivially-shaped theorem " ^
+                          quote (Syntax.string_of_term (Context.proof_of context)
+                                   (Thm.prop_of th'))
+                          ^ "; matching is by proposition, so this also suppresses every \
+                            \same-statement lemma from retrieval")
+                   else ()
+       in Infra_Decl.map (fn (c,t,y) =>
+            (c, iNet.insert_term_safe Thm.eq_thm_prop (Thm.full_prop_of th', th') t, y)) context
        end)))
     "declare a theorem as semantic-retrieval infrastructure")
 
@@ -88,9 +115,16 @@ fun gen_infra_filters (context : Context.generic)
   let
     (* User-declared infra entities (see `Infra_Decl` above). *)
     val (decl_consts, decl_thms, decl_types) = Infra_Decl.get context
+    val has_thm_decls = not (iNet.is_empty decl_thms)
     val has_infra_decls =
-      not (Symtab.is_empty decl_consts) orelse not (Symtab.is_empty decl_thms)
+      not (Symtab.is_empty decl_consts) orelse has_thm_decls
       orelse not (Symtab.is_empty decl_types)
+    (* membership by proposition: structural candidates from the net, then exact aconv.
+       Short-circuits to zero work (no full_prop_of / match) when nothing is declared. *)
+    fun decl_infra_thm thm =
+      has_thm_decls andalso
+      exists (fn t => Thm.eq_thm_prop (t, thm))
+        (iNet.match_term decl_thms (Thm.full_prop_of thm))
     val type_space = Context.cases Sign.type_space Proof_Context.type_space context
     val consts = Context.cases Sign.consts_of Proof_Context.consts_of context
     val const_space = Consts.space_of consts
@@ -373,7 +407,7 @@ fun gen_infra_filters (context : Context.generic)
     fun is_internal_constant (name, T) = is_infra_const' name (SOME T)
 
     fun is_infra_thm (full_name, thm) =
-        Symtab.defined decl_thms full_name   (* user-declared infra theorem *)
+        decl_infra_thm thm   (* user-declared infra theorem (matched by proposition) *)
         orelse Name_Space.is_concealed fact_space full_name
         orelse is_hidden fact_space full_name
         (* No accessible short name in this context (e.g. shadowed, or a
@@ -455,20 +489,20 @@ fun gen_infra_filters (context : Context.generic)
        "??."-hidden form and Name_Space.the_entry then fails with
        "Inaccessible fact". *)
     fun is_infra_dynamic_fact name =
-      Symtab.defined decl_thms name   (* user-declared infra (symmetric with is_infra_thm) *)
-      orelse Symtab.defined dynamic_fact_blacklist name
+      Symtab.defined dynamic_fact_blacklist name
       orelse exists (fn pfx => String.isPrefix pfx name) infra_dynamic_thy_prefixes
       orelse is_codatatype_cong name
       orelse Name_Space.is_concealed fact_space name
       orelse is_hidden fact_space name
       orelse String.isPrefix "??." (Facts.extern ctxt facts name)
 
-    (* Exactly the decl-driven drops `is_infra_thm` adds — name match + const-mention
-       cascade — and nothing else.  Used by the caller (make_entity_callbacks) to drop
-       declared-infra entries from the persistent thm/rule caches, which the live KNN
-       CACHED pass does not re-filter. *)
-    fun is_declared_infra_thm (name, thm) =
-      Symtab.defined decl_thms name
+    (* Exactly the decl-driven drops `is_infra_thm` adds — thm membership (by proposition)
+       + const-mention cascade — and nothing else.  Used by the caller
+       (make_entity_callbacks) to drop declared-infra entries from the persistent thm/rule
+       caches, which the live KNN CACHED pass does not re-filter.  (The name arg is unused
+       now that membership is by proposition; kept for the caller's signature.) *)
+    fun is_declared_infra_thm (_, thm) =
+      decl_infra_thm thm
       orelse (not (Symtab.is_empty decl_consts)
               andalso Term.exists_Const
                         (fn (n,_) => Symtab.defined decl_consts n) (Thm.prop_of thm))
