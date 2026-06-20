@@ -124,6 +124,34 @@ Set in Isabelle via `declare [[option = value]]`:
 
 These are accessible from Python via `connection.config_lookup("option_name")`.
 
+## Marking entities as infrastructure (excluded from retrieval)
+
+Some entities are plumbing that should never surface in semantic retrieval. Built-in
+heuristics already drop most of them (concealed/hidden names, ADT/record/BNF machinery,
+`Minilang.*`, tool-internal collections, …). To mark additional ones by hand:
+
+```isabelle
+declare [[infra_constant Foo.bar Baz.qux]]   (* constants (also cascades to theorems
+                                                 whose statement mentions them) *)
+declare [[infra_type   Foo.t]]               (* types *)
+declare some_lemma[infra_thm]                 (* a theorem — attached fact attribute *)
+
+declare [[infra_constant del Foo.bar]]        (* `del` undoes any of the above *)
+declare some_lemma[infra_thm del]
+```
+
+Notes:
+- `infra_thm` matches **by proposition** (like `named_theorems`): it stores the theorem
+  itself, so two lemmas with the same statement are treated alike, and a declaration inside
+  a `locale` correctly suppresses the exported instance at each `interpretation`. Marking a
+  trivially-shaped lemma (`x = x`, `True`) is honoured but warns, since it would suppress
+  every same-statement lemma.
+- `infra_constant`/`infra_type` resolve their (global) argument at parse time; `infra_thm`
+  is attached to the fact (`lemma[infra_thm]`, not `[[infra_thm name]]`).
+- Whole `named_theorems` *collections* are suppressed via the static blacklist in
+  `Tools/infra_filter.ML`, not via `infra_thm`.
+- Effect is read at collection time: re-collect to drop entries already written to the DB.
+
 ## Usage
 
 ### Isabelle/ML

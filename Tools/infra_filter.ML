@@ -77,22 +77,29 @@ fun is_trivial_prop t =
    | Const(\<^const_name>\<open>Pure.imp\<close>, _) $ a $ b => a aconv b
    | _ => false)
 
+(* Each attribute accepts an optional leading `del` to UNdeclare (remove from the set/net)
+   rather than add — mirroring `simp`/`simp del`. *)
+val del_flag = Scan.lift (Scan.optional (Args.del >> K true) false)
+
 val _ = Theory.setup (
   Attrib.setup \<^binding>\<open>infra_constant\<close>
-    (Scan.repeat1 (Args.const {proper = true, strict = false}) >>
-      (fn ns => infra_decl_attr (fn (c,t,y) => (fold Symtab.insert_set ns c, t, y))))
-    "declare constants as semantic-retrieval infrastructure" #>
+    ((del_flag -- Scan.repeat1 (Args.const {proper = true, strict = false})) >>
+      (fn (del, ns) => infra_decl_attr (fn (c,t,y) =>
+         (fold (if del then Symtab.remove_set else Symtab.insert_set) ns c, t, y))))
+    "declare (or, with `del`, undeclare) constants as semantic-retrieval infrastructure" #>
   Attrib.setup \<^binding>\<open>infra_type\<close>
-    (Scan.repeat1 (Args.type_name {proper = true, strict = false}) >>
-      (fn ns => infra_decl_attr (fn (c,t,y) => (c, t, fold Symtab.insert_set ns y))))
-    "declare types as semantic-retrieval infrastructure" #>
+    ((del_flag -- Scan.repeat1 (Args.type_name {proper = true, strict = false})) >>
+      (fn (del, ns) => infra_decl_attr (fn (c,t,y) =>
+         (c, t, fold (if del then Symtab.remove_set else Symtab.insert_set) ns y))))
+    "declare (or, with `del`, undeclare) types as semantic-retrieval infrastructure" #>
   Attrib.setup \<^binding>\<open>infra_thm\<close>
-    (Scan.succeed (Thm.declaration_attribute (fn th => fn context =>
+    (del_flag >>
+      (fn del => Thm.declaration_attribute (fn th => fn context =>
        let val th' = Thm.trim_context th
-           (* honour the declaration either way; just warn when the proposition is trivially
-              shaped, since matching is by proposition (it would also suppress every
+           (* honour the declaration either way; warn only when ADDING a trivially-shaped
+              proposition, since matching is by proposition (it would also suppress every
               same-statement lemma from retrieval) *)
-           val _ = if is_trivial_prop (Thm.prop_of th')
+           val _ = if not del andalso is_trivial_prop (Thm.prop_of th')
                    then warning ("infra_thm on a trivially-shaped theorem " ^
                           quote (Syntax.string_of_term (Context.proof_of context)
                                    (Thm.prop_of th'))
@@ -100,9 +107,10 @@ val _ = Theory.setup (
                             \same-statement lemma from retrieval")
                    else ()
        in Infra_Decl.map (fn (c,t,y) =>
-            (c, iNet.insert_term_safe Thm.eq_thm_prop (Thm.full_prop_of th', th') t, y)) context
+            (c, (if del then iNet.delete_term_safe else iNet.insert_term_safe)
+                  Thm.eq_thm_prop (Thm.full_prop_of th', th') t, y)) context
        end)))
-    "declare a theorem as semantic-retrieval infrastructure")
+    "declare (or, with `del`, undeclare) a theorem as semantic-retrieval infrastructure")
 
 fun gen_infra_filters (context : Context.generic)
     : {is_infra_const: string -> bool,

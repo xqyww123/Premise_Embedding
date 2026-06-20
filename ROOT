@@ -3,5 +3,8 @@ session Semantic_Embedding = HOL +
     Isabelle_RPC
     Performant_Isabelle_ML
   theories
-    Sledgehammer_Embedding
     Semantic_Embedding
+
+session Semantic_Embedding_Test in "Test" = Semantic_Embedding +
+  theories
+    Infra_Decl_Test
