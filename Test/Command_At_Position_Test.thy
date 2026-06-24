@@ -105,6 +105,40 @@ let
   val _ = @{assert} (is_none wip_miss)
   val _ = writeln ("Test 10 - WIP re-cut past EOF returns NONE (no whole-file leak): OK")
 
+  (* ---- Test 11: recut_dump_command — the branch the whole-theory-leak fix
+     ACTUALLY changed (command_at_position's s<=1 re-cut).  Tests 1-10 only
+     touch unchanged code, so a regression to `| NONE => SOME (source, s, e)`
+     (the original leak) would pass them.  Drive the helper with a SYNTHETIC
+     whole-file dump and assert it NEVER returns the whole `source`:
+       (a) an offset inside the 2nd command returns ONLY that command;
+       (b) an offset past EOF (re-cut miss) returns NONE — not the whole source. *)
+  val dump_src =
+    "theory Synthetic_Dump\n" ^
+    "  imports Main\n" ^
+    "begin\n\n" ^
+    "definition synth_alpha :: bool where \"synth_alpha = True\"\n\n" ^
+    "definition synth_beta :: bool where \"synth_beta = False\"\n\n" ^
+    "end\n"
+  (* A path that does not exist: the in-memory re-cut uses `dump_src` directly
+     and resolves keywords from its own header (imports Main); the disk fallback
+     on a miss reads this absent file -> [] -> NONE. *)
+  val dump_file = "/nonexistent/Synthetic_Dump.thy"
+  fun off_of needle =  (* 1-based symbol offset of needle in dump_src (ASCII) *)
+    Substring.size (#1 (Substring.position needle (Substring.full dump_src))) + 1
+  (* (a) hit inside the 2nd command *)
+  val hit = PIDE_State.recut_dump_command dump_file dump_src 1 (off_of "synth_beta = False")
+  val _ = @{assert} (is_some hit)
+  val (hit_src, _, _) = the hit
+  val _ = @{assert} (String.isSubstring "synth_beta" hit_src)
+  val _ = @{assert} (not (String.isSubstring "synth_alpha" hit_src))
+  val _ = @{assert} (not (String.isSubstring "theory Synthetic_Dump" hit_src))
+  val _ = @{assert} (hit_src <> dump_src)
+  val _ = writeln ("Test 11a - recut_dump_command hit returns only the single command: OK")
+  (* (b) re-cut miss must NOT return the whole source *)
+  val miss = PIDE_State.recut_dump_command dump_file dump_src 1 (size dump_src + 50)
+  val _ = @{assert} (is_none miss)
+  val _ = writeln ("Test 11b - recut_dump_command miss returns NONE, not the whole theory: OK")
+
 in
   writeln "\n=== All PIDE_State.command_at_position tests passed ==="
 end

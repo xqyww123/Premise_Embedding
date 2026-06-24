@@ -47,6 +47,12 @@ sig
   val command_spans_of_file: string -> (string * int * int) list
   val command_at_position_wip: string -> int -> (string * int * int) option
 
+  (* Re-cut a degenerate whole-file command_at_position result (source, start s)
+     into the single command containing the file-global symbol `offset`; on a
+     miss degrades to command_at_position_wip / NONE, never the whole `source`.
+     Exposed for testing the whole-theory-leak fix. *)
+  val recut_dump_command: string -> string -> int -> int -> (string * int * int) option
+
   (* Convert between symbol offset and line:column via Python RPC.
      Requires the Isabelle_RPC Python host to be running. *)
   val offset_to_line_column: string -> int -> int * int
@@ -458,42 +464,49 @@ fun command_spans_of_file file_path : (string * int * int) list =
 fun command_at_position_wip file off =
   List.find (fn (_, s, e) => off >= s andalso off < e) (command_spans_of_file file);
 
+(* Re-cut a degenerate whole-file `command_at_position` result.
+
+   A degenerate DB snapshot dumps the WHOLE theory file as one command's source
+   (Build.read_theory rebuilds the theory as a single Command.unparsed; a
+   whole-file COMMAND_SPAN then makes try_substring return everything).  Such a
+   dump's span starts at the file head (s <= 1).  Given that dump as `source`
+   with its start `s`, re-cut the ALREADY-RETURNED source — NOT the file on
+   disk, so no extra read and no risk of a stale/edited buffer mismatch — and
+   return the single command containing `offset`.
+
+   If the re-cut locates NO span at the offset (the offset fell in inter-command
+   whitespace, or `command_spans_of_text` failed to parse and returned []), we
+   must NOT fall back to the raw whole-file `source`: returning it leaks the
+   entire theory to the caller.  Degrade to the WIP path (re-cut from the clean
+   on-disk source); if that also finds nothing it returns NONE, and the caller
+   degrades to a single-line search.
+
+   Exposed for testing: it is the only branch the whole-theory-leak fix changed
+   (the leak was `... | NONE => SOME (source, s, e)` returning the whole file),
+   yet that branch cannot be driven from a live theory (it needs an s <= 1
+   degenerate snapshot), so it is unit-tested directly with a synthetic dump. *)
+fun recut_dump_command file source s offset =
+  let
+    val spans = command_spans_of_text file source
+    val local_off = offset - s + 1  (* source's symbol 1 = file symbol s *)
+  in
+    case List.find (fn (_, ss, ee) => local_off >= ss andalso local_off < ee) spans of
+      SOME (src, ss, ee) => SOME (src, s + ss - 1, s + ee - 1)
+    | NONE => command_at_position_wip file offset
+  end;
+
 fun command_at_position pos =
   let val (file, offset) = pos_file_offset pos
   in
     if file = "" orelse offset = 0 then NONE
     else
       case command_at_position_pide file offset of
-        SOME (r as (source, s, e)) =>
-          (* A degenerate DB snapshot dumps the WHOLE theory file as one command's
-             source (Build.read_theory rebuilds the theory as a single
-             Command.unparsed; a whole-file COMMAND_SPAN then makes try_substring
-             return everything).  Such a dump's span starts at the file head
-             (s <= 1); every real entity command sits after `theory .. begin`, so
-             s > 1 and is trusted directly with zero work.  For an s <= 1 result we
-             re-cut the ALREADY-RETURNED source — NOT the file on disk, so no extra
-             read and no risk of a stale/edited buffer mismatch — and return the
-             single command at the offset.  This is correct whether the result was
-             the whole-file dump or genuinely the file's first command, so no
-             whole-file-vs-large-command discrimination is needed.
-
-             If the re-cut locates NO span at the offset (the offset fell in
-             inter-command whitespace, or `command_spans_of_text` failed to
-             parse and returned []), we must NOT fall back to the raw `r`: that
-             is exactly the whole-file dump and returning it leaks the entire
-             theory to the caller.  Degrade to the WIP path (re-cut from the
-             clean on-disk source); if that also finds nothing it returns NONE,
-             and the caller degrades to a single-line search. *)
+        (* Every real entity command sits after `theory .. begin`, so s > 1 and
+           is trusted directly with zero work.  An s <= 1 result is (or may be) a
+           whole-file degenerate dump; re-cut it to the single command. *)
+        SOME (r as (source, s, _)) =>
           if s > 1 then SOME r
-          else
-            let
-              val spans = command_spans_of_text file source
-              val local_off = offset - s + 1  (* source's symbol 1 = file symbol s *)
-            in
-              case List.find (fn (_, ss, ee) => local_off >= ss andalso local_off < ee) spans of
-                SOME (src, ss, ee) => SOME (src, s + ss - 1, s + ee - 1)
-              | NONE => command_at_position_wip file offset
-            end
+          else recut_dump_command file source s offset
       | NONE => command_at_position_wip file offset
   end;
 
