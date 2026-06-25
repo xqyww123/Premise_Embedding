@@ -1332,13 +1332,16 @@ fun collect_uninterpreted (force : bool) thy =
     fun collect thy acc =
       let val id = Context.theory_identifier thy
       in
-        if (not force andalso is_interpreted thy) orelse Inthashtab.defined seen id
-           orelse is_infra_session thy
+        if Inthashtab.defined seen id orelse is_infra_session thy
         then acc
         else
           let val _ = Inthashtab.update seen (id, ())
+              (* Always descend into ancestors, even past an already-interpreted
+                 theory, so an uninterpreted ancestor is never skipped (we no
+                 longer assume "interpreted" implies all ancestors interpreted).
+                 The interpreted theory itself is still not re-collected. *)
               val acc' = fold collect (Theory.parents_of thy) acc
-          in acc' @ [thy] end
+          in if not force andalso is_interpreted thy then acc' else acc' @ [thy] end
       end
   in collect thy [] end
 
