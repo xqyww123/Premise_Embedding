@@ -34,6 +34,12 @@ from Isabelle_RPC_Host.universal_key import universal_key
 
 type theory_hash = bytes
 
+# Sentinel bucket for experiences with NO constituent theories — a "global"
+# experience available in every context. Uses the all-zero 16-byte hash, matching
+# xor_theory_prefix([]) = 0x00..00 (the key prefix such experiences already carry);
+# a real xxhash128 theory hash colliding with all-zeros is astronomically improbable.
+_GLOBAL: theory_hash = b'\x00' * 16
+
 
 class _Experience_Index:
     _env: 'lmdb.Environment | None' = None
@@ -73,10 +79,14 @@ class _Experience_Index:
             txn.delete(h)
 
     def add(self, uk: universal_key, constituent_hashes: 'list[theory_hash]') -> None:
-        """Register ``uk`` under each of its constituent theory hashes (idempotent)."""
+        """Register ``uk`` under each of its constituent theory hashes (idempotent).
+
+        An empty constituent list registers ``uk`` under the ``_GLOBAL`` sentinel
+        bucket instead (a global experience), so it stays retrievable + dedup-visible
+        rather than being orphaned (never added to any bucket)."""
         uk = bytes(uk)
         with self._ensure_env().begin(write=True) as txn:
-            for h in constituent_hashes:
+            for h in (constituent_hashes or [_GLOBAL]):
                 h = bytes(h)
                 bucket = self._get_bucket(txn, h)
                 if uk not in bucket:
@@ -84,10 +94,11 @@ class _Experience_Index:
                     self._put_bucket(txn, h, bucket)
 
     def remove(self, uk: universal_key, constituent_hashes: 'list[theory_hash]') -> None:
-        """Remove ``uk`` from each of its constituent theory hashes' buckets."""
+        """Remove ``uk`` from each of its constituent theory hashes' buckets (an empty
+        list removes it from the ``_GLOBAL`` bucket — symmetric with ``add``)."""
         uk = bytes(uk)
         with self._ensure_env().begin(write=True) as txn:
-            for h in constituent_hashes:
+            for h in (constituent_hashes or [_GLOBAL]):
                 h = bytes(h)
                 bucket = self._get_bucket(txn, h)
                 if uk in bucket:
@@ -115,10 +126,12 @@ class _Experience_Index:
 
         A superset of the truly-available experiences: an experience appears here
         as soon as ONE of its constituents is loaded; the caller must still filter
-        to those whose FULL constituent set is loaded."""
+        to those whose FULL constituent set is loaded. The ``_GLOBAL`` bucket is
+        always included (global experiences are available in every context; the
+        caller's full-subset check passes them vacuously)."""
         result: set[bytes] = set()
         with self._ensure_env().begin() as txn:
-            for h in loaded_hashes:
+            for h in (loaded_hashes | {_GLOBAL}):
                 raw = txn.get(bytes(h))
                 if raw is not None:
                     result.update(bytes(x) for x in msgpack.unpackb(raw))

@@ -1,6 +1,11 @@
 signature INFRA_FILTER = sig
   val smart_size_of_term : term -> int
   val is_infra_session : theory -> bool
+  (* True if the theory is infrastructure: either it belongs to an infra session
+     (is_infra_session) or its base name is an infra base theory (e.g. Minilang).
+     Whole-theory predicate for callers that want to exclude a theory outright
+     (e.g. the AoA-learning target scope), complementing the per-entity filters. *)
+  val is_infra_theory : theory -> bool
   val gen_infra_filters : Context.generic ->
     {is_infra_const: string -> bool,
      is_infra_thm: string * thm -> bool,
@@ -31,6 +36,10 @@ fun is_infra_session thy =
    `"Minilang."` does not match sibling theories like `Minilang_Agent.` (the
    char after `Minilang` is `.` vs `_`). *)
 val infra_base_theory_names = ["Minilang"]
+
+fun is_infra_theory thy =
+  is_infra_session thy orelse
+  member (op =) infra_base_theory_names (Long_Name.base_name (Context.theory_long_name thy))
 
 (* User-declared infrastructure entities (via `declare [[infra_constant c ...]]`,
    `declare [[infra_type T ...]]`, `declare some_lemma[infra_thm]`), consulted by
