@@ -5,6 +5,8 @@ Subcommands:
   collect   Collect semantic interpretations for a theory (requires Isa-REPL)
   list      List all theories in the semantic database (offline)
   remove    Remove specific theories from the database (offline)
+  reindex   Rebuild experience_index.lmdb from semantics.lmdb (offline)
+  fsck      Check semantics.lmdb invariants; --fix repairs the derived ones (offline)
 """
 import argparse
 import os
@@ -330,6 +332,109 @@ def cmd_remove(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# reindex / fsck
+# ---------------------------------------------------------------------------
+
+def _require_db() -> None:
+    if not os.path.exists(SEMANTICS_DB_PATH):
+        print(f"No semantic database found at {SEMANTICS_DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_reindex(args: argparse.Namespace) -> None:
+    _require_db()
+    from Isabelle_Semantic_Embedding.semantics import Semantic_DB
+    n = Semantic_DB.rebuild_experience_index()
+    print(f"Rebuilt the experience index from {n} EXPERIENCE record(s) in semantics.lmdb.")
+
+
+def cmd_fsck(args: argparse.Namespace) -> None:
+    """Check the invariants of semantics.lmdb that can break silently.
+
+    Deliberately NOT checked: whether a record has a vector.  Vectors are a
+    lazily-filled derived cache — topk hands unknown keys to _auto_embed, which
+    embeds anything whose interpretation is already stored.  A record with no
+    vector is legitimate; reporting a cold cache as damage would be noise.
+
+    Both repairable classes are repaired the same way, by recomputing a derived
+    artefact from the primary data it is derived from:
+      * the experience index is a derived view of the EXPERIENCE records -> rebuild
+      * an XOR key prefix is derived from the record's constituent list -> re-key
+    """
+    _require_db()
+    from Isabelle_Semantic_Embedding.semantics import Semantic_DB, SEMANTICS_MAP_SIZE
+    from Isabelle_Semantic_Embedding.experience_index import Experience_Index
+
+    c = Semantic_DB.check_consistency()
+    indexed = Experience_Index.all_keys()
+    missing_from_index = c.experience_keys - indexed
+    stale_in_index = indexed - c.experience_keys
+
+    def row(label: str, n: int, note: str = "") -> None:
+        print(f"  {label:<46}{n:>7}{'   ' + note if note else ''}")
+
+    print(f"semantics.lmdb   : {c.n_records} records, of which {len(c.experience_keys)} experiences")
+    print(f"experience_index : {len(indexed)} keys")
+    print()
+
+    print("[repairable by --fix]")
+    row("EXPERIENCE record present, missing from index", len(missing_from_index))
+    row("index key with no EXPERIENCE record", len(stale_in_index))
+    row("XOR key prefix disagrees with constituents", len(c.xor_mismatches))
+    for bad, good in c.xor_mismatches[:5]:
+        rec = Semantic_DB[bad]
+        print(f"      {rec.name if rec else '?'}")
+        print(f"        prefix {bad[:16].hex()} -> should be {good[:16].hex()}")
+        if rec is not None and rec.theory_constituents:
+            print(f"        constituents: {', '.join(n for n, _ in rec.theory_constituents)}")
+    if len(c.xor_mismatches) > 5:
+        print(f"      ... and {len(c.xor_mismatches) - 5} more")
+    if c.xor_mismatches:
+        print("      !! This invariant cannot break on its own. Something wrote a key that")
+        print("         disagrees with its own constituent list — check that ML's")
+        print("         Universal_Key.compute_constituents still mirrors xor_theory_prefix.")
+
+    print("\n[report only]")
+    row("legacy XOR record (no constituent list)", c.legacy_xor, "(run migrate_xor_thm_keys.py)")
+
+    db_bytes = os.path.getsize(os.path.join(SEMANTICS_DB_PATH, "data.mdb"))
+    pct = 100.0 * db_bytes / SEMANTICS_MAP_SIZE
+    print(f"\n  semantics.lmdb size {db_bytes / 1024 ** 2:.1f} MiB / "
+          f"{SEMANTICS_MAP_SIZE / 1024 ** 3:.0f} GiB map_size ({pct:.1f}%)"
+          f"{'   ** writes fail once this reaches 100% **' if pct > 80 else ''}")
+
+    problems = (len(missing_from_index) + len(stale_in_index)
+                + len(c.xor_mismatches) + c.legacy_xor)
+
+    if args.fix:
+        repaired = 0
+        if c.xor_mismatches:
+            print("\n--fix: re-keying records whose XOR prefix disagrees with their constituents...")
+            moved, conflicts = Semantic_DB.repair_xor_prefixes(c.xor_mismatches)
+            for bad, good in moved:
+                print(f"  moved {bad.hex()[:24]}… -> {good.hex()[:24]}…")
+            repaired += len(moved)
+            for bad in conflicts:
+                print(f"  CONFLICT, left alone: {bad.hex()} — the correct key already holds "
+                      f"a different record", file=sys.stderr)
+        if missing_from_index or stale_in_index or repaired:
+            print("\n--fix: rebuilding the experience index...")
+            # The index is derived, so one rebuild subsumes every index-level
+            # discrepancy: the entries missing above, the stale ones, and the
+            # re-keyed experiences just moved by repair_xor_prefixes.
+            n = Semantic_DB.rebuild_experience_index()
+            print(f"  Rebuilt from {n} EXPERIENCE record(s) in semantics.lmdb.")
+            repaired += len(missing_from_index) + len(stale_in_index)
+        problems -= repaired
+
+    print()
+    if problems:
+        print(f"{problems} problem(s) remain.")
+        sys.exit(1)
+    print("All checks passed.")
+
+
+# ---------------------------------------------------------------------------
 # collect
 # ---------------------------------------------------------------------------
 
@@ -470,5 +575,16 @@ p_remove.add_argument("identifiers", nargs="+",
     help="Theory names or universal key hex prefixes (from 'list' output)")
 p_remove.add_argument("--force", action="store_true", help="Skip confirmation prompt")
 
+# reindex
+p_reindex = sub.add_parser("reindex",
+    help="Rebuild experience_index.lmdb from the EXPERIENCE records in semantics.lmdb")
+
+# fsck
+p_fsck = sub.add_parser("fsck", help="Check semantics.lmdb invariants")
+p_fsck.add_argument("--fix", action="store_true",
+    help="Repair the derived artefacts: rebuild the experience index, and re-key "
+         "records whose XOR prefix disagrees with their constituent list.")
+
 args = parser.parse_args()
-{"collect": cmd_collect, "list": cmd_list, "remove": cmd_remove}[args.command](args)
+{"collect": cmd_collect, "list": cmd_list, "remove": cmd_remove,
+ "reindex": cmd_reindex, "fsck": cmd_fsck}[args.command](args)

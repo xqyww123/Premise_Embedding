@@ -24,6 +24,7 @@ Do not introduce an ``await`` inside a write transaction.
 
 import os
 import threading
+from collections.abc import Iterable
 from typing import Any
 
 import lmdb
@@ -120,6 +121,44 @@ class _Experience_Index:
                     updates.append((bytes(h), bucket))
             for h, bucket in updates:
                 self._put_bucket(txn, h, bucket)
+
+    def rebuild(self, entries: 'Iterable[tuple[universal_key, list[theory_hash]]]') -> int:
+        """Drop every bucket and rebuild the index from ``entries``.
+
+        This index is a pure derived view of the EXPERIENCE records in
+        semantics.lmdb — an experience belongs in the bucket of each of its
+        constituent theory hashes (``_GLOBAL`` when it has none), and nothing
+        else is stored here — so a full rebuild is always correct, and is the
+        only repair for drift.  Drift is reachable: an experience lives in three
+        stores (semantics.lmdb, the vector store, this index) written in three
+        separate transactions with no cross-store atomicity, so a crash between
+        them leaves a record that no bucket mentions.  ``candidates`` would then
+        never return it and the experience becomes silently unretrievable (and
+        invisible to AoA's ``all_keys``-based dedup, which re-learns it).
+
+        One write transaction: readers see either the whole old index or the
+        whole new one.  Returns the number of experiences indexed.
+
+        CONTRACT: ``entries`` must be a snapshot the caller keeps valid for the
+        duration of this call — in practice, taken while holding the semantics
+        write transaction (see Semantic_DB.rebuild_experience_index).  Rebuilding
+        from a snapshot that another writer has already moved past would erase the
+        buckets of whatever it added, which is the very drift this repairs."""
+        # dict-keyed buckets: O(1) dedup, insertion order preserved (bucket
+        # order is semantically irrelevant — every reader unions them).
+        buckets: 'dict[bytes, dict[bytes, None]]' = {}
+        n = 0
+        for uk, constituent_hashes in entries:
+            uk = bytes(uk)
+            n += 1
+            for h in (constituent_hashes or [_GLOBAL]):
+                buckets.setdefault(bytes(h), {})[uk] = None
+        with self._ensure_env().begin(write=True) as txn:
+            for h in [bytes(h) for h, _ in txn.cursor()]:
+                txn.delete(h)
+            for h, bucket in buckets.items():
+                self._put_bucket(txn, h, list(bucket))
+        return n
 
     def candidates(self, loaded_hashes: 'set[theory_hash]') -> 'set[bytes]':
         """Union of the buckets of the given (loaded) theory hashes.

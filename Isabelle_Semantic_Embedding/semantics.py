@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import threading
+from collections.abc import Iterator
 from typing import Any, NamedTuple
 
 import lmdb
@@ -102,6 +103,22 @@ persist_wip: bool = os.getenv("SEMANTIC_PERSIST_WIP", "") != ""
 # Read-only openers are unaffected — lmdb adopts the file's actual size.
 # Keep every writer of semantics.lmdb on this one constant.
 SEMANTICS_MAP_SIZE: int = 1 << 30
+
+
+def _iter_vector_store_envs() -> 'Iterator[lmdb.Environment]':
+    """Every ``vector_*.lmdb`` store on disk, as an open (process-cached) environment.
+
+    One store per embedding model; the model name is encoded in the directory name.
+    """
+    cache_dir = platformdirs.user_cache_dir("Isabelle_Semantic_Embedding", "Qiyuan")
+    if not os.path.isdir(cache_dir):
+        return
+    from .semantic_embedding import _get_lmdb_env
+    for entry in sorted(os.listdir(cache_dir)):
+        if entry.startswith("vector_") and entry.endswith(".lmdb"):
+            path = os.path.join(cache_dir, entry)
+            if os.path.isdir(path):
+                yield _get_lmdb_env(path)
 
 
 class Provenance(NamedTuple):
@@ -326,22 +343,27 @@ class _Semantic_DB:
                 txn.delete(key)
         return len(to_delete)
 
-    def experience_entries(self) -> 'list[tuple[universal_key, list[bytes]]]':
-        """``(key, constituent theory hashes)`` for every EXPERIENCE record.
+    @staticmethod
+    def _scan_experiences(txn: Any) -> 'list[tuple[universal_key, list[bytes]]]':
+        """``(key, constituent theory hashes)`` for every EXPERIENCE record seen by txn.
 
         Experience keys are XOR-prefixed (32 bytes, kind tag at byte 16), so they
         are recognized from the key alone; only the matches are decoded."""
         from Isabelle_RPC_Host.universal_key import is_xor_prefixed_key
         tag = int(EntityKind.EXPERIENCE)
         entries: list[tuple[bytes, list[bytes]]] = []
-        with self._ensure_env().begin() as txn:
-            for key, val in txn.cursor():
-                key = bytes(key)
-                if not is_xor_prefixed_key(key) or key[16] != tag:
-                    continue
-                rec = self._decode(bytes(val))
-                entries.append((key, [h for _, h in (rec.theory_constituents or [])]))
+        for key, val in txn.cursor():
+            key = bytes(key)
+            if not is_xor_prefixed_key(key) or key[16] != tag:
+                continue
+            rec = _Semantic_DB._decode(bytes(val))
+            entries.append((key, [h for _, h in (rec.theory_constituents or [])]))
         return entries
+
+    def experience_entries(self) -> 'list[tuple[universal_key, list[bytes]]]':
+        """``(key, constituent theory hashes)`` for every EXPERIENCE record."""
+        with self._ensure_env().begin() as txn:
+            return self._scan_experiences(txn)
 
     def rebuild_experience_index(self) -> int:
         """Rebuild experience_index.lmdb from the EXPERIENCE records stored here.
@@ -350,9 +372,109 @@ class _Semantic_DB:
         and the three stores an experience lives in are written without cross-store
         atomicity, so it can drift.  Call this after any bulk mutation of
         semantics.lmdb that bypasses Experience_Index (e.g. merging in another
-        machine's snapshot).  Returns the number of experiences indexed."""
+        machine's snapshot).  Returns the number of experiences indexed.
+
+        The scan and the index rebuild both run inside ONE semantics write
+        transaction.  That is load-bearing, not incidental: without it, an
+        experience written between the scan and the wipe has its bucket erased and
+        becomes silently unretrievable — exactly the drift this method repairs.
+        Holding the write transaction excludes every writer of semantics.lmdb
+        (``Semantic_DB[key] = ...``) for the whole span, so the scan cannot go
+        stale.  Readers are untouched; LMDB is MVCC.
+
+        Lock order is semantics -> experience_index, matching every other writer:
+        mcp_http_server commits the record (closing that transaction) before
+        calling Experience_Index.add, and _migrate_constituent_records likewise
+        touches the index only after its write transaction exits.  Nothing ever
+        holds the index lock while wanting the semantics one, so no deadlock."""
         from .experience_index import Experience_Index
-        return Experience_Index.rebuild(self.experience_entries())
+        with self._ensure_env().begin(write=True) as txn:
+            return Experience_Index.rebuild(self._scan_experiences(txn))
+
+    class Consistency(NamedTuple):
+        """What a whole-store consistency scan found.  See semantics_manage fsck."""
+        n_records: int                       # entity records (theory status excluded)
+        experience_keys: set[bytes]
+        legacy_xor: int                      # XOR-prefixed records with no constituent list
+        # (wrong_key, correct_key) for records whose XOR prefix disagrees with
+        # xor_theory_prefix(their constituent list)
+        xor_mismatches: 'list[tuple[bytes, bytes]]'
+
+    def check_consistency(self) -> 'Consistency':
+        """Scan the store once and report the invariants that can break silently.
+
+        Only genuine invariants: a *missing vector* is NOT one of them.  Vectors are
+        a lazily-filled derived cache — topk hands unknown keys to _auto_embed, which
+        embeds anything whose interpretation is already stored.  Reporting a cold
+        cache as damage would be noise."""
+        from Isabelle_RPC_Host.universal_key import is_xor_prefixed_key, xor_theory_prefix
+        tag = int(EntityKind.EXPERIENCE)
+        n_records = 0
+        experience_keys: set[bytes] = set()
+        legacy_xor = 0
+        xor_mismatches: list[tuple[bytes, bytes]] = []
+        with self._ensure_env().begin() as txn:
+            for key, val in txn.cursor():
+                key = bytes(key)
+                if len(key) == 16:
+                    continue                      # theory status record, not an entity
+                n_records += 1
+                if not is_xor_prefixed_key(key):
+                    continue
+                if key[16] == tag:
+                    experience_keys.add(key)
+                rec = self._decode(bytes(val))
+                if rec.theory_constituents is None:
+                    legacy_xor += 1
+                    continue
+                expect = xor_theory_prefix([h for _, h in rec.theory_constituents])
+                if expect != key[:16]:
+                    xor_mismatches.append((key, expect + key[16:]))
+        return _Semantic_DB.Consistency(n_records, experience_keys, legacy_xor, xor_mismatches)
+
+    def repair_xor_prefixes(self,
+                            mismatches: 'list[tuple[bytes, bytes]]',
+                            ) -> 'tuple[list[tuple[bytes, bytes]], list[bytes]]':
+        """Re-key records whose XOR prefix disagrees with their constituent list.
+
+        The prefix is *derived* (xor_theory_prefix of the constituents), the
+        constituent list is stored primary data, so the list wins and the record
+        moves to the recomputed key.  A record already sitting at the correct key
+        with different content is a real conflict: refuse it rather than guess.
+
+        The semantics moves run in one write transaction, so they are atomic.
+        Vectors are moved on a best-effort basis afterwards — they are a cache, and
+        _auto_embed refills whatever is missing.  Callers must rebuild the
+        experience index afterwards: an EXPERIENCE record that moved is still
+        indexed under its old key.
+
+        Returns (moved, conflicts)."""
+        moved: list[tuple[bytes, bytes]] = []
+        conflicts: list[bytes] = []
+        with self._ensure_env().begin(write=True) as txn:
+            for bad, good in mismatches:
+                val = txn.get(bad)
+                if val is None:
+                    continue                      # vanished since the scan
+                val = bytes(val)
+                existing = txn.get(good)
+                if existing is None:
+                    txn.put(good, val)
+                elif bytes(existing) != val:
+                    conflicts.append(bad)
+                    continue
+                txn.delete(bad)
+                moved.append((bad, good))
+        for env in _iter_vector_store_envs():
+            with env.begin(write=True) as vtxn:
+                for bad, good in moved:
+                    v = vtxn.get(bad)
+                    if v is None:
+                        continue
+                    if vtxn.get(good) is None:
+                        vtxn.put(good, bytes(v))
+                    vtxn.delete(bad)
+        return moved, conflicts
 
     @staticmethod
     def _copy_prefix(env: lmdb.Environment, old_prefix: bytes, new_prefix: bytes) -> int:
@@ -450,19 +572,12 @@ class _Semantic_DB:
             for old_key, new_key, old_hashes, new_hashes in exp_rekeys:
                 Experience_Index.remove(old_key, old_hashes)
                 Experience_Index.add(new_key, new_hashes)
-        cache_dir = platformdirs.user_cache_dir("Isabelle_Semantic_Embedding", "Qiyuan")
-        if os.path.isdir(cache_dir):
-            from .semantic_embedding import _get_lmdb_env
-            for entry in os.listdir(cache_dir):
-                if entry.startswith("vector_") and entry.endswith(".lmdb"):
-                    path = os.path.join(cache_dir, entry)
-                    if os.path.isdir(path):
-                        venv = _get_lmdb_env(path)
-                        with venv.begin(write=True) as vtxn:
-                            for old_key, new_key, _ in rekeys:
-                                v = vtxn.get(old_key)
-                                if v is not None:
-                                    vtxn.put(new_key, bytes(v))
+        for venv in _iter_vector_store_envs():
+            with venv.begin(write=True) as vtxn:
+                for old_key, new_key, _ in rekeys:
+                    v = vtxn.get(old_key)
+                    if v is not None:
+                        vtxn.put(new_key, bytes(v))
         return len(rekeys)
 
     def _try_migrate(self, new_key: universal_key) -> bool:
@@ -875,24 +990,14 @@ class Semantic_Vector_Store(Vector_Store):
     def clean_all_wip_in_created_dbs() -> None:
         """Remove all WIP (non-persistent) entries from every vector store on disk."""
         from Isabelle_RPC_Host.theory_hash import is_persistent
-        cache_dir = platformdirs.user_cache_dir("Isabelle_Semantic_Embedding", "Qiyuan")
-        if not os.path.isdir(cache_dir):
-            return
-        prefix = "vector_"
-        suffix = ".lmdb"
-        for entry in os.listdir(cache_dir):
-            if entry.startswith(prefix) and entry.endswith(suffix):
-                path = os.path.join(cache_dir, entry)
-                if os.path.isdir(path):
-                    from .semantic_embedding import _get_lmdb_env
-                    env = _get_lmdb_env(path)
-                    to_delete: list[bytes] = []
-                    with env.begin(write=True) as txn:
-                        for key, _ in txn.cursor():
-                            if not is_persistent(key):
-                                to_delete.append(bytes(key))
-                        for key in to_delete:
-                            txn.delete(key)
+        for env in _iter_vector_store_envs():
+            to_delete: list[bytes] = []
+            with env.begin(write=True) as txn:
+                for key, _ in txn.cursor():
+                    if not is_persistent(key):
+                        to_delete.append(bytes(key))
+                for key in to_delete:
+                    txn.delete(key)
 
     @staticmethod
     def created_embedding_models() -> list[str]:
