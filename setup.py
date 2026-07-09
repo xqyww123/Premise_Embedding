@@ -57,7 +57,13 @@ except ImportError:  # pragma: no cover
 
 HERE = Path(__file__).parent.resolve()
 PACKAGE = "Isabelle_Semantic_Embedding"
-LIB_NAME = "libisabelle_vector.so"
+# Isabelle_Semantic_Embedding/_vecarith.py and Tools/simd_vector.ML pick the same
+# name from sys.platform and ML_System.platform_is_* respectively.
+LIB_NAME = {
+    "linux": "libisabelle_vector.so",
+    "darwin": "libisabelle_vector.dylib",
+    "win32": "isabelle_vector.dll",
+}.get(sys.platform, "libisabelle_vector.so")
 KERNEL_SRC = HERE / "Tools" / "Vector_Arith"
 KERNEL_BUILD = KERNEL_SRC / "build"
 
@@ -80,6 +86,24 @@ ALLOWED_NEEDED = {
 
 # ELF e_machine -> the architecture spelling used in platform tags.
 ELF_MACHINES = {0x03: "i686", 0x28: "armv7l", 0x3E: "x86_64", 0xB7: "aarch64", 0xF3: "riscv64"}
+
+# Mach-O. A universal2 build is a "fat" archive: a big-endian header listing the
+# per-architecture slices, each itself a normal Mach-O. The magic is stored
+# big-endian regardless of the slices' endianness (mach-o/fat.h).
+FAT_MAGIC = 0xCAFEBABE
+MH_MAGIC_64 = 0xFEEDFACF
+MACHO_CPUS = {0x01000007: "x86_64", 0x0100000C: "arm64"}  # CPU_ARCH_ABI64 | {X86, ARM}
+# The deployment target the kernel is built against; must match CMAKE_OSX_DEPLOYMENT_TARGET.
+MACOS_MIN = "11_0"
+
+# PE. Only the COFF machine field is needed; the import table is read with objdump.
+PE_MACHINES = {0x8664: "amd64", 0xAA64: "arm64"}
+# DLLs a Windows kernel build may import. Everything here ships with Windows itself.
+# python*.dll is the one this whole split exists to keep out (see isabelle_vector.cpp);
+# the MinGW runtimes would load fine inside MSYS2 but not in Isabelle's Cygwin-launched
+# process, so they must not creep in either -- they only appear if the kernel starts
+# referencing C++ runtime symbols, which today it does not.
+PE_FORBIDDEN = ("python", "libstdc++", "libgcc_s", "libwinpthread")
 
 
 # --------------------------------------------------------------- building the .so
@@ -123,22 +147,74 @@ def _library() -> Path:
     return so
 
 
-# ------------------------------------------------------------ inspecting the .so
+# --------------------------------------------------------- inspecting the kernel
+
+def _binary_format(so: Path) -> str:
+    """``elf`` / ``macho`` / ``pe``, from the first bytes alone."""
+    head = so.open("rb").read(4)
+    if head[:4] == b"\x7fELF":
+        return "elf"
+    if head[:2] == b"MZ":
+        return "pe"
+    magic = int.from_bytes(head, "big")
+    if magic == FAT_MAGIC or int.from_bytes(head, "little") == MH_MAGIC_64:
+        return "macho"
+    raise SystemExit(f"{so}: not an ELF, Mach-O or PE object")
+
 
 def _elf_arch(so: Path) -> str:
-    """Architecture of an ELF object, read straight out of its header.
-
-    ``e_machine`` sits at offset 0x12 in both ELF32 and ELF64, so this needs no
-    parser and no binutils.
-    """
+    """``e_machine`` sits at offset 0x12 in both ELF32 and ELF64: no binutils needed."""
     head = so.open("rb").read(20)
-    if head[:4] != b"\x7fELF":
-        raise SystemExit(f"{so} is not an ELF object")
     endian = "little" if head[5] == 1 else "big"
     machine = int.from_bytes(head[18:20], endian)
     if machine not in ELF_MACHINES:
         raise SystemExit(f"{so}: unhandled ELF machine 0x{machine:02x}")
     return ELF_MACHINES[machine]
+
+
+def macho_arches(so: Path) -> list[str]:
+    """The architecture slices in a Mach-O, in file order. One entry if not fat.
+
+    Public because the wheel's *other* compiled artifact -- the _vecgather extension
+    module, which setuptools builds and which obeys ARCHFLAGS rather than
+    CMAKE_OSX_ARCHITECTURES -- has to be checked with the same eyes. A universal2
+    tag on a wheel whose extension module is arm64-only installs cleanly on an Intel
+    Mac and then fails at `import`, and no test running on the build machine can see it.
+    """
+    data = so.open("rb").read(8)
+    if int.from_bytes(data[:4], "big") != FAT_MAGIC:  # thin: a single Mach-O
+        cputype = int.from_bytes(so.open("rb").read(8)[4:8], "little")
+        return [MACHO_CPUS.get(cputype, f"0x{cputype:08x}")]
+    n = int.from_bytes(data[4:8], "big")
+    blob = so.open("rb").read(8 + n * 20)
+    out = []
+    for i in range(n):
+        cputype = int.from_bytes(blob[8 + i * 20: 12 + i * 20], "big")
+        out.append(MACHO_CPUS.get(cputype, f"0x{cputype:08x}"))
+    return out
+
+
+def _pe_arch(so: Path) -> str:
+    """COFF ``Machine``, reached through the DOS stub's ``e_lfanew`` at 0x3C."""
+    blob = so.open("rb").read(0x400)
+    off = int.from_bytes(blob[0x3C:0x40], "little")
+    if blob[off:off + 4] != b"PE\0\0":
+        raise SystemExit(f"{so}: no PE signature at e_lfanew={off:#x}")
+    machine = int.from_bytes(blob[off + 4: off + 6], "little")
+    if machine not in PE_MACHINES:
+        raise SystemExit(f"{so}: unhandled PE machine 0x{machine:04x}")
+    return PE_MACHINES[machine]
+
+
+def _pe_imports(so: Path) -> set[str]:
+    """DLLs named in the import table, via objdump (MinGW brings binutils along)."""
+    exe = shutil.which("objdump")
+    if exe is None:
+        print(f"warning: objdump not found; cannot check {so.name}'s imports for "
+              f"{PE_FORBIDDEN}. This check is skipped, not passed.", file=sys.stderr)
+        return set()
+    out = subprocess.run([exe, "-p", str(so)], check=True, capture_output=True, text=True).stdout
+    return {m.lower() for m in re.findall(r"DLL Name:\s*(\S+)", out)}
 
 
 def _dynamic_info(so: Path) -> tuple[set[str], set[tuple[int, ...]]]:
@@ -161,7 +237,32 @@ def _dynamic_info(so: Path) -> tuple[set[str], set[tuple[int, ...]]]:
 
 
 def _platform_tag(so: Path) -> str:
-    """The most permissive manylinux tag this exact binary honestly satisfies."""
+    """The most permissive tag this exact binary honestly satisfies.
+
+    Derived from the artifact rather than from the host, because a tag that
+    over-promises fails on someone else's machine, not on this one.
+    """
+    fmt = _binary_format(so)
+    if fmt == "macho":
+        arches = macho_arches(so)
+        if sorted(arches) != ["arm64", "x86_64"]:
+            raise SystemExit(
+                f"{so} has slices {arches}; a universal2 wheel needs both x86_64 and "
+                "arm64. Is CMAKE_OSX_ARCHITECTURES set before add_library()?"
+            )
+        return f"macosx_{MACOS_MIN}_universal2"
+
+    if fmt == "pe":
+        forbidden = sorted(d for d in _pe_imports(so)
+                           if any(d.startswith(p) for p in PE_FORBIDDEN))
+        if forbidden:
+            raise SystemExit(
+                f"{so} imports {forbidden}. Isabelle/ML loads this library with "
+                "LoadLibrary, which resolves the whole import table at load, into a "
+                "process launched from a Cygwin shell whose PATH we do not control."
+            )
+        return f"win_{_pe_arch(so)}"
+
     arch = _elf_arch(so)
     needed, versions = _dynamic_info(so)
     external = needed - ALLOWED_NEEDED
@@ -183,6 +284,15 @@ def _check_supplied_tag(so: Path, plat: str) -> None:
     A wrong tag is not a build failure but a runtime one, on someone else's
     machine, at the first dlopen -- so it is worth catching here.
     """
+    fmt = _binary_format(so)
+    if fmt != "elf":
+        # Mach-O and PE carry no glibc versions to reconcile; the derived tag already
+        # encodes everything checkable, so simply require agreement with it.
+        derived = _platform_tag(so)
+        if plat != derived:
+            raise SystemExit(f"--plat-name {plat} contradicts the library, which is {derived}")
+        return
+
     arch = _elf_arch(so)
     if not plat.endswith("_" + arch) and not plat.endswith("-" + arch):
         raise SystemExit(f"--plat-name {plat} does not match the library's architecture ({arch})")
@@ -240,6 +350,32 @@ class build_py(_build_py):
         self.copy_file(str(so), str(target / LIB_NAME))
 
 
+def _check_extension_arch(bdist_dir: str | None, plat: str) -> None:
+    """On macOS, make the extension module answer for the tag the kernel earned.
+
+    The two compiled artifacts obey different switches: the kernel is a CMake target
+    and takes CMAKE_OSX_ARCHITECTURES, while _vecgather is a setuptools ext_module
+    and takes ARCHFLAGS. Set only the former -- the obvious mistake -- and a
+    universal2 kernel ships beside an arm64-only extension under a universal2 tag.
+    pip installs it happily on an Intel Mac; `import _vecgather` then dies with
+    "incompatible architecture". No test on the (arm64) build machine can see this,
+    so the wheel itself must be inspected.
+    """
+    if not plat.endswith("universal2") or not bdist_dir:
+        return
+    found = sorted((Path(bdist_dir) / PACKAGE).glob("_vecgather*.so"))
+    if not found:
+        raise SystemExit(f"no _vecgather extension module staged in {bdist_dir}")
+    for ext in found:
+        arches = macho_arches(ext)
+        if sorted(arches) != ["arm64", "x86_64"]:
+            raise SystemExit(
+                f"{ext.name} has slices {arches}, but the wheel is tagged {plat}.\n"
+                'Set ARCHFLAGS="-arch arm64 -arch x86_64" for the build: '
+                "CMAKE_OSX_ARCHITECTURES governs the kernel, not this module."
+            )
+
+
 class bdist_wheel(_bdist_wheel):
     def get_tag(self) -> tuple[str, str, str]:
         # (cp311, abi3) comes from the py_limited_api option below; root_is_pure is
@@ -255,6 +391,7 @@ class bdist_wheel(_bdist_wheel):
             _check_supplied_tag(so, plat)
         else:
             plat = _platform_tag(so)
+        _check_extension_arch(self.bdist_dir, plat)
         return impl, abi, plat
 
 

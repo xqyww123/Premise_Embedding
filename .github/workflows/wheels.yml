@@ -40,8 +40,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-24.04, arch: x86_64 }
-          - { runner: ubuntu-24.04-arm, arch: aarch64 }
+          - { runner: ubuntu-24.04, arch: x86_64, lib: libisabelle_vector.so }
+          - { runner: ubuntu-24.04-arm, arch: aarch64, lib: libisabelle_vector.so }
+          # An Apple Silicon runner, but it builds for both architectures: Isabelle
+          # runs native arm64 Poly/ML there (etc/options ML_system_apple = true) and
+          # x86_64 on Intel Macs, and one fat binary serves both.
+          - { runner: macos-14, arch: universal2, lib: libisabelle_vector.dylib }
 
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +53,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Build for both macOS architectures
+        if: runner.os == 'macOS'
+        # Two artifacts, two switches. CMAKE_OSX_ARCHITECTURES (set in Vector_Arith's
+        # CMakeLists) governs the kernel and Highway; ARCHFLAGS governs the
+        # _vecgather extension module, which setuptools builds. Setting only the
+        # first yields a universal2-tagged wheel whose extension module is arm64-only
+        # -- it installs on an Intel Mac and dies at `import`. setup.py's
+        # _check_extension_arch refuses to emit such a wheel, so this is what keeps
+        # the build green rather than what keeps it honest.
+        run: |
+          echo 'ARCHFLAGS=-arch arm64 -arch x86_64' >> "$GITHUB_ENV"
+          echo 'MACOSX_DEPLOYMENT_TARGET=11.0' >> "$GITHUB_ENV"
 
       - name: Build vendored Highway (static)
         # Only the `hwy` target: the tests and examples are a far larger build than
@@ -59,9 +76,19 @@ jobs:
         # CMakeLists looks there and nowhere else, and cross-checks that the headers
         # come from the same tree as the archive, because libhwy.a owns the dispatch
         # tables and their target numbering is not stable across releases.
+        #
+        # On macOS the archive must be fat too, or linking the kernel fails with
+        # "building for macOS-arm64 but attempting to link with file built for
+        # macOS-x86_64". Highway adds no -march on x86_64/arm64, so clang's two
+        # front-end passes are safe.
         run: |
           hwy=Tools/Vector_Arith/contrib/highway-1.3.0
-          cmake -S "$hwy" -B "$hwy/build" \
+          if [ "$RUNNER_OS" = macOS ]; then
+            osx='-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0'
+          else
+            osx=''
+          fi
+          cmake -S "$hwy" -B "$hwy/build" $osx \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DHWY_ENABLE_TESTS=OFF \
@@ -73,47 +100,86 @@ jobs:
         # setup.py would build the library on its own, but not the tests. Run them
         # before the wheel is packed: test_ml_dlopen is the one that catches a
         # CPython symbol creeping back into the kernel, which would break
-        # Isabelle/ML's Foreign.loadLibrary (dlopen with RTLD_LAZY) at load time
-        # while leaving Python perfectly happy.
+        # Isabelle/ML's Foreign.loadLibrary at load time while leaving Python happy.
+        #
+        # The test binaries are thin (whatever the host is); only the shipped library
+        # needs to be fat, and CMakeLists makes it so.
         run: |
           cmake -S Tools/Vector_Arith -B Tools/Vector_Arith/build -DCMAKE_BUILD_TYPE=Release
           cmake --build Tools/Vector_Arith/build --parallel
           ./Tools/Vector_Arith/build/test_gather
-          ./Tools/Vector_Arith/build/test_ml_dlopen ./Tools/Vector_Arith/build/libisabelle_vector.so
+          ./Tools/Vector_Arith/build/test_ml_dlopen "./Tools/Vector_Arith/build/${{ matrix.lib }}"
 
       - name: Report what Highway compiled in
-        # The dispatch table is chosen at build time, per architecture. If this
-        # prints only EMU128/SCALAR the wheel is a scalar fallback wearing a SIMD
-        # name -- worth seeing in the log rather than discovering by benchmark.
+        # The dispatch table is fixed at build time, per architecture. If a slice
+        # shows only EMU128/SCALAR the wheel is a scalar fallback wearing a SIMD
+        # name -- fail here rather than discover it by benchmark. On a fat binary
+        # each slice has its own table, so each must be checked separately.
         run: |
-          nm -C Tools/Vector_Arith/build/libisabelle_vector.so \
-            | grep -o 'N_[A-Z0-9_]*' | sort -u | tr '\n' ' '
-          echo
-          objdump -p Tools/Vector_Arith/build/libisabelle_vector.so | grep NEEDED
-          objdump -T Tools/Vector_Arith/build/libisabelle_vector.so \
-            | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+          lib=Tools/Vector_Arith/build/${{ matrix.lib }}
+          if [ "$RUNNER_OS" = macOS ]; then
+            echo "slices: $(lipo -archs "$lib")"
+            for a in $(lipo -archs "$lib"); do
+              lipo -thin "$a" "$lib" -output /tmp/slice.dylib
+              targets=$(nm -jU /tmp/slice.dylib | grep -o 'N_[A-Z0-9_]*' | sort -u | tr '\n' ' ')
+              echo "  $a: ${targets:-（none）}"
+              case "$targets" in
+                *N_AVX2*|*N_NEON*) ;;
+                *) echo "::error::slice $a has no real SIMD target: $targets"; exit 1 ;;
+              esac
+            done
+            otool -L "$lib" | grep -i python && { echo "::error::links Python"; exit 1; } || true
+          else
+            nm -C "$lib" | grep -o 'N_[A-Z0-9_]*' | sort -u | tr '\n' ' '
+            echo
+            objdump -p "$lib" | grep NEEDED
+            objdump -T "$lib" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+          fi
 
       - name: Build the wheel
         # --wheel, not a bare `python -m build`: the latter builds an sdist first
         # and then the wheel from inside it, and the sdist carries no Tools/ tree.
-        # setup.py reuses the library built above, then derives the platform tag
-        # from its ELF header and verifies DT_NEEDED and the glibc symbol versions
-        # against the manylinux allowlist.
+        # setup.py reuses the library built above, derives the platform tag from the
+        # binary's own headers, and refuses to emit a tag it cannot back up -- an
+        # ELF whose DT_NEEDED escapes the manylinux allowlist, a Mach-O missing a
+        # slice, a PE importing python*.dll.
         run: |
           python -m pip install --upgrade build
           python -m build --wheel
           ls -l dist/
 
-      - name: Check the tag matches the runner
+      - name: Check the wheel matches the runner
+        # The tag is what pip trusts. Both compiled artifacts must live up to it --
+        # on macOS especially, where they are produced by different toolchains and
+        # only the wheel itself shows whether both obeyed.
         run: |
-          test -n "$(ls dist/*-manylinux_*_${{ matrix.arch }}.whl)"
+          test -n "$(ls dist/*-${{ matrix.arch }}.whl)"
           python - <<'PY'
           import pathlib, zipfile
           whl, = pathlib.Path("dist").glob("*.whl")
           names = zipfile.ZipFile(whl).namelist()
-          assert "Isabelle_Semantic_Embedding/libisabelle_vector.so" in names, names
+          for want in ("${{ matrix.lib }}", "_vecgather"):
+              assert any(want in n for n in names), (want, names)
           print("ok:", whl.name)
           PY
+
+      - name: Both artifacts are universal2
+        if: runner.os == 'macOS'
+        # setup.py already refuses to build an inconsistent wheel; this re-checks the
+        # bytes that actually shipped, and prints them, because the failure it guards
+        # against (arm64-only extension under a universal2 tag) is invisible on this
+        # arm64 runner and would only surface on a user's Intel Mac.
+        run: |
+          python -m zipfile -e dist/*.whl /tmp/whl
+          for f in /tmp/whl/Isabelle_Semantic_Embedding/libisabelle_vector.dylib \
+                   /tmp/whl/Isabelle_Semantic_Embedding/_vecgather*.so; do
+            archs=$(lipo -archs "$f")
+            echo "$(basename "$f"): $archs"
+            case "$(echo $archs | tr ' ' '\n' | sort | tr '\n' ' ')" in
+              "arm64 x86_64 ") ;;
+              *) echo "::error::$(basename "$f") is $archs, not universal2"; exit 1 ;;
+            esac
+          done
 
       - uses: actions/upload-artifact@v4
         with:
