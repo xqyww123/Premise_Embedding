@@ -12,6 +12,11 @@ version = "0.1.0"
 description = "Isabelle Semantic Embedding"
 readme = "README.md"
 license = "LGPL-2.1-or-later"
+# The GNU convention for a library under the LGPL 2.1 (glibc's, among others):
+# COPYING carries the ordinary GPL and COPYING.LIB the Lesser one. Both ship,
+# because LGPL-2.1 section 3 lets a recipient convert any copy to the plain GPL,
+# and they cannot exercise that right without its text.
+license-files = ["COPYING", "COPYING.LIB"]
 # desugar, hover, premise_selection and semantics annotate with `X | Y` and do not
 # import `annotations` from __future__, so those annotations are evaluated at import
 # time. isabelle-rpc requires 3.10 independently.
