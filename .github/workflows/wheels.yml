@@ -367,6 +367,8 @@ jobs:
     environment: pypi
     permissions:
       id-token: write # mints the OIDC token that PyPI trusted publishing verifies
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -376,4 +378,23 @@ jobs:
 
       - run: ls -l dist/
 
+      - id: version
+        shell: bash
+        # v0.2.0 -> 0.2.0, for the verification job below. Expression syntax has no
+        # substring function, so the tag is stripped here rather than in a `with:`.
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # Everything above tested the artifacts in dist/. This tests the ones a user gets:
+  # after the upload, through PyPI's index, with pip choosing which of the four
+  # wheels the host deserves. The same workflow runs weekly on its own, so a new
+  # CPython or a refreshed runner image cannot rot a published wheel unnoticed.
+  #
+  # The version is pinned rather than left to "latest", so that a release running
+  # concurrently cannot make this pass for an artifact it never tested.
+  verify-published:
+    needs: publish
+    uses: ./.github/workflows/verify-pypi.yml
+    with:
+      version: ${{ needs.publish.outputs.version }}

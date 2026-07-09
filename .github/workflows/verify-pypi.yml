@@ -1,0 +1,128 @@
+# Test what is actually on PyPI, rather than what we just built.
+#
+# wheels.yml tests the artifacts in dist/. Between there and a user's machine lie
+# the upload, PyPI's index, pip's choice of which of the four wheels to fetch, and
+# the dependency resolution -- none of which dist/ can speak for. The one real bug
+# this class has already produced was a `dependencies` entry naming the import name
+# (`Isabelle_RPC_Host`) rather than the distribution name (`isabelle-rpc`), which
+# every local check passed and every `pip install` would have failed.
+#
+# Called from wheels.yml straight after a successful publish, and weekly on its own
+# so that a new CPython release or a refreshed runner image cannot rot the wheels
+# unnoticed. `workflow_dispatch` takes an explicit version for re-checking an old one.
+name: verify-pypi
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version to verify. Empty means whatever PyPI calls latest.
+        type: string
+        required: false
+        default: ""
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to verify (e.g. 0.2.0). Empty means latest.
+        type: string
+        required: false
+        default: ""
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, off the hour to dodge the scheduler's rush
+
+permissions:
+  contents: read
+
+env:
+  PACKAGE: Isabelle_Semantic_Embedding
+
+jobs:
+  install-and-test:
+    name: ${{ matrix.label }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each wheel gets a host that can actually run it, and between them the
+          # rows cover every interpreter the cp311-abi3 tag promises to serve.
+          - { runner: ubuntu-24.04, python: "3.11", label: linux-x86_64 }
+          - { runner: ubuntu-24.04, python: "3.14", label: linux-x86_64 }
+          - { runner: ubuntu-24.04-arm, python: "3.12", label: linux-aarch64 }
+          - { runner: macos-14, python: "3.12", label: macos-arm64 }
+          # The one host that can tell a real x86_64 slice from a universal2 tag.
+          - { runner: macos-13, python: "3.11", label: macos-intel }
+          - { runner: windows-2022, python: "3.13", label: windows-amd64 }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install from PyPI
+        shell: bash
+        # A fresh upload takes a little while to become installable, so retry rather
+        # than fail the first job after a release. --no-cache-dir because a cached
+        # wheel from an earlier run would defeat the entire point of this workflow.
+        #
+        # --no-deps keeps the runtime dependencies (transformers, faiss, torch) out
+        # of a test that touches none of them; the dependency graph is checked
+        # separately, and once, in resolve-dependencies below.
+        run: |
+          spec="$PACKAGE"
+          if [ -n "${{ inputs.version }}" ]; then spec="$PACKAGE==${{ inputs.version }}"; fi
+          echo "installing $spec"
+          for attempt in 1 2 3 4 5 6 7 8; do
+            if python -m pip install --no-deps --no-cache-dir "$spec"; then
+              exit 0
+            fi
+            echo "attempt $attempt failed; PyPI may not have indexed it yet"
+            sleep 30
+          done
+          echo "::error::could not install $spec from PyPI"
+          exit 1
+
+      - name: Report what pip chose
+        shell: bash
+        run: |
+          python -c "import platform, sys; print('host', platform.machine(), 'python', sys.version)"
+          python -m pip show "$PACKAGE" | sed -n '1,3p'
+
+      - name: Run the test suite against it
+        shell: bash
+        # From a scratch directory, and with the `pytest` entry point rather than
+        # `python -m pytest`: both the cwd and the test file's directory reach
+        # sys.path, and from the checkout the source tree would shadow the package
+        # installed from PyPI. VECARITH_REQUIRE_INSTALLED makes that an error.
+        run: |
+          python -m pip install --quiet pytest numpy
+          mkdir -p "${RUNNER_TEMP}/run" && cd "${RUNNER_TEMP}/run"
+          VECARITH_REQUIRE_INSTALLED=1 pytest -q "${GITHUB_WORKSPACE}/tests/test_vecarith.py"
+
+  resolve-dependencies:
+    name: dependencies resolve
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11" # the floor: resolution must succeed at the boundary
+
+      - name: Every dependency exists and is satisfiable
+        shell: bash
+        # The check the other job deliberately skips. It caught nothing on the day it
+        # was written, and would have caught `Isabelle_RPC_Host` -- an import name in
+        # a field that holds distribution names -- on the day that shipped. --dry-run
+        # resolves the full graph without building or installing any of it.
+        run: |
+          spec="$PACKAGE"
+          if [ -n "${{ inputs.version }}" ]; then spec="$PACKAGE==${{ inputs.version }}"; fi
+          for attempt in 1 2 3 4 5 6; do
+            if python -m pip install --dry-run --no-cache-dir "$spec"; then
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::dependency resolution failed for $spec"
+          exit 1
