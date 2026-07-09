@@ -123,8 +123,14 @@ jobs:
         run: |
           lib=Tools/Vector_Arith/build/${{ matrix.lib }}
           if [ "$RUNNER_OS" = macOS ]; then
-            echo "slices: $(lipo -archs "$lib")"
-            for a in $(lipo -archs "$lib"); do
+            archs=$(lipo -archs "$lib")
+            echo "slices: $archs"
+            case "$(echo $archs | tr ' ' '\n' | sort | tr '\n' ' ')" in
+              "arm64 x86_64 ") ;;
+              *) echo "::error::kernel is $archs, not universal2 -- did"
+                 echo "::error::CMAKE_OSX_ARCHITECTURES reach add_library()?"; exit 1 ;;
+            esac
+            for a in $archs; do
               lipo -thin "$a" "$lib" -output /tmp/slice.dylib
               targets=$(nm -jU /tmp/slice.dylib | grep -o 'N_[A-Z0-9_]*' | sort -u | tr '\n' ' ')
               echo "  $a: ${targets:-（none）}"

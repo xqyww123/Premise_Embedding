@@ -80,12 +80,25 @@ endif()
 
 # A fat binary covers both Intel Macs (x86_64-darwin) and Apple Silicon
 # (arm64-darwin, which Isabelle prefers by default: etc/options ML_system_apple).
+#
 # This MUST precede add_library: a target's OSX_ARCHITECTURES property is
 # initialized from the variable at target-creation time, and setting it afterwards
 # silently yields a host-architecture-only library.
+#
+# Plain set(), not set(CACHE): Platform/Darwin-Initialize.cmake already created
+# CMAKE_OSX_ARCHITECTURES as a cache entry (empty, from the environment) while
+# project() ran, and set(CACHE) over an existing entry is a no-op -- it would leave
+# the kernel arm64-only on an Apple Silicon builder, under a universal2 tag. The
+# guard keeps an explicit -DCMAKE_OSX_ARCHITECTURES=... authoritative, since a
+# normal variable would otherwise shadow the cache one it came in through.
 if(APPLE)
-    set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "universal2")
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "matches the macosx_11_0 wheel tag")
+    if(NOT CMAKE_OSX_ARCHITECTURES)
+        set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64")
+    endif()
+    if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+        set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0")  # matches the macosx_11_0 wheel tag
+    endif()
+    message(STATUS "macOS architectures: ${CMAKE_OSX_ARCHITECTURES}")
 endif()
 
 add_library(isabelle_vector SHARED isabelle_vector.cpp)
