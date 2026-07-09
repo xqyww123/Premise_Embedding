@@ -46,6 +46,7 @@ jobs:
           # runs native arm64 Poly/ML there (etc/options ML_system_apple = true) and
           # x86_64 on Intel Macs, and one fat binary serves both.
           - { runner: macos-14, arch: universal2, lib: libisabelle_vector.dylib }
+          - { runner: windows-2022, arch: amd64, lib: isabelle_vector.dll }
 
     steps:
       - uses: actions/checkout@v4
@@ -53,6 +54,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      # Two toolchains, on purpose. The kernel needs MinGW: Highway marks AVX3 and
+      # everything above it as HWY_BROKEN_MSVC (detect_targets.h:191), so MSVC would
+      # silently drop five SIMD targets, and Poly/ML is itself a MinGW build
+      # (Admin/component_polyml.scala:37). The _vecgather extension needs MSVC, which
+      # is what setuptools knows how to drive and what links python3.lib. They never
+      # meet: the two artifacts share no symbol, no heap and no CRT object
+      # (vecgather writes only into buffers the caller allocated).
+      - if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+      - name: Put MinGW's binutils on PATH
+        if: runner.os == 'Windows'
+        # setup.py reads the kernel's PE import table with objdump, from the plain
+        # shell that runs `python -m build`, not from the MSYS2 one.
+        shell: msys2 {0}
+        run: cygpath -w /mingw64/bin >> "$GITHUB_PATH"
 
       - name: Build for both macOS architectures
         if: runner.os == 'macOS'
@@ -68,6 +89,7 @@ jobs:
           echo 'MACOSX_DEPLOYMENT_TARGET=11.0' >> "$GITHUB_ENV"
 
       - name: Build vendored Highway (static)
+        if: runner.os != 'Windows'
         # Only the `hwy` target: the tests and examples are a far larger build than
         # the library, and none of them ship. Highway already forces PIC on that
         # target, which matters because the archive is linked into a shared object.
@@ -102,6 +124,7 @@ jobs:
           if [ "$RUNNER_OS" = macOS ]; then lipo -info "$hwy/hwybuild/libhwy.a"; fi
 
       - name: Build the kernel and run its tests
+        if: runner.os != 'Windows'
         # setup.py would build the library on its own, but not the tests. Run them
         # before the wheel is packed: test_ml_dlopen is the one that catches a
         # CPython symbol creeping back into the kernel, which would break
@@ -115,7 +138,52 @@ jobs:
           ./Tools/Vector_Arith/build/test_gather
           ./Tools/Vector_Arith/build/test_ml_dlopen "./Tools/Vector_Arith/build/${{ matrix.lib }}"
 
+      - name: Build Highway, the kernel and its tests (MinGW)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        # All of it inside MSYS2, with Ninja rather than the Visual Studio generator
+        # cmake would otherwise pick. test_ml_dlopen exercises the LoadLibrary path
+        # that Poly/ML takes on Windows (polyffi.cpp:153), which -- unlike
+        # dlopen(RTLD_LAZY) -- resolves the whole import table at load, so it fails
+        # here if any dependency of the kernel is missing rather than at ML load time.
+        run: |
+          hwy=Tools/Vector_Arith/contrib/highway-1.3.0
+          cmake -S "$hwy" -B "$hwy/hwybuild" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DHWY_ENABLE_TESTS=OFF -DHWY_ENABLE_EXAMPLES=OFF -DHWY_ENABLE_CONTRIB=OFF
+          cmake --build "$hwy/hwybuild" --target hwy --parallel
+          cmake -S Tools/Vector_Arith -B Tools/Vector_Arith/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build Tools/Vector_Arith/build --parallel
+          ./Tools/Vector_Arith/build/test_gather.exe
+          ./Tools/Vector_Arith/build/test_ml_dlopen.exe "./Tools/Vector_Arith/build/${{ matrix.lib }}"
+          # Hand the finished DLL to setup.py, which would otherwise rerun cmake from
+          # the plain shell and rebuild the kernel with MSVC -- losing five SIMD targets.
+          echo "ISABELLE_VECTOR_SO=$(cygpath -w "$PWD/Tools/Vector_Arith/build/${{ matrix.lib }}")" \
+            >> "$GITHUB_ENV"
+
+      - name: Report what Highway compiled in (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        # MSVC would have dropped AVX3 and above (HWY_BROKEN_MSVC, detect_targets.h:191)
+        # and an old MinGW would silently drop AVX3_SPR (gcc>=12) or AVX3_DL/ZEN4
+        # (gcc>=8.1) the same way, so assert the top of the range actually arrived.
+        run: |
+          lib=Tools/Vector_Arith/build/${{ matrix.lib }}
+          targets=$(nm -C "$lib" | grep -o 'N_[A-Z0-9_]*' | sort -u | tr '\n' ' ')
+          echo "targets: $targets"
+          objdump -p "$lib" | grep 'DLL Name:'
+          for want in N_AVX2 N_AVX3 N_AVX3_SPR N_AVX10_2; do
+            case " $targets " in
+              *" $want "*) ;;
+              *) echo "::error::$want missing -- MinGW too old, or MSVC crept in"; exit 1 ;;
+            esac
+          done
+          if objdump -p "$lib" | grep -Eiq 'DLL Name:.*(python|libstdc\+\+|libgcc_s|libwinpthread)'; then
+            echo "::error::kernel imports a DLL that Isabelle's process may not find"; exit 1
+          fi
+
       - name: Report what Highway compiled in
+        if: runner.os != 'Windows'
         # The dispatch table is fixed at build time, per architecture. If a slice
         # shows only EMU128/SCALAR the wheel is a scalar fallback wearing a SIMD
         # name -- fail here rather than discover it by benchmark. On a fat binary
@@ -158,6 +226,7 @@ jobs:
           fi
 
       - name: Build the wheel
+        shell: bash
         # --wheel, not a bare `python -m build`: the latter builds an sdist first
         # and then the wheel from inside it, and the sdist carries no Tools/ tree.
         # setup.py reuses the library built above, derives the platform tag from the
@@ -170,6 +239,7 @@ jobs:
           ls -l dist/
 
       - name: Check the wheel matches the runner
+        shell: bash
         # The tag is what pip trusts. Both compiled artifacts must live up to it --
         # on macOS especially, where they are produced by different toolchains and
         # only the wheel itself shows whether both obeyed.

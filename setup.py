@@ -207,11 +207,19 @@ def _pe_arch(so: Path) -> str:
 
 
 def _pe_imports(so: Path) -> set[str]:
-    """DLLs named in the import table, via objdump (MinGW brings binutils along)."""
-    exe = shutil.which("objdump")
-    if exe is None:
-        print(f"warning: objdump not found; cannot check {so.name}'s imports for "
-              f"{PE_FORBIDDEN}. This check is skipped, not passed.", file=sys.stderr)
+    """DLLs named in the import table, via objdump (MinGW brings binutils along).
+
+    The wheel is built by a plain-shell `python -m build` while the kernel is built
+    under MSYS2, so an unprefixed objdump may not be on PATH; try the cross-prefixed
+    name too before giving up.
+    """
+    for name in ("objdump", "x86_64-w64-mingw32-objdump", "llvm-objdump"):
+        exe = shutil.which(name)
+        if exe:
+            break
+    else:
+        print(f"warning: no objdump found, so {so.name}'s imports were NOT checked "
+              f"against {PE_FORBIDDEN}. Skipped, not passed.", file=sys.stderr)
         return set()
     out = subprocess.run([exe, "-p", str(so)], check=True, capture_output=True, text=True).stdout
     return {m.lower() for m in re.findall(r"DLL Name:\s*(\S+)", out)}

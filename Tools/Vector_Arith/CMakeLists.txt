@@ -21,6 +21,10 @@ if(TRUE)  # 强制手动查找
     # macOS filesystems are case-insensitive by default, so `cmake -B .../build`
     # collides with it ("Unable to (re)create the private pkgRedirects directory").
     # `build` stays in the list because existing checkouts have one.
+    # NO_CMAKE_FIND_ROOT_PATH: under a cross-compiling toolchain file,
+    # CMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY would re-root these PATHS into the
+    # sysroot and find nothing. The vendored archive is inside the source tree, and
+    # is cross-built alongside the kernel, so it must be searched where it is.
     find_library(HWY_STATIC_LIBRARY
         NAMES libhwy.a
         PATHS
@@ -30,6 +34,7 @@ if(TRUE)  # 强制手动查找
             ${CMAKE_SOURCE_DIR}/contrib/highway/build
             ${CMAKE_SOURCE_DIR}/contrib/build
         NO_DEFAULT_PATH
+        NO_CMAKE_FIND_ROOT_PATH
     )
 
     # NO_DEFAULT_PATH matters: without it, find_path searches the system prefixes
@@ -40,6 +45,7 @@ if(TRUE)  # 强制手动查找
     # not stable across releases -- a mismatch can dispatch into the wrong entry.
     find_path(HWY_INCLUDE_DIR hwy/highway.h
         NO_DEFAULT_PATH
+        NO_CMAKE_FIND_ROOT_PATH
         PATHS
             ${CMAKE_SOURCE_DIR}/contrib/highway-1.3.0
             ${CMAKE_SOURCE_DIR}/contrib/highway
@@ -116,8 +122,13 @@ endif()
 # MinGW-w64, never MSVC: Highway marks AVX3 and everything above it as
 # HWY_BROKEN_MSVC (detect_targets.h:191), silently dropping five SIMD targets.
 # Poly/ML is itself built with MinGW (Admin/component_polyml.scala:37).
+#
+# PREFIX "": MinGW would otherwise emit libisabelle_vector.dll, while _vecarith.py
+# and simd_vector.ML both look for isabelle_vector.dll -- the usual Windows spelling.
 if(WIN32)
-    set_target_properties(isabelle_vector PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    set_target_properties(isabelle_vector PROPERTIES
+        WINDOWS_EXPORT_ALL_SYMBOLS ON
+        PREFIX "")
 endif()
 
 # 设置包含目录

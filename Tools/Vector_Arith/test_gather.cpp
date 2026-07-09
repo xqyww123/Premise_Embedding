@@ -16,12 +16,20 @@ extern "C" int top_k_q15_gather(const uintptr_t* vec_addrs, const int16_t* query
 
 static const double NORM = 0.95;
 
+/* A self-contained LCG (Numerical Recipes' constants). rand_r is POSIX-only, so
+   MinGW has none; and its sequence varies by libc, which would make these vectors
+   -- and any failure they provoke -- differ between platforms. */
+static unsigned next_rand(unsigned* seed) {
+  *seed = *seed * 1664525u + 1013904223u;
+  return *seed >> 1; /* drop the low bit: an LCG's lowest bits have short periods */
+}
+
 /* Quantize a random unit-ish vector to Q1.15 scaled to NORM, as production does. */
 static void make_vec(int16_t* dst, int32_t D, unsigned* seed) {
   double* f = (double*)malloc(D * sizeof(double));
   double ss = 0.0;
   for (int32_t i = 0; i < D; i++) {
-    double u = (double)rand_r(seed) / RAND_MAX * 2.0 - 1.0;
+    double u = (double)next_rand(seed) / (double)0x7FFFFFFFu * 2.0 - 1.0;
     f[i] = u; ss += u * u;
   }
   double n = sqrt(ss);
