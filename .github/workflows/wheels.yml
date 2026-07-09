@@ -120,8 +120,18 @@ jobs:
         # shows only EMU128/SCALAR the wheel is a scalar fallback wearing a SIMD
         # name -- fail here rather than discover it by benchmark. On a fat binary
         # each slice has its own table, so each must be checked separately.
+        #
+        # Demangle first: the target lives in a namespace, and against a raw mangled
+        # name `grep -o 'N_[A-Z0-9_]*'` runs straight on into Itanium ABI length
+        # prefixes, printing N_AVX2 as "N_AVX210D".
+        #
+        # Apple Silicon legitimately has no SVE -- Highway disables it under
+        # HWY_OS_APPLE ("No Apple CPU (at least up to and including M4 and A18) has
+        # SVE", detect_targets.h:261) -- so NEON alone is the correct answer there,
+        # and the gate demands only that some real SIMD target survived.
         run: |
           lib=Tools/Vector_Arith/build/${{ matrix.lib }}
+          targets_of() { nm -jUC "$1" | grep -o 'N_[A-Z0-9_]*' | sort -u | tr '\n' ' '; }
           if [ "$RUNNER_OS" = macOS ]; then
             archs=$(lipo -archs "$lib")
             echo "slices: $archs"
@@ -132,10 +142,10 @@ jobs:
             esac
             for a in $archs; do
               lipo -thin "$a" "$lib" -output /tmp/slice.dylib
-              targets=$(nm -jU /tmp/slice.dylib | grep -o 'N_[A-Z0-9_]*' | sort -u | tr '\n' ' ')
-              echo "  $a: ${targets:-（none）}"
-              case "$targets" in
-                *N_AVX2*|*N_NEON*) ;;
+              targets=$(targets_of /tmp/slice.dylib)
+              echo "  $a: ${targets:-(none)}"
+              case " $targets " in
+                *" N_AVX2 "*|*" N_NEON "*) ;;
                 *) echo "::error::slice $a has no real SIMD target: $targets"; exit 1 ;;
               esac
             done
