@@ -288,6 +288,10 @@ jobs:
         # the suite would pass while testing something else. VECARITH_REQUIRE_INSTALLED
         # turns that from a silence into an error.
         run: |
+          # The Windows job exported this so setup.py would not rebuild the kernel
+          # with MSVC. It also outranks every entry in _candidate_paths(), so leaving
+          # it set would test the checkout's library instead of the one in the wheel.
+          unset ISABELLE_VECTOR_SO
           python -m pip install --quiet pytest numpy
           python -m pip install --quiet --no-deps dist/*.whl
           mkdir -p /tmp/vecarith-run
