@@ -5,7 +5,7 @@ This module is the single owner of the Q1.15 contract:
 
   * encoding      : ``rint(target_norm * v/|v| * 32768)`` as little-endian int16
   * dot product   : Highway ``MulFixedPoint15`` == round((a*b) / 32768), in int16
-  * score recovery: ``cos = s / (32768 * target_norm**2)``
+  * score recovery: ``cos = clip(s / (32768 * target_norm**2), -1, 1)``
 
 The kernel deliberately uses a *rounding* fixed-point multiply rather than
 ``MulHigh`` (a floor). ``x - floor(x)`` lies in [0,1) for negative products just as
@@ -15,7 +15,9 @@ vectors, but far less when the two vectors are highly correlated (most products
 then being small and positive). No constant correction can fix both regimes: a
 ``+D/2`` term overshot by +0.023 at cos->1 and produced "cosines" above 1.0.
 Rounding is unbiased, cuts the error ~10x, and costs nothing (VPMULHRSW and
-VPMULHW have identical throughput; measured 25.8ms vs 25.7ms).
+VPMULHW have identical throughput; measured 25.8ms vs 25.7ms). It does not make
+the overshoot vanish -- a self-match still reaches 1.0007 at D=512, forty times
+smaller than the floor's 1.0243 -- so ``recover_cos`` clips.
 
 ``target_norm`` is below 1.0 for two independent reasons: a unit vector may have a
 component of exactly 1.0, which is unrepresentable in Q1.15's [-1, 1); and it keeps
@@ -80,12 +82,20 @@ def encode_q15(vectors: np.ndarray, target_norm: float = TARGET_NORM) -> np.ndar
 def recover_cos(scores: np.ndarray, D: int, target_norm: float = TARGET_NORM) -> np.ndarray:
     """Turn raw int16 dot products back into cosine similarities.
 
+    Clipped to [-1, 1]. The scale alone lands slightly outside it -- a vector against
+    itself scores up to 29593 where 32768*0.95**2 = 29573 was predicted, a relative
+    7e-4, because quantizing each component and rounding each product both perturb
+    the sum. A cosine of real vectors cannot exceed 1, so every excess is noise, and
+    clipping projects the result back onto the feasible set: it can only reduce the
+    error, never increase it, and being monotone it cannot reorder anything. Callers
+    therefore never have to clamp on this function's behalf.
+
     ``D`` is accepted for symmetry with the caller's shape checks; the rounding
     multiply needs no dimension-dependent correction.
     """
     del D  # unused: the rounding multiply is unbiased
     s = np.asarray(scores, dtype=np.float64)
-    return s / (_DOT_SCALE * target_norm * target_norm)
+    return np.clip(s / (_DOT_SCALE * target_norm * target_norm), -1.0, 1.0)
 
 
 # ------------------------------------------------------------------ shared object

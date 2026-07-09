@@ -169,19 +169,28 @@ def test_accumulator_cannot_overflow_at_the_worst_case():
 
 
 def test_recovered_cosines_stay_in_range():
-    """recover_cos is a scale, not a clamp, so a self-match lands just above 1.0.
+    """recover_cos clips, so callers never have to.
 
-    Callers must not assume cos <= 1.0 exactly. Sledgehammer_MaSh.normalize_scores
-    divides each fact list by its own mean, so the constant -- and this 1e-3 -- are
-    both absorbed downstream; nothing here rounds or clips on their behalf.
+    The bare scale lands slightly outside [-1, 1] -- quantization and per-term
+    rounding both perturb the sum, and a self-match reaches 1.0007 at D=512. Every
+    such excess is noise (a cosine of real vectors cannot exceed 1), so clipping
+    projects onto the feasible set: error can only shrink, and monotonicity means
+    nothing reorders.
     """
     rng = np.random.default_rng(3)
     a, b = random_q15(rng, 256, D), random_q15(rng, D)
     cos = V.recover_cos(reference_dot(a, b), D)
-    assert np.all(np.abs(cos) <= 1.001)
+    assert np.all(np.abs(cos) <= 1.0)
 
-    self_cos = V.recover_cos(np.array([V.dot_q15(b, b)]), D)[0]
-    assert 0.999 <= self_cos <= 1.001, self_cos
+    raw = V.dot_q15(b, b)
+    unclipped = raw / (V.Q15_SCALE * V.TARGET_NORM**2)
+    assert unclipped > 1.0, "the overshoot this test exists for has disappeared"
+    assert V.recover_cos(np.array([raw]), D)[0] == 1.0
+
+    # Clipping must not disturb anything already inside the range.
+    inside = np.array([-29000, -1, 0, 1, 29000])
+    assert np.allclose(V.recover_cos(inside, D),
+                       inside / (V.Q15_SCALE * V.TARGET_NORM**2))
 
 
 def test_quantization_error_against_float64_truth():
