@@ -1,3 +1,21 @@
+/* The Q1.15 SIMD kernel. Two processes load this same shared object: CPython
+ * through ctypes.CDLL, and Isabelle/ML through Foreign.loadLibrary -- the latter
+ * into a process with no interpreter in it.
+ *
+ * INVARIANT: nothing here may reference a CPython symbol, function or data.
+ *   - Unix: Poly/ML dlopens with RTLD_LAZY (libpolyml/polyffi.cpp:167), so an
+ *     undefined *function* would go unnoticed until called, but a data symbol
+ *     relocates eagerly and breaks the load outright.
+ *   - Windows: LoadLibrary (polyffi.cpp:153) resolves the whole ordinary import
+ *     table at load. A python3.dll import may happen to resolve if Python is on the
+ *     process PATH, but relying on that is a fragile, version-coupled coupling --
+ *     the ML process is launched from a Cygwin shell whose PATH we do not control.
+ *
+ * The Python-facing glue lives in Isabelle_Semantic_Embedding/_vecgather.c, a
+ * separate CPython extension module. Two guards keep this file honest:
+ * -Wl,-z,defs makes a stray symbol a link error, and test_ml_dlopen reproduces
+ * Poly/ML's load at build time.
+ */
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>

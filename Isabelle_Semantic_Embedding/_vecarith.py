@@ -25,17 +25,28 @@ term carries scale 32768, so ``|s| <= 32768 * target_norm**2``; at 0.95 that is
 dimensions (hence every per-lane and reduction-tree intermediate) by the same
 quantity, so nothing can overflow along the way.
 
-Calls go through ``ctypes.CDLL``, which releases the GIL for the duration of the
-foreign call. That is what allows the KNN to run under ``asyncio.to_thread``
-without starving the event loop; a pure-Python gather loop would hold the GIL.
+The kernel is reached through ``ctypes.CDLL``, which releases the GIL for the
+duration of the foreign call. That is what allows the KNN to run under
+``asyncio.to_thread`` without starving the event loop; a pure-Python gather loop
+would hold the GIL throughout.
+
+Address gathering is a separate matter: it lives in the ``_vecgather`` extension
+module, whose entry point holds the GIL by construction because it calls the
+CPython C API. That costs nothing -- it is ~10ms against the kernel's ~150ms, and
+the event-loop stall is set by the part that does release the GIL. The kernel
+itself contains no Python at all, so Isabelle/ML can load the very same shared
+object into a process that has no interpreter.
 """
 from __future__ import annotations
 
 import ctypes
 import os
 import pathlib
+import sys
 
 import numpy as np
+
+from . import _vecgather
 
 # ---------------------------------------------------------------- Q1.15 contract
 
@@ -81,7 +92,12 @@ def recover_cos(scores: np.ndarray, D: int, target_norm: float = TARGET_NORM) ->
 
 _ENV_VAR = "ISABELLE_VECTOR_SO"
 _REQUIRED_SYMBOL = "top_k_q15_gather"
-_LIB_NAME = "libisabelle_vector.so"
+_LIB_NAME = {
+    "linux": "libisabelle_vector.so",
+    "darwin": "libisabelle_vector.dylib",
+    "win32": "isabelle_vector.dll",
+}.get(sys.platform, "libisabelle_vector.so")
+"""Tools/simd_vector.ML picks the same name from ML_System.platform_is_windows/macos."""
 
 
 def _candidate_paths() -> list[pathlib.Path]:
@@ -118,13 +134,12 @@ def library_path() -> str:
 
 
 def _load() -> ctypes.CDLL:
-    """Bind the shared object twice, under the two different GIL disciplines.
+    """Bind the kernel through ``CDLL``, which releases the GIL around the call.
 
-    ``CDLL`` releases the GIL around a foreign call, which is the whole point for
-    the SIMD kernel: the event loop keeps running while the scan proceeds in a
-    worker thread. ``gather_addrs`` however touches the Python API, so it must be
-    reached through ``PyDLL``, which holds the GIL. Calling it via CDLL segfaults
-    the moment anything allocates.
+    That is the whole point: the event loop keeps running while the scan proceeds
+    in a worker thread. Nothing in this library touches the Python API, so there
+    is no GIL to hold -- address gathering lives in the ``_vecgather`` extension
+    module instead.
     """
     tried: list[str] = []
     for path in _candidate_paths():
@@ -153,16 +168,16 @@ def _load() -> ctypes.CDLL:
         _lib_path = path
         return lib
     raise RuntimeError(
-        "libisabelle_vector.so with %s not found. Tried:\n  %s\n"
+        "%s with %s not found. Tried:\n  %s\n"
         "Rebuild with:  cmake -S contrib/Semantic_Embedding/Tools/Vector_Arith "
         "-B contrib/Semantic_Embedding/Tools/Vector_Arith/build_new && "
         "cmake --build contrib/Semantic_Embedding/Tools/Vector_Arith/build_new\n"
-        "Or set %s to an explicit path." % (_REQUIRED_SYMBOL, "\n  ".join(tried), _ENV_VAR)
+        "Or set %s to an explicit path."
+        % (_LIB_NAME, _REQUIRED_SYMBOL, "\n  ".join(tried), _ENV_VAR)
     )
 
 
 _lib_cache: ctypes.CDLL | None = None
-_pylib_cache: ctypes.PyDLL | None = None
 _lib_path: pathlib.Path | None = None
 
 
@@ -177,30 +192,6 @@ def _lib() -> ctypes.CDLL:
     if _lib_cache is None:
         _lib_cache = _load()
     return _lib_cache
-
-
-def _pylib() -> ctypes.PyDLL:
-    """Second handle onto the same object, for the entry points that touch CPython.
-
-    dlopen refcounts, so this is the same mapping; only ctypes' GIL discipline
-    differs. gather_addrs must run with the GIL held.
-    """
-    global _pylib_cache
-    if _pylib_cache is None:
-        _lib()  # resolves and validates _lib_path
-        assert _lib_path is not None
-        lib = ctypes.PyDLL(str(_lib_path))
-        lib.gather_addrs.restype = ctypes.c_int
-        lib.gather_addrs.argtypes = [
-            ctypes.py_object,   # list of buffers (or None)
-            ctypes.c_ssize_t,   # expected byte length
-            ctypes.c_void_p,    # uintptr_t* out_addrs
-            ctypes.c_void_p,    # int32_t* out_keep
-            ctypes.c_void_p,    # int32_t* out_missing
-            ctypes.c_void_p,    # int32_t counts[3]
-        ]
-        _pylib_cache = lib
-    return _pylib_cache
 
 
 def dot_q15(a: np.ndarray, b: np.ndarray) -> int:
@@ -231,10 +222,10 @@ def gather_addrs(buffers: list, expected: int) -> tuple[np.ndarray, np.ndarray, 
     keep = np.empty(n, dtype=np.int32)
     missing = np.empty(n, dtype=np.int32)
     counts = np.zeros(3, dtype=np.int32)
-    # PyDLL, not CDLL: this call touches the Python API and needs the GIL held.
-    if _pylib().gather_addrs(buffers, expected, addrs.ctypes.data, keep.ctypes.data,
-                             missing.ctypes.data, counts.ctypes.data) != 0:
-        raise TypeError("gather_addrs expects a list")
+    # An extension module, so the GIL is held for the duration -- which the CPython
+    # calls inside require. It raises TypeError itself when ``buffers`` is not a list.
+    _vecgather.gather_addrs(buffers, expected, addrs.ctypes.data, keep.ctypes.data,
+                            missing.ctypes.data, counts.ctypes.data)
     kept, n_missing, skipped = (int(c) for c in counts)
     return addrs[:kept], keep[:kept], missing[:n_missing], skipped
 

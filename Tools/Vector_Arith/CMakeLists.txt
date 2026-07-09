@@ -64,28 +64,41 @@ if(TRUE)  # 强制手动查找
     endif()
 endif()
 
-# Python headers only — we never link libpython. The CPython symbols vecgather.c
-# references stay undefined and are resolved by the interpreter (ctypes.CDLL), the
-# same way any extension module works. Isabelle/ML dlopens this library with
-# RTLD_LAZY and never calls those entry points, so they never resolve there;
-# test_ml_dlopen enforces that no Python *data* symbol sneaks in and breaks it.
-execute_process(
-    COMMAND python3 -c "import sysconfig; print(sysconfig.get_paths()['include'])"
-    OUTPUT_VARIABLE PYTHON_INCLUDE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE
-    RESULT_VARIABLE PYTHON_INCLUDE_RESULT)
-if(NOT PYTHON_INCLUDE_RESULT EQUAL 0 OR NOT EXISTS "${PYTHON_INCLUDE_DIR}/Python.h")
-    message(FATAL_ERROR "Python headers not found (tried ${PYTHON_INCLUDE_DIR})")
-endif()
-message(STATUS "Python include (headers only, no link): ${PYTHON_INCLUDE_DIR}")
+# This library contains no Python. The gather glue that used to live here is now
+# Isabelle_Semantic_Embedding/_vecgather.c, a CPython extension module built by
+# setuptools. Keeping the kernel Python-free is what lets Isabelle/ML load this
+# very file into a process with no interpreter -- on Unix through dlopen(RTLD_LAZY)
+# and on Windows through LoadLibrary, which resolves the whole import table eagerly
+# and would therefore not tolerate a python3.dll import at all.
 
-# 创建共享库
-add_library(isabelle_vector SHARED
-    isabelle_vector.cpp
-    vecgather.c
-)
-set_source_files_properties(vecgather.c PROPERTIES INCLUDE_DIRECTORIES "${PYTHON_INCLUDE_DIR}")
-# Undefined Python symbols are expected; do not let the linker reject them.
-target_link_options(isabelle_vector PRIVATE "LINKER:--allow-shlib-undefined")
+# A fat binary covers both Intel Macs (x86_64-darwin) and Apple Silicon
+# (arm64-darwin, which Isabelle prefers by default: etc/options ML_system_apple).
+# This MUST precede add_library: a target's OSX_ARCHITECTURES property is
+# initialized from the variable at target-creation time, and setting it afterwards
+# silently yields a host-architecture-only library.
+if(APPLE)
+    set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "universal2")
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "matches the macosx_11_0 wheel tag")
+endif()
+
+add_library(isabelle_vector SHARED isabelle_vector.cpp)
+
+# Turn a stray undefined symbol into a link error. Removing the old
+# --allow-shlib-undefined would NOT have done this: ld permits undefined references
+# from a -shared link's own objects by default, and that option only ever governed
+# symbols reached through DT_NEEDED libraries. So this is the build-time guard that
+# catches a CPython symbol creeping back into the kernel; test_ml_dlopen is the
+# run-time one. (macOS errors on undefined symbols by default; PE cannot have any.)
+if(NOT WIN32 AND NOT APPLE)
+    target_link_options(isabelle_vector PRIVATE "LINKER:-z,defs")
+endif()
+
+# MinGW-w64, never MSVC: Highway marks AVX3 and everything above it as
+# HWY_BROKEN_MSVC (detect_targets.h:191), silently dropping five SIMD targets.
+# Poly/ML is itself built with MinGW (Admin/component_polyml.scala:37).
+if(WIN32)
+    set_target_properties(isabelle_vector PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
 
 # 设置包含目录
 target_include_directories(isabelle_vector PRIVATE
@@ -132,9 +145,6 @@ target_compile_definitions(isabelle_vector PRIVATE
 add_executable(test_gather test_gather.cpp)
 target_link_libraries(test_gather PRIVATE isabelle_vector m)
 target_compile_options(test_gather PRIVATE -O2)
-# The library carries undefined CPython symbols on purpose (see vecgather.c); this
-# test never calls into them, so the linker must not insist on resolving them.
-target_link_options(test_gather PRIVATE "LINKER:--allow-shlib-undefined")
 
 # Reproduces Poly/ML's dlopen(RTLD_LAZY) so a stray Python data symbol fails the
 # build here rather than at Isabelle load time.

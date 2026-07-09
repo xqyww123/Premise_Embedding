@@ -72,7 +72,7 @@ jobs:
       - name: Build the kernel and run its tests
         # setup.py would build the library on its own, but not the tests. Run them
         # before the wheel is packed: test_ml_dlopen is the one that catches a
-        # CPython *data* symbol creeping into vecgather.c, which would break
+        # CPython symbol creeping back into the kernel, which would break
         # Isabelle/ML's Foreign.loadLibrary (dlopen with RTLD_LAZY) at load time
         # while leaving Python perfectly happy.
         run: |

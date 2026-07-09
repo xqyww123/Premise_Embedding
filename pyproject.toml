@@ -17,16 +17,20 @@ license = "LGPL-2.1-or-later"
 # because LGPL-2.1 section 3 lets a recipient convert any copy to the plain GPL,
 # and they cannot exercise that right without its text.
 license-files = ["COPYING", "COPYING.LIB"]
-# desugar, hover, premise_selection and semantics annotate with `X | Y` and do not
-# import `annotations` from __future__, so those annotations are evaluated at import
-# time. isabelle-rpc requires 3.10 independently.
-requires-python = ">=3.10"
+# _vecgather is compiled against the limited API, and Py_buffer / PyObject_GetBuffer
+# entered it in 3.11, not before ("Limited API and stable ABI since Python 3.11",
+# pybuffer.h) -- so an abi3 build cannot go lower. 3.10 reaches end of life on
+# 2026-10-31 in any case. (desugar, hover, premise_selection and semantics also
+# annotate with `X | Y` without importing `annotations` from __future__, which
+# already required 3.10; that constraint is now subsumed.)
+requires-python = ">=3.11"
 authors = [
     { name="Qiyuan Xu", email="xqyww123@gmail.com" },
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
     # The wheel carries libisabelle_vector.so, an ELF pinned to one architecture.
+    # macOS and Windows are planned; see MACOS_WINDOWS_SPLIT_PLAN.md in the parent tree.
     "Operating System :: POSIX :: Linux",
 ]
 # Distribution names, not import names: `Isabelle_RPC_Host` is what you import, but
@@ -57,8 +61,10 @@ include = ["Isabelle_Semantic_Embedding", "Isabelle_Semantic_Embedding.*"]
 exclude = ["contrib", "contrib.*"]
 
 [tool.setuptools.package-data]
-# libisabelle_vector.so is compiled and staged into the build tree by setup.py's
-# build_py, not tracked in the source tree; listing it keeps sdist-derived and
-# prebuilt-drop-in builds picking it up too.
+# libisabelle_vector.so is compiled by CMake and staged into the build tree by
+# setup.py's build_py, not tracked in the source tree; listing it keeps
+# sdist-derived and prebuilt-drop-in builds picking it up too. The other compiled
+# artifact, _vecgather, is an ext_module and needs no entry here -- build_ext
+# places it. (.dylib / .dll will join this list when those platforms land.)
 Isabelle_Semantic_Embedding = ["embedding_config_template.yaml", "config_template.yaml",
                                "libisabelle_vector.so"]

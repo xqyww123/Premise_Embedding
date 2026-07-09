@@ -1,25 +1,33 @@
 """Build the platform wheel that carries the Highway SIMD kernel.
 
-The distribution ships one compiled artifact: ``libisabelle_vector.so``, built
-from ``Tools/Vector_Arith``. It lands beside ``_vecarith.py`` as package data,
-which is the second (and, without a source checkout, only) entry in
-``_vecarith._candidate_paths()``. Two consumers dlopen that one file -- Python via
-``ctypes.CDLL``/``PyDLL``, and Isabelle/ML via ``Foreign.loadLibrary``, the latter
-asking ``_vecarith.library_path()`` over RPC rather than guessing a path. Shipping
-it prebuilt is what lets a machine with neither Highway nor a compiler run either.
+The distribution ships two compiled artifacts, and they are deliberately separate:
 
-Why the wheel is ``py3-none-manylinux_*``:
+* ``libisabelle_vector.so`` -- the SIMD kernel, built by CMake out of
+  ``Tools/Vector_Arith`` and staged beside ``_vecarith.py`` as package data (the
+  second, and without a source checkout the only, entry in
+  ``_vecarith._candidate_paths()``). It contains **no Python**. Two consumers load
+  it: Python through ``ctypes.CDLL``, which releases the GIL for the scan, and
+  Isabelle/ML through ``Foreign.loadLibrary`` into a process with no interpreter,
+  asking ``_vecarith.library_path()`` over RPC rather than guessing a path.
+* ``_vecgather.abi3.so`` -- the address-gathering glue, a CPython extension module
+  built by ``build_ext``. It is imported, never dlopened.
 
-* ``py3``/``none``  -- the library is *not* a CPython extension module. It is
-  dlopened, never imported; it does not link libpython; and the only CPython
-  symbols it references are stable-ABI *functions* plus the stable ``Py_buffer``
-  layout (see ``Tools/Vector_Arith/vecgather.c``). One build serves every CPython
-  3.x, so an ABI tag would be a lie that costs us a wheel per interpreter.
-* ``manylinux_*``   -- but the ELF is pinned to a single architecture. Highway's
+Keeping them apart is what makes the kernel loadable by Isabelle/ML on Windows,
+where ``LoadLibrary`` resolves the entire import table eagerly and would not
+tolerate a ``python3.dll`` import; it also retires the ``ctypes.PyDLL`` handle the
+glue used to need, and the segfault that followed from reaching for ``CDLL``.
+
+Why the wheel is ``cp311-abi3-<platform>``:
+
+* ``cp311``/``abi3`` -- the extension module is compiled against the limited API,
+  so one build serves CPython 3.11 through 3.14 and there is no per-interpreter
+  wheel. 3.11 is the floor because ``Py_buffer`` and ``PyObject_GetBuffer`` entered
+  the limited API there and not earlier (``pybuffer.h``).
+* ``<platform>``   -- both artifacts are pinned to one architecture. Highway's
   runtime dispatch chooses a SIMD target *within* an architecture; it does not
-  cross between them. A ``py3-none-any`` wheel would happily install an x86-64
-  ``.so`` on aarch64 and fail at first dlopen. The exact tag is computed from the
-  ELF itself (``_platform_tag``) rather than hard-coded, and an explicitly passed
+  cross between them. An ``any`` wheel would happily install an x86-64 ``.so`` on
+  aarch64 and fail at first dlopen. The tag is computed from the kernel's own
+  headers (``_platform_tag``) rather than hard-coded, and an explicitly passed
   ``--plat-name`` is checked against it.
 
 Build with::
@@ -39,9 +47,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from setuptools import setup
+from setuptools import Extension, setup
 from setuptools.command.build_py import build_py as _build_py
-from setuptools.dist import Distribution
 
 try:  # setuptools >= 70.1 vendors it; older installs need the `wheel` package
     from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel
@@ -198,18 +205,29 @@ def _check_supplied_tag(so: Path, plat: str) -> None:
 
 # ------------------------------------------------------------------- setuptools
 
-class BinaryDistribution(Distribution):
-    """The wheel is architecture-specific even though it builds no ext_modules.
-
-    setuptools decides purelib vs platlib -- and bdist_wheel its ``root_is_pure``
-    default -- from this predicate. The kernel is compiled, so the answer is yes.
-    """
-
-    def has_ext_modules(self) -> bool:
-        return True
+# The gather glue, as a real extension module rather than a ctypes target. Its
+# entry point holds the GIL by construction, which is what the CPython calls
+# inside it require; the ctypes.PyDLL handle that used to provide that -- and the
+# segfault that followed from reaching for CDLL instead -- are gone.
+#
+# Py_LIMITED_API 0x030B0000 because Py_buffer and PyObject_GetBuffer entered the
+# limited API in 3.11 and not before (pybuffer.h). One abi3 build then serves
+# 3.11 through 3.14, so this stays one wheel per platform, not one per interpreter.
+_vecgather = Extension(
+    f"{PACKAGE}._vecgather",
+    sources=[f"{PACKAGE}/_vecgather.c"],
+    define_macros=[("Py_LIMITED_API", "0x030B0000")],
+    py_limited_api=True,
+)
 
 
 class build_py(_build_py):
+    """Stage the CMake-built kernel next to the package's Python sources.
+
+    build_py runs before build_ext (distutils' sub_commands order), and the two
+    write different filenames into build_lib, so neither clobbers the other.
+    """
+
     def run(self) -> None:
         so = _library()
         super().run()
@@ -223,11 +241,12 @@ class build_py(_build_py):
 
 
 class bdist_wheel(_bdist_wheel):
-    def finalize_options(self) -> None:
-        super().finalize_options()
-        self.root_is_pure = False
-
     def get_tag(self) -> tuple[str, str, str]:
+        # (cp311, abi3) comes from the py_limited_api option below; root_is_pure is
+        # already False because ext_modules is non-empty. Only the platform half is
+        # ours to compute, and it comes from the kernel's own headers rather than
+        # from the host: a wrong tag fails on someone else's machine, not this one.
+        impl, abi, _ = super().get_tag()
         so = Path(self.bdist_dir) / PACKAGE / LIB_NAME if self.bdist_dir else None
         if so is None or not so.is_file():
             so = _library()  # get_tag can run before the staging copy exists
@@ -236,9 +255,11 @@ class bdist_wheel(_bdist_wheel):
             _check_supplied_tag(so, plat)
         else:
             plat = _platform_tag(so)
-        # Not (cp313, cp313): nothing links libpython, and only stable-ABI
-        # functions are referenced, so a single build serves every CPython 3.x.
-        return "py3", "none", plat
+        return impl, abi, plat
 
 
-setup(distclass=BinaryDistribution, cmdclass={"build_py": build_py, "bdist_wheel": bdist_wheel})
+setup(
+    ext_modules=[_vecgather],
+    options={"bdist_wheel": {"py_limited_api": "cp311"}},
+    cmdclass={"build_py": build_py, "bdist_wheel": bdist_wheel},
+)

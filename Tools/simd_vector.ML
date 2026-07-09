@@ -30,9 +30,14 @@ end
 
 val vector_library_path =
   let
+    (* Isabelle_Semantic_Embedding._vecarith picks the same name from sys.platform. *)
+    val lib_name =
+      if ML_System.platform_is_windows then "isabelle_vector.dll"
+      else if ML_System.platform_is_macos then "libisabelle_vector.dylib"
+      else "libisabelle_vector.so"
     fun in_tree () =
       Resources.master_directory \<^theory>
-        + Path.make ["Tools", "Vector_Arith", "build", "libisabelle_vector.so"]
+        + Path.make ["Tools", "Vector_Arith", "build", lib_name]
         |> Path.expand |> Path.implode
     fun ask_python () =
       (Remote_Procedure_Calling.load ["Isabelle_Semantic_Embedding"];
@@ -46,7 +51,14 @@ val vector_library_path =
              Exn.Res path => path
            | Exn.Exn exn => if Exn.is_interrupt exn then Exn.reraise exn else in_tree ())
       | path => path)
-  in fn () => Lazy.force resolved end
+    (* Unconditionally, because platform_path is right in every case and identity in
+       most: on Unix it is `fn path => path`. On Windows the ML process is a native
+       PE launched from a Cygwin shell, so Foreign.loadLibrary wants C:\..., while
+       Python -- found by `command -v python3` under that same Cygwin bash -- may
+       report either shape. platform_path maps C:\x and C:/x and /cygdrive/c/x all to
+       C:\x, and /usr/lib/... through CYGWIN_ROOT (which getsettings does export: its
+       `set -o allexport` spans the assignment). *)
+  in fn () => ML_System.platform_path (Lazy.force resolved) end
 
 functor Vector_Arith (
       CONFIG : sig val DIM : int

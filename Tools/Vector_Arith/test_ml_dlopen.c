@@ -1,14 +1,20 @@
-/* Guards the invariant that vecgather.c documents: Isabelle/ML must still be able
- * to load this shared object even though it references CPython functions.
+/* Guards the invariant that isabelle_vector.cpp documents: Isabelle/ML must be able
+ * to load this shared object into a process that has no Python in it.
  *
- * Poly/ML loads it with dlopen(RTLD_LAZY) (libpolyml/polyffi.cpp:167) from a
- * process with no Python. Lazy binding defers *function* symbols, so the CPython
- * ones never resolve as long as ML only calls dot_q15 / top_k_q15. Data symbols
- * are a different matter: they are relocated eagerly even under RTLD_LAZY, so a
- * single Py_None or PyList_Type reference breaks the ML side at load time.
+ * The kernel no longer references CPython at all -- the glue moved to
+ * Isabelle_Semantic_Embedding/_vecgather.c, a separate extension module -- so this
+ * now guards against a regression rather than against the design. -Wl,-z,defs is the
+ * build-time half of the same guard; this is the load-time half, and it is the only
+ * one that would catch a Python symbol arriving via a static library.
  *
- * This reproduces exactly what Poly/ML does, and then calls the C-only entry
- * points, so that mistake fails the build instead of Isabelle. */
+ * Poly/ML loads it with dlopen(RTLD_LAZY) (libpolyml/polyffi.cpp:167). Lazy binding
+ * defers *function* symbols, but data symbols relocate eagerly even so: a single
+ * Py_None or PyList_Type reference would break the ML side outright at load. On
+ * Windows LoadLibrary (polyffi.cpp:153) is stricter still, resolving the entire
+ * ordinary import table.
+ *
+ * This reproduces exactly what Poly/ML does, then calls the entry points ML uses,
+ * so such a mistake fails the build instead of Isabelle. */
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>

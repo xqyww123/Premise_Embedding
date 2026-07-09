@@ -19,3 +19,7 @@ IsaREPL.egg-info
 build
 *.egg-info
 secret.sh
+
+# `pip install -e .` builds the _vecgather extension module in place.
+Isabelle_Semantic_Embedding/_vecgather*.so
+Isabelle_Semantic_Embedding/_vecgather*.pyd
