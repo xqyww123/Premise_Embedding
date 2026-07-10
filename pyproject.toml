@@ -45,7 +45,11 @@ dependencies = [
     "transformers",
     "numpy",
     "faiss-cpu",
-    "requests",
+    # premise_selection and semantic_embedding import it at module level. It also
+    # arrives transitively, through mcp (via claude-agent-sdk) and huggingface-hub,
+    # which is why nothing has broken -- but a dependency you import is one you own,
+    # and mcp's httpx<1.0.0 would silently become our ceiling.
+    "httpx",
     "diskcache",
     "claude-agent-sdk",
     "pyyaml",
