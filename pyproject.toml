@@ -40,7 +40,11 @@ dependencies = [
     "msgpack",
     "isabelle-rpc>=0.3.0",
     "rocksdict",
-    "lmdb",
+    # Pinned: liblmdb 0.9.35 (bundled in py-lmdb 2.1.0) corrupts a database on
+    # write (MDB_CORRUPTED "Located page was wrong type") on Ubuntu 24.04 —
+    # reproduced on a fresh empty store, every filesystem incl. tmpfs. 1.4.1
+    # (liblmdb 0.9.29) is verified good.
+    "lmdb==1.4.1",
     "platformdirs",
     "transformers",
     "numpy",
