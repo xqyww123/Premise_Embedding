@@ -20,6 +20,7 @@ from datetime import datetime
 import lmdb
 import msgpack
 import pytest
+import zstandard as zstd
 
 from Isabelle_Semantic_Embedding import r2_sync
 from Isabelle_Semantic_Embedding._user_config import env_bool
@@ -352,24 +353,61 @@ def test_a_manifest_from_a_future_client_is_refused():
 
 
 def test_a_corrupt_download_never_reaches_the_merge(tmp_path):
-    """`pull` verifies nothing by hand: `tar --zstd` carries an XXH64 content
-    checksum, so a flipped byte fails to extract and no merge is attempted.  This
-    pins that property of the format, which is what let the sha256 pass go."""
+    """`pull` verifies nothing by hand: the zstd frame carries an XXH64 content
+    checksum (we write it with write_checksum=True), so a flipped byte fails to
+    extract and no merge is attempted.  This pins that property, which is what let
+    the sha256 pass go."""
     payload = tmp_path / "d" / "blob"
     payload.parent.mkdir()
     payload.write_bytes(bytes(range(256)) * 4096)
     tar = tmp_path / "snap.tar.zst"
-    subprocess.run(["tar", "--zstd", "-cf", tar, "-C", tmp_path, "d"], check=True)
+    r2_sync._write_tar_zst(str(tar), str(tmp_path), ["d"])
 
     raw = bytearray(tar.read_bytes())
     raw[len(raw) // 2] ^= 0xFF
     tar.write_bytes(raw)
 
+    with pytest.raises(zstd.ZstdError):     # the frame checksum fails on a flipped byte
+        r2_sync._extract_tar_zst(str(tar), str(tmp_path / "out"))
+
+
+def test_pack_and_extract_round_trip_excludes_and_interoperates_with_the_cli(tmp_path):
+    """The pure-Python .tar.zst is byte-for-byte a normal one: `exclude` drops a
+    named subtree, and the CLI `tar --zstd` can still read what we wrote (so the
+    already-published snapshot, made by the CLI, stays pullable and vice versa)."""
+    src = tmp_path / "src" / "sub"
+    src.mkdir(parents=True)
+    (tmp_path / "src" / "a.txt").write_text("alpha")
+    (src / "b.txt").write_text("beta")
+    (tmp_path / "src" / "embed_cache").mkdir()
+    (tmp_path / "src" / "embed_cache" / "junk").write_text("drop me")
+
+    tar = tmp_path / "s.tar.zst"
+    r2_sync._write_tar_zst(str(tar), str(tmp_path), ["src"], exclude="embed_cache")
+
     out = tmp_path / "out"
-    out.mkdir()
-    r = subprocess.run(["tar", "--zstd", "-xf", tar, "-C", out],
-                       capture_output=True, text=True)
-    assert r.returncode != 0, "a flipped byte extracted cleanly; zstd has no checksum"
+    r2_sync._extract_tar_zst(str(tar), str(out))
+    assert (out / "src" / "a.txt").read_text() == "alpha"
+    assert (out / "src" / "sub" / "b.txt").read_text() == "beta"
+    assert not (out / "src" / "embed_cache").exists(), "exclude did not drop the subtree"
+
+    # ours -> CLI
+    cli = tmp_path / "cli"
+    cli.mkdir()
+    rc = subprocess.run(["tar", "--zstd", "-xf", str(tar), "-C", str(cli)],
+                        capture_output=True, text=True)
+    assert rc.returncode == 0, f"CLI tar could not read our archive: {rc.stderr}"
+    assert (cli / "src" / "a.txt").read_text() == "alpha"
+
+    # CLI -> ours (the deployment-critical direction: the object currently on R2 was
+    # written by `tar --zstd`, and every new client reads it with _extract_tar_zst)
+    cli_tar = tmp_path / "cli.tar.zst"
+    subprocess.run(["tar", "--zstd", "-cf", str(cli_tar), "-C", str(tmp_path), "src"],
+                   check=True)
+    from_cli = tmp_path / "from_cli"
+    r2_sync._extract_tar_zst(str(cli_tar), str(from_cli))
+    assert (from_cli / "src" / "a.txt").read_text() == "alpha"
+    assert (from_cli / "src" / "sub" / "b.txt").read_text() == "beta"
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +431,19 @@ def test_r2busy_is_an_r2error_so_the_manual_cli_still_catches_it():
     assert issubclass(r2_sync.R2Busy, r2_sync.R2Error)
 
 
+def test_the_pull_incomplete_sentinel_round_trips(monkeypatch, tmp_path):
+    """pull_snapshot marks this before the merge and clears it after; if the merge
+    crashes it stays set, so the next run re-pulls a half-written DB."""
+    monkeypatch.setattr(r2_sync, "CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(r2_sync, "INCOMPLETE_PATH", str(tmp_path / ".pull_incomplete"))
+    assert r2_sync.pull_was_interrupted() is False
+    r2_sync._mark_pull_incomplete()
+    assert r2_sync.pull_was_interrupted() is True      # a crash here would leave it set
+    r2_sync._clear_pull_incomplete()
+    assert r2_sync.pull_was_interrupted() is False
+    r2_sync._clear_pull_incomplete()                   # idempotent when already absent
+
+
 def test_semantic_db_is_empty_when_the_store_is_absent(monkeypatch, tmp_path):
     monkeypatch.setattr(r2_sync, "CACHE_DIR", str(tmp_path))   # no semantics.lmdb here
     assert r2_sync.semantic_db_is_empty() is True
@@ -404,7 +455,6 @@ def _stub_pull_until_download(monkeypatch, tmp_path, idle):
     begin, so a test can observe the idle gate and the first on_phase call."""
     monkeypatch.setattr(r2_sync, "CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(r2_sync, "LOCK_PATH", str(tmp_path / ".r2_pull.lock"))
-    monkeypatch.setattr(r2_sync, "_require_tools", lambda: None)
     monkeypatch.setattr(r2_sync, "remote_head",
                         lambda s, client=None: r2_sync.Remote_Head(
                             "new", 10, datetime(2026, 7, 9, 12, 0)))

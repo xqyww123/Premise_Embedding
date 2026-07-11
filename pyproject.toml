@@ -23,7 +23,10 @@ license-files = ["COPYING", "COPYING.LIB"]
 # 2026-10-31 in any case. (desugar, hover, premise_selection and semantics also
 # annotate with `X | Y` without importing `annotations` from __future__, which
 # already required 3.10; that constraint is now subsumed.)
-requires-python = ">=3.11"
+# The .4 floor: r2_sync's tar.zst extraction passes tarfile's `filter="data"`, the
+# PEP 706 extraction-filter arg, which was only backported to CPython 3.11.4 --
+# on 3.11.0-3.11.3 it is a TypeError, failing every pull.
+requires-python = ">=3.11.4"
 authors = [
     { name="Qiyuan Xu", email="xqyww123@gmail.com" },
 ]
@@ -40,7 +43,12 @@ dependencies = [
     "msgpack",
     "isabelle-rpc>=0.3.0",
     "rocksdict",
-    "lmdb",
+    # Floor, not a pin. liblmdb 0.9.35 (bundled in py-lmdb 2.x) carries no
+    # corruption regression over 0.9.29 -- the arc trends safer. The ONE release to
+    # avoid is exactly 2.1.0, whose over-eager hardening raised a FALSE MDB_CORRUPTED
+    # when overwriting values larger than a page (our ~8 KB vectors on 4 KB pages);
+    # fixed the same day in 2.1.1 (py-lmdb #431). So float freely at >=2.1.1.
+    "lmdb>=2.1.1",
     "platformdirs",
     "transformers",
     "numpy",
@@ -59,6 +67,10 @@ dependencies = [
     # msvcrt on Windows). Arrives transitively via huggingface-hub, but r2_sync
     # imports it directly, so it is declared here.
     "filelock",
+    # r2_sync packs/unpacks the snapshot .tar.zst in pure Python (stdlib tarfile +
+    # this), so the sync needs no tar/zstd binary on PATH -- the one thing that
+    # kept pull from working on a bare Windows box.
+    "zstandard",
 ]
 
 [project.urls]

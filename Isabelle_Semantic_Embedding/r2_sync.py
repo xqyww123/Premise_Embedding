@@ -16,8 +16,9 @@ A snapshot is validated after it is unpacked, not before it is fetched: the
 manifest, a scan for legacy records, and a measurement of the actual vector byte
 lengths.  Rejecting early would need metadata the anonymous endpoint will not
 serve, and would buy only the ten seconds the (free) download takes.  A corrupt
-download never reaches any of this — ``tar --zstd`` carries an XXH64 content
-checksum and fails to extract.
+download never reaches any of this — the zstd frame carries an XXH64 content
+checksum and fails to extract.  Packing and unpacking are pure Python (``tarfile``
++ ``zstandard``), so the sync needs no ``tar``/``zstd`` binary on any platform.
 
 The two directions are deliberately asymmetric:
 
@@ -57,6 +58,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -68,6 +70,7 @@ from typing import Any, NamedTuple
 
 import lmdb
 import platformdirs
+import zstandard as zstd
 from ._paths import semantic_DB_dir
 from filelock import FileLock, Timeout as _LockTimeout
 
@@ -89,6 +92,11 @@ CACHE_DIR = semantic_DB_dir()
 MANIFEST_NAME = "MANIFEST.json"
 MARKER_PATH = os.path.join(CACHE_DIR, ".r2_snapshot.json")
 LOCK_PATH = os.path.join(CACHE_DIR, ".r2_pull.lock")
+# Written while a merge is in flight, removed on success. A merge is many batched
+# write-txns across stores (semantics.lmdb first), so a crash midway leaves a
+# non-empty-but-incomplete DB that `semantic_db_is_empty` would call "present".
+# This sentinel surviving means "the last pull did not finish" -> re-pull.
+INCOMPLETE_PATH = os.path.join(CACHE_DIR, ".pull_incomplete")
 
 # Peak transient usage, measured 2026-07-09: push needs the compacted copy
 # (~1.5 GB) plus the tarball (~0.7 GB); pull adds the backup and the merge's
@@ -332,10 +340,38 @@ def remote_head(s: 'Settings | None' = None, client=None) -> 'Remote_Head | None
 # Preflight
 # ---------------------------------------------------------------------------
 
-def _require_tools() -> None:
-    missing = [t for t in ("tar", "zstd") if shutil.which(t) is None]
-    if missing:
-        raise R2Error(f"missing required tool(s) on PATH: {', '.join(missing)}")
+_ZSTD_LEVEL = 3   # zstd's own default, and what `tar --zstd` used before this
+
+
+def _write_tar_zst(out_path: str, base_dir: str, arcnames: 'list[str]',
+                   exclude: 'str | None' = None) -> None:
+    """Stream `arcnames` (each relative to `base_dir`) into a tar, zstd-compressed
+    with a frame checksum, at `out_path`.  Pure Python -- no `tar`/`zstd` binary,
+    so it behaves the same on Linux, macOS and Windows.  `exclude`, if given, drops
+    every entry with a path component of that name (like `tar --exclude=NAME`; a
+    dir dropped this way is not recursed into).  The result is an ordinary
+    `.tar.zst`, interchangeable with one made by `tar --zstd`.
+    """
+    def _filter(ti: tarfile.TarInfo) -> 'tarfile.TarInfo | None':
+        return None if exclude and exclude in ti.name.split("/") else ti
+
+    cctx = zstd.ZstdCompressor(level=_ZSTD_LEVEL, write_checksum=True)
+    with open(out_path, "wb") as fh, cctx.stream_writer(fh) as z:
+        with tarfile.open(mode="w|", fileobj=z) as tar:
+            for name in arcnames:
+                tar.add(os.path.join(base_dir, name), arcname=name, filter=_filter)
+
+
+def _extract_tar_zst(tarball: str, dest: str) -> None:
+    """Extract a `.tar.zst` (ours, or one made by `tar --zstd`) into `dest`.  The
+    zstd frame checksum makes a corrupt or truncated archive raise here rather than
+    reach the merge -- the guarantee the old `tar --zstd` extraction gave us.  The
+    `data` filter rejects absolute paths and `..` escapes, since extraction runs
+    before the manifest is even read."""
+    dctx = zstd.ZstdDecompressor()
+    with open(tarball, "rb") as fh, dctx.stream_reader(fh) as z:
+        with tarfile.open(mode="r|", fileobj=z) as tar:
+            tar.extractall(dest, filter="data")
 
 
 def _free_bytes(path: str) -> int:
@@ -731,14 +767,12 @@ def _pack_snapshot(tmp: str) -> str:
 
     tarball = os.path.join(tmp, "snapshot.tar.zst")
     _log("  packing tar.zst...")
-    subprocess.run(["tar", "--zstd", "-cf", tarball, "-C", tmp, MANIFEST_NAME,
-                    *stores.keys()], check=True)
+    _write_tar_zst(tarball, tmp, [MANIFEST_NAME, *stores.keys()])
     return tarball
 
 
 def push_snapshot(*, force: bool = False, dry_run: bool = False) -> None:
     """Pack the local stores and overwrite the single remote object."""
-    _require_tools()
     s = settings()
     client = _client(s)
     head = remote_head(s, client)
@@ -802,9 +836,8 @@ def _backup(keep: int = 2) -> str:
     home = os.path.expanduser("~")
     out = os.path.join(home, f"Isabelle_Semantic_Embedding.backup_{stamp}.tar.zst")
     _log(f"  backing up to {out}")
-    subprocess.run(["tar", "--zstd", "-cf", out, "--exclude=embed_cache",
-                    "-C", os.path.dirname(CACHE_DIR), os.path.basename(CACHE_DIR)],
-                   check=True)
+    _write_tar_zst(out, os.path.dirname(CACHE_DIR), [os.path.basename(CACHE_DIR)],
+                   exclude="embed_cache")
 
     prefix = "Isabelle_Semantic_Embedding.backup_"
     old = sorted(e for e in os.listdir(home)
@@ -838,7 +871,6 @@ def pull_snapshot(*, backup: bool = True, force: bool = False,
     def _phase(name: str) -> None:
         if on_phase:
             on_phase(name)
-    _require_tools()
     s = settings()
     with _pull_lock():
         where = s.public_object_url if s.public_url else f"s3://{s.bucket}/{s.object_key}"
@@ -883,11 +915,11 @@ def pull_snapshot(*, backup: bool = True, force: bool = False,
 
             root = os.path.join(tmp, "snapshot")
             os.makedirs(root)
-            # tar --zstd verifies the frame's XXH64 content checksum, so a corrupt
-            # or truncated download fails here rather than reaching the merge.
+            # The zstd frame carries an XXH64 content checksum, so a corrupt or
+            # truncated download fails to extract here rather than reaching the merge.
             _phase("extracting")
             _log("  extracting...")
-            subprocess.run(["tar", "--zstd", "-xf", tarball, "-C", root], check=True)
+            _extract_tar_zst(tarball, root)
             os.remove(tarball)                    # ~0.7 GiB back before the merge
 
             manifest_path = os.path.join(root, MANIFEST_NAME)
@@ -904,7 +936,9 @@ def pull_snapshot(*, backup: bool = True, force: bool = False,
                 _require_idle(force)
             _phase("merging")
             _log("  merging...")
+            _mark_pull_incomplete()          # a crash mid-merge leaves this behind
             _merge_snapshot(root)
+            _clear_pull_incomplete()         # merge finished -> DB is whole again
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -935,6 +969,24 @@ def semantic_db_record_count() -> int:
         return 0
     from .semantics import Semantic_DB
     return Semantic_DB._ensure_env().stat()["entries"]
+
+
+def _mark_pull_incomplete() -> None:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    open(INCOMPLETE_PATH, "w").close()
+
+
+def _clear_pull_incomplete() -> None:
+    try:
+        os.remove(INCOMPLETE_PATH)
+    except FileNotFoundError:
+        pass
+
+
+def pull_was_interrupted() -> bool:
+    """True if a previous merge died partway (the sentinel outlived it), so the
+    local DB may be non-empty yet incomplete and should be re-pulled."""
+    return os.path.exists(INCOMPLETE_PATH)
 
 
 def status() -> None:
