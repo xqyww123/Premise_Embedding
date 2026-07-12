@@ -21,11 +21,12 @@ from claude_agent_sdk import SdkMcpTool, tool
 from .semantic_embedding import (Vector_Store, Embedding_Provider, make_embedding_provider,
                                  sanitize_model, unsanitize_model,
                                  Reranker_Provider, reranker_provider, key)
-from ._vecarith import encode_q15, library_path as _vector_library_path
+from ._vecarith import library_path as _vector_library_path
 
 from .base import ToolCall_ret, mk_ret as _mk_ret
 from .hover import resolve_context_at
 from .embedding_config import _DEFAULT_KINDS_PHRASE
+from .document_text import document_text_of, entity_document_text
 
 
 # Map an EntityKind to the plural noun phrase used in a query instruction's
@@ -288,6 +289,22 @@ class _Semantic_DB:
         with self._ensure_env().begin() as txn:
             return [txn.get(k) is not None for k in keys]
 
+    def get_many(self, keys: list[universal_key]) -> 'list[Record | None]':
+        """Fetch a batch of records in a SINGLE read transaction -- the batch counterpart
+        of ``__getitem__``, mirroring ``contains``.  Result is positionally aligned with
+        ``keys``; a key with no record yields None.
+
+        ``[self[k] for k in keys]`` would open (and commit) one txn PER key.  Callers
+        like ``_auto_embed`` run on the event loop with a ``missing`` list that can be
+        10^5 long when a library has not been embedded for the active model yet, so the
+        per-key form turns one cheap scan into 10^5 synchronous begin/commit pairs."""
+        with self._ensure_env().begin() as txn:
+            out: 'list[_Semantic_DB.Record | None]' = []
+            for k in keys:
+                raw = txn.get(k)
+                out.append(self._decode(raw) if raw is not None else None)
+            return out
+
     def iter_entity_records(self) -> 'Iterator[tuple[universal_key, Record]]':
         """Yield ``(key, Record)`` for every non-status record, in ONE read txn.
 
@@ -339,7 +356,12 @@ class _Semantic_DB:
         if rec.interpretation is None:
             return None
         if with_pretty:
-            return rec.pretty_print + "\n" + rec.interpretation
+            # Display/reranker path. entity_document_text is the single definition of
+            # the entity convention (pretty_print + "\n" + interpretation); applied to
+            # any kind here it reproduces today's kind-blind string byte-for-byte, so
+            # this is a pure de-duplication (no behavior change). The embed path no
+            # longer routes through query -- it uses document_text_of directly.
+            return entity_document_text(rec)
         return rec.interpretation
 
     def is_thy_interpreted(self, key: universal_key) -> bool:
@@ -1120,94 +1142,93 @@ class Semantic_Vector_Store(Vector_Store):
     async def _auto_embed(self, missing: list[key]) -> list[key]:
         if self.connection is None:
             return []
-        if not await self.connection.config_lookup("auto_interpret_for_embedding"):
-            await self.connection.warning(
-                f"[Semantic_Embedding] {len(missing)} entities missing semantic embeddings, "
-                f"but auto_interpret_for_embedding is disabled. "
-                f"Set [[auto_interpret_for_embedding = true]] to enable automatic interpretation and embedding.")
-            return []
-        # Extract theory hashes from missing keys, skipping already-embedded
-        # theories.  XOR-prefixed keys (theorem/rule AND experience) are skipped:
-        # their prefix is an XOR pseudo-theory, not a locatable theory — their
-        # home theory is reached through the namespace entities (constants,
-        # types, ...) that share it.
-        from Isabelle_RPC_Host.universal_key import is_xor_prefixed_key
-        theory_hashes: set[bytes] = set()
-        for k in missing:
-            if is_xor_prefixed_key(k):
-                continue
-            entity = destruct_key(k)
-            if not self.is_thy_embedded(entity.theory):
-                theory_hashes.add(entity.theory)
-        await self.connection.tracing(
-            f"[Semantic_Embedding] {len(missing)} entities missing embeddings, "
-            f"spanning {len(theory_hashes)} un-embedded theories")
-        # # DEBUG: show missing entities (requires debug_key_name from context.py)
-        # from Isabelle_RPC_Host.context import debug_key_name
-        # for k in missing[:50]:
-        #     readable = debug_key_name(k) or f"<unknown {k.hex()[:16]}…>"
-        #     await self.connection.tracing(f"  MISSING: {readable}")
-        # if len(missing) > 50:
-        #     await self.connection.tracing(f"  ... and {len(missing) - 50} more")
-        # Filter to uninterpreted theories, excluding the current theory and skipped theories
-        from Isabelle_RPC_Host.context import theory_long_name
-        current_thy = await theory_long_name(self.connection)
-        uninterpreted_theories: list[str] = []
-        for th in theory_hashes:
-            if not Semantic_DB.is_thy_interpreted(th):
-                name = await self.connection.callback("Theory_Hash.theory_name_of", th)
-                if name is not None and name != current_thy and not is_thy_skipped(name):
-                    uninterpreted_theories.append(name)
+        gate = await self.connection.config_lookup("auto_interpret_for_embedding")
         confirmed = False
-        if uninterpreted_theories:
-            if len(uninterpreted_theories) > 5:
-                import Isabelle_RPC_Host.dialogue
-                answer = await self.connection.dialogue(
-                    f"[Semantic Embedding] {len(uninterpreted_theories)} uninterpreted theories "
-                    f"need interpretation before embedding. "
-                    f"This may consume a significant amount of API tokens. Proceed?",
-                    ["Yes", "No"])
-                if answer != "Yes":
-                    return []
-                confirmed = True
+        theory_hashes: set[bytes] = set()
+        # (1) When the gate permits it, auto-interpret the uninterpreted theories of the
+        # non-xor missing entities so they become embeddable.  XOR-prefixed keys
+        # (theorem/rule AND experience) are skipped: their prefix is an XOR pseudo-theory,
+        # not a locatable theory.  EXPERIENCE keys are xor-prefixed AND carry their own
+        # interpretation, so they never need this step -- the gate governs ONLY this
+        # interpretation, not the embedding in (2) (S1-a).
+        if gate:
+            from Isabelle_RPC_Host.universal_key import is_xor_prefixed_key
+            for k in missing:
+                if is_xor_prefixed_key(k):
+                    continue
+                entity = destruct_key(k)
+                if not self.is_thy_embedded(entity.theory):
+                    theory_hashes.add(entity.theory)
             await self.connection.tracing(
-                f"[Semantic_Embedding] {len(uninterpreted_theories)} of {len(theory_hashes)} theories "
-                f"not yet interpreted, running interpretation for: "
-                + ", ".join(uninterpreted_theories))
-            await interpret_theories_by_names(self.connection, uninterpreted_theories)
-        # Query semantic store for interpretations and embed them
-        texts: list[str] = []
-        text_keys: list[key] = []
-        for k in missing:
-            sem = Semantic_DB.query(k, with_pretty=True)
-            if sem is not None:
-                texts.append(sem)
-                text_keys.append(k)
-        if not texts:
-            await self.connection.tracing(
-                f"[Semantic_Embedding] no semantic interpretations found for the missing entities, skipping")
+                f"[Semantic_Embedding] {len(missing)} entities missing embeddings, "
+                f"spanning {len(theory_hashes)} un-embedded theories")
+            # Filter to uninterpreted theories, excluding the current theory and skipped theories
+            from Isabelle_RPC_Host.context import theory_long_name
+            current_thy = await theory_long_name(self.connection)
+            uninterpreted_theories: list[str] = []
+            for th in theory_hashes:
+                if not Semantic_DB.is_thy_interpreted(th):
+                    name = await self.connection.callback("Theory_Hash.theory_name_of", th)
+                    if name is not None and name != current_thy and not is_thy_skipped(name):
+                        uninterpreted_theories.append(name)
+            if uninterpreted_theories:
+                if len(uninterpreted_theories) > 5:
+                    import Isabelle_RPC_Host.dialogue
+                    answer = await self.connection.dialogue(
+                        f"[Semantic Embedding] {len(uninterpreted_theories)} uninterpreted theories "
+                        f"need interpretation before embedding. "
+                        f"This may consume a significant amount of API tokens. Proceed?",
+                        ["Yes", "No"])
+                    if answer != "Yes":
+                        return []
+                    confirmed = True
+                await self.connection.tracing(
+                    f"[Semantic_Embedding] {len(uninterpreted_theories)} of {len(theory_hashes)} theories "
+                    f"not yet interpreted, running interpretation for: "
+                    + ", ".join(uninterpreted_theories))
+                await interpret_theories_by_names(self.connection, uninterpreted_theories)
+        # (2) Keys embeddable NOW: record present AND document_text_of != None -- every
+        # EXPERIENCE, plus entities whose theory is interpreted (including any just
+        # interpreted in (1)).  This set embeds regardless of the gate (S1-a): the gate
+        # is about spending LLM tokens to interpret, and these need no interpretation.
+        # ONE read txn for the whole batch (get_many), not one per key: `missing` can be
+        # 10^5 long on a library not yet embedded for this model, and we are on the event
+        # loop.  This runs before the gate check below because the gate governs only the
+        # interpretation in (1) -- but it must not cost 10^5 begin/commit pairs to find
+        # out there is nothing ready.
+        ready: 'list[tuple[key, SemanticRecord]]' = [
+            (k, rec) for k, rec in zip(missing, Semantic_DB.get_many(missing))
+            if rec is not None and document_text_of(rec) is not None]
+        # (3) Gate off: warn about the entities we could NOT embed (they would need
+        # interpretation, which the gate forbids).  The already-ready set still embeds.
+        if not gate:
+            n_blocked = len(missing) - len(ready)
+            if n_blocked:
+                await self.connection.warning(
+                    f"[Semantic_Embedding] {n_blocked} entities missing semantic embeddings, "
+                    f"but auto_interpret_for_embedding is disabled. "
+                    f"Set [[auto_interpret_for_embedding = true]] to enable automatic interpretation and embedding.")
+        if not ready:                                    # C1: nothing embeddable -> do NOT mark theories
+            if gate:
+                await self.connection.tracing(
+                    f"[Semantic_Embedding] no semantic interpretations found for the missing entities, skipping")
             return []
-        if len(texts) > 42 and not confirmed:
+        if len(ready) > 42 and not confirmed:
             import Isabelle_RPC_Host.dialogue
             answer = await self.connection.dialogue(
-                f"[Semantic Embedding] {len(texts)} entities to embed. "
+                f"[Semantic Embedding] {len(ready)} entities to embed. "
                 f"This may consume a significant amount of API tokens. Proceed?",
                 ["Yes", "No"])
             if answer != "Yes":
                 return []
-        total_chars = sum(len(t) for t in texts)
         await self.connection.tracing(
-            f"[Semantic_Embedding] embedding {len(texts)} of {len(missing)} missing entities "
-            f"({total_chars} chars total) into vectors")
-        embed_result = await self.emb_provider.embed(texts)
-        # Persist into LMDB; topk's gather picks them up from there.
-        with self._env.begin(write=True) as txn:
-            for k, vec in zip(text_keys, embed_result.vectors):
-                txn.put(k, encode_q15(vec).tobytes())
-        # Mark processed theories as embedded, recording cost
+            f"[Semantic_Embedding] embedding {len(ready)} of {len(missing)} missing entities into vectors")
+        tokens = await self.embed_records(ready, force=True)
+        # Mark processed theories as embedded, recording cost.  theory_hashes is empty
+        # when the gate is off, so a gate-off ready-only embed marks nothing.
         for th in theory_hashes:
-            self.mark_thy_embedded(th, embed_result.total_tokens)
-        return text_keys
+            self.mark_thy_embedded(th, tokens)
+        return [k for k, _ in ready]
 
     async def _experience_hits(self, term_patterns: 'list[str]',
                                ctxt: Any) -> 'dict[universal_key, float]':
@@ -1421,10 +1442,9 @@ class Semantic_Vector_Store(Vector_Store):
             for uk, _score in top:
                 rec = Semantic_DB[uk]
                 if rec is not None:
-                    # Experience doc_text = its goal_description (§7.3), not the
-                    # pretty-printed name+expr used for entities.
-                    doc_text = (rec.interpretation if rec.kind == EntityKind.EXPERIENCE
-                                else Semantic_DB.query(uk, with_pretty=True))
+                    # The reranker scores the SAME canonical document that was embedded
+                    # (document_text_of), per kind -- not a third, divergent text (D1).
+                    doc_text = document_text_of(rec)
                     if doc_text:
                         doc_entries.append((uk, _apply_live_name(uk, rec), doc_text))
             if doc_entries:
@@ -1481,42 +1501,65 @@ class Semantic_Vector_Store(Vector_Store):
         scored.sort(key=lambda x: x[0], reverse=True)
         return scored[:k], warnings, total
 
-    async def _embed_keys(self, keys: list[universal_key], *,
-                          force: bool = False) -> int:
-        """Embed the given keys, storing vectors in the vector store.
-        Looks up semantic texts from Semantic_DB, embeds them, and stores vectors.
-        When force=True, re-embeds all keys even if they already have vectors.
-        Returns the number of entities actually embedded."""
-        if force:
-            to_embed = keys
-        else:
-            exists = self.contains(keys)
-            to_embed = [k for k, ex in zip(keys, exists) if not ex]
-        if not to_embed:
+    async def embed_records(self, items: 'list[tuple[universal_key, SemanticRecord]]',
+                            *, force: bool = False) -> int:
+        """THE single choke point that turns records into stored vectors, using this
+        store's bound (model, provider).  Text comes only from ``document_text_of`` --
+        the one authority, dispatched on kind -- so every write path shares one
+        convention.  Records with no embeddable text (interpretation missing, or a
+        corrupt experience ``expr``) are skipped.  With ``force=False`` skips keys
+        already present in this store.  Returns tokens consumed.
+
+        Works on in-memory records (no DB round-trip needed), which is what lets
+        write_memory embed with the very text a later re-embed reconstructs -- byte
+        identical by construction.  connection is optional (offline embed passes None);
+        only the tracing line uses it, guarded."""
+        if not force:
+            keys = [k for k, _ in items]
+            exist = self.contains(keys)
+            items = [it for it, ex in zip(items, exist) if not ex]
+        kv = [(k, t) for k, rec in items if (t := document_text_of(rec)) is not None]
+        if not kv:
             return 0
-        # Collect semantic texts
-        texts: list[str] = []
-        text_keys: list[universal_key] = []
-        for k in to_embed:
-            sem = Semantic_DB.query(k, with_pretty=True)
-            if sem is not None:
-                texts.append(sem)
-                text_keys.append(k)
-        if not texts:
-            return 0
-        # Embed and store
         if self.connection is not None:
             await self.connection.tracing(
-                f"[Semantic_Embedding] embedding {len(texts)} entities ({sum(len(t) for t in texts)} chars)")
-        result = await self.emb_provider.embed(texts)
-        with self._env.begin(write=True) as txn:
-            for k, vec in zip(text_keys, result.vectors):
-                txn.put(k, encode_q15(vec).tobytes())
-        return len(text_keys)
+                f"[Semantic_Embedding] embedding {len(kv)} records ({sum(len(t) for _, t in kv)} chars)")
+        return await self.embed(kv)
+
+    async def embed_keys(self, keys: list[universal_key], *, force: bool = False) -> int:
+        """Convenience over :meth:`embed_records`: fetch each key's record from
+        Semantic_DB, then delegate.  Callers that already hold the records should call
+        embed_records directly (this re-reads them).  Returns tokens consumed.
+
+        The vector-store ``contains`` filter runs FIRST (one read txn on this store), so
+        only the not-yet-embedded keys cost a Semantic_DB read (one read txn + msgpack
+        decode each).  On a mostly-embedded theory that is the difference between one
+        txn and N."""
+        if not force:
+            exist = self.contains(keys)
+            keys = [k for k, ex in zip(keys, exist) if not ex]
+        items = [(k, rec) for k, rec in zip(keys, Semantic_DB.get_many(keys))
+                 if rec is not None]
+        # force=True: `keys` is already exactly the set to write, so don't re-check.
+        return await self.embed_records(items, force=True)
 
     async def embed_entities(self, keys: list[universal_key]) -> None:
         """Embed the given entity keys, skipping those already embedded."""
-        await self._embed_keys(keys, force=False)
+        await self.embed_keys(keys, force=False)
+
+    async def put_experience(self, key: universal_key, rec: 'SemanticRecord') -> None:
+        """Create/overwrite an experience across all three of its stores (record +
+        this model's vector + availability index), embed-first.  Ergonomic entry to
+        ``experience_store.put_experience``; the tri-store transaction lives there."""
+        from .experience_store import put_experience
+        await put_experience(self, key, rec)
+
+    def delete_experience(self, key: universal_key) -> None:
+        """Remove an experience from every store (record + vectors in ALL models +
+        index).  Ergonomic entry to ``experience_store.delete_experience``; ``self`` is
+        just the handle -- deletion is model-global (see Del1)."""
+        from .experience_store import delete_experience
+        delete_experience(key)
 
     async def embed_all_entities_in_theories(self, theories: list[str | universal_key],
                                               *, force: bool = False) -> None:
@@ -1559,7 +1602,7 @@ class Semantic_Vector_Store(Vector_Store):
                                theory=thy_name, the_theory_only=True)
             keys = [k for k, _, _ in entries]
             wip = is_WIP(thy_key) and not persist_wip
-            await self._embed_keys(keys, force=force)
+            await self.embed_keys(keys, force=force)
             if not wip:
                 self.mark_thy_embedded(thy_key)
 

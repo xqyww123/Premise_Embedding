@@ -645,47 +645,103 @@ def cmd_collect(args: argparse.Namespace) -> None:
 # embed
 # ---------------------------------------------------------------------------
 
-def _collect_embed_candidates() -> list[tuple[bytes, str]]:
-    """Every interpreted, non-WIP entity as (key, embedding-text), in one read txn.
+def _purge_experience_vectors() -> int:
+    """Delete every EXPERIENCE vector from EVERY ``vector_*.lmdb`` (plan §5 migration).
 
-    Entities embed the pretty signature + interpretation (matching
-    Semantic_DB.query(with_pretty=True)). Text is built from the record in hand —
-    never a nested query() (see Semantic_DB.iter_entity_records).
+    Experience keys are 32 bytes, XOR-prefixed, with the kind tag at byte 16 (the same
+    judgment `_Semantic_DB._scan_experiences` uses), so they are recognized from the key
+    alone -- which means this also removes ORPHANS (vectors whose record is gone). A
+    force re-embed alone cannot: it only overwrites keys still present in Semantic_DB,
+    and it only touches the models named on the command line, leaving old-convention
+    vectors alive in every other store (where `contains()` would then keep `_auto_embed`
+    from ever refreshing them). Purging everywhere and re-embedding is what makes the
+    single document-text convention actually hold across models: unnamed stores simply
+    backfill lazily under the new convention (Del1's asymmetry).
 
-    EXPERIENCE records are deliberately EXCLUDED: their document vector uses a
-    framing text (patterns + situation) produced by the AoA layer
-    (IsaMini.AoA.mcp_http_server._experience_document_text), which this offline,
-    layering-below tool must not reconstruct. Experience vectors are (re)written by
-    the AoA write-memory path, not here."""
+    Returns the number of vectors deleted."""
+    from Isabelle_Semantic_Embedding.semantics import _iter_vector_store_envs
+    from Isabelle_RPC_Host.universal_key import EntityKind
+    tag = int(EntityKind.EXPERIENCE)
+    deleted = 0
+    for env in _iter_vector_store_envs():
+        to_delete: list[bytes] = []
+        with env.begin() as txn:
+            for k, _ in txn.cursor():
+                k = bytes(k)
+                if len(k) == 32 and k[16] == tag:
+                    to_delete.append(k)
+        if to_delete:
+            with env.begin(write=True) as txn:
+                for k in to_delete:
+                    txn.delete(k)
+            deleted += len(to_delete)
+    return deleted
+
+
+def _parse_kinds(spec: str) -> 'set | None':
+    """Parse a comma-separated EntityKind list (e.g. 'experience,theorem') to a set,
+    or None for 'all'. Unknown names are a hard error listing the valid ones."""
+    from Isabelle_RPC_Host.universal_key import EntityKind
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    out = set()
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.add(EntityKind[tok.upper()])
+        except KeyError:
+            valid = ", ".join(k.name.lower() for k in EntityKind)
+            raise SystemExit(f"unknown kind {tok!r}; valid kinds: {valid}")
+    return out
+
+
+def _collect_embed_candidates(kinds: 'set | None' = None) -> 'list[tuple[bytes, object]]':
+    """Every interpreted, non-WIP record as (key, record), in one read txn.
+
+    Records are handed to ``Semantic_Vector_Store.embed_records``, which derives the
+    document text via ``document_text_of`` (the single authority, dispatched on kind).
+    EXPERIENCE records are now INCLUDED: their framing document text is produced by the
+    same lower-layer authority, so this offline tool re-embeds them under the identical
+    convention as the AoA write path (the f63b0bb experience-exclusion stopgap is gone).
+    Records are yielded from the singleton env -- never a second lmdb.open of
+    semantics.lmdb, and never a nested query() (see Semantic_DB.iter_entity_records).
+
+    ``kinds``: if given, restrict to these EntityKinds (e.g. {EXPERIENCE} for the §5
+    experience-vector migration); default None = all kinds."""
     from Isabelle_Semantic_Embedding.semantics import Semantic_DB, persist_wip
-    from Isabelle_RPC_Host.universal_key import EntityKind, is_WIP
-    out: list[tuple[bytes, str]] = []
+    from Isabelle_RPC_Host.universal_key import is_WIP
+    out: list[tuple[bytes, object]] = []
     for key, rec in Semantic_DB.iter_entity_records():
         if rec.interpretation is None:
             continue
-        if rec.kind == EntityKind.EXPERIENCE:
+        if kinds is not None and rec.kind not in kinds:
             continue
         if is_WIP(key) and not persist_wip:
             continue
-        out.append((key, rec.pretty_print + "\n" + rec.interpretation))
+        out.append((key, rec))
     return out
 
 
 async def _embed_models(models: list[str], *, driver: str, base_url: str,
-                        force: bool, yes: bool) -> None:
+                        force: bool, yes: bool, kinds: 'set | None' = None) -> None:
     """Make vector_MODEL complete w.r.t. semantics.lmdb, for each model.
 
     Drives the scan off the Semantic_DB singleton (never a second lmdb.open of
     semantics.lmdb). Non-interactive without ``yes`` and with real work to do is a
-    hard error, never a silent skip or an input() hang."""
+    hard error, never a silent skip or an input() hang. Text is derived per (key,
+    record) by embed_records -> document_text_of; this tool never assembles it."""
     from Isabelle_Semantic_Embedding.semantics import (
         Semantic_Vector_Store, _resolve_embedding_config_env)
     from Isabelle_Semantic_Embedding.semantic_embedding import make_embedding_provider
+    from Isabelle_Semantic_Embedding.document_text import document_text_of
     env_driver, env_base_url, _ = _resolve_embedding_config_env()
     driver = driver or env_driver
     base_url = base_url or env_base_url
 
-    candidates = _collect_embed_candidates()
+    candidates = _collect_embed_candidates(kinds)
     for model in models:
         provider = make_embedding_provider(driver, base_url, model)
         store = Semantic_Vector_Store(emb_provider=provider, connection=None)
@@ -694,14 +750,14 @@ async def _embed_models(models: list[str], *, driver: str, base_url: str,
             todo = candidates
         else:
             present = store.contains([k for k, _ in candidates])
-            todo = [kt for kt, p in zip(candidates, present) if not p]
+            todo = [kr for kr, p in zip(candidates, present) if not p]
 
         n = len(todo)
         if n == 0:
             print(f"{model}: already complete ({len(candidates)} entities).")
             continue
-        print(f"{model}: {n} of {len(candidates)} entities need vectors "
-              f"({sum(len(t) for _, t in todo)} chars).")
+        chars = sum(len(document_text_of(rec) or "") for _, rec in todo)
+        print(f"{model}: {n} of {len(candidates)} entities need vectors ({chars} chars).")
 
         if not yes:
             if sys.stdin.isatty():
@@ -716,7 +772,10 @@ async def _embed_models(models: list[str], *, driver: str, base_url: str,
         BATCH = 256
         total_tokens = 0
         for i in range(0, n, BATCH):
-            total_tokens += await store.embed(todo[i:i + BATCH])
+            # force=True: `todo` is already the exact set to (re)write, so let
+            # embed_records skip its redundant contains() check. It derives each
+            # record's text via document_text_of and skips any with no embeddable text.
+            total_tokens += await store.embed_records(todo[i:i + BATCH], force=True)
             print(f"  {model}: embedded {min(i + BATCH, n)}/{n}", flush=True)
         print(f"{model}: done ({n} embedded, {total_tokens} tokens).")
 
@@ -725,8 +784,34 @@ def cmd_embed(args: argparse.Namespace) -> None:
     """Make vector_MODEL complete w.r.t. semantics.lmdb, offline (no Isabelle)."""
     _require_db()
     import asyncio
+    from Isabelle_RPC_Host.universal_key import EntityKind
+    kinds = _parse_kinds(args.kinds)
+    yes = args.yes
+    # §5 migration: `--kinds experience --force` must first PURGE every experience vector
+    # from EVERY vector_*.lmdb -- otherwise old-convention vectors survive in the stores
+    # not named here (and orphans survive everywhere), and `contains()` would keep
+    # `_auto_embed` from ever refreshing them. See _purge_experience_vectors.
+    #
+    # The purge is DESTRUCTIVE, so its confirmation must happen HERE, before it runs --
+    # NOT in _embed_models, whose gate sits after it. Otherwise every abort path
+    # ("Aborted." on a declined prompt; "Refusing ... non-interactively" + exit 1) would
+    # report that nothing was done while the vectors were already gone.
+    if args.force and kinds == {EntityKind.EXPERIENCE}:
+        if not yes:
+            if not sys.stdin.isatty():
+                print("Refusing to purge and re-embed experience vectors "
+                      "non-interactively; pass --yes.", file=sys.stderr)
+                sys.exit(1)
+            if input("This DELETES every experience vector from every vector_*.lmdb, "
+                     "then re-embeds them. Proceed? [y/N] ").strip().lower() != "y":
+                print("Aborted.")
+                return
+            yes = True           # confirmed here; don't prompt again per model below
+        n = _purge_experience_vectors()
+        print(f"Purged {n} experience vector(s) from all vector_*.lmdb; re-embedding "
+              f"the named model(s) now (other models backfill lazily).")
     asyncio.run(_embed_models(args.models, driver=args.driver, base_url=args.base_url,
-                              force=args.force, yes=args.yes))
+                              force=args.force, yes=yes, kinds=kinds))
 
 
 # ---------------------------------------------------------------------------
@@ -794,6 +879,10 @@ p_embed.add_argument("--yes", action="store_true",
     help="Proceed without the confirmation prompt (required when stdin is not a TTY).")
 p_embed.add_argument("--force", action="store_true",
     help="Re-embed even entities that already have a vector for the model.")
+p_embed.add_argument("--kinds", default="",
+    help="Comma-separated EntityKinds to restrict to (e.g. 'experience'); default all. "
+         "Use '--kinds experience --force' for the §5 experience-vector migration "
+         "(re-embed every experience under the single document-text convention).")
 p_embed.add_argument("--driver", default="",
     help="Override the embedding driver class (else env EMBEDDING_DRIVER / default).")
 p_embed.add_argument("--base-url", dest="base_url", default="",

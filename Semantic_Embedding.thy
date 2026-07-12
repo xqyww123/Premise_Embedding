@@ -1,5 +1,5 @@
 theory Semantic_Embedding
-  imports Main Isabelle_RPC.Remote_Procedure_Calling
+  imports HOL.Record Isabelle_RPC.Remote_Procedure_Calling
 begin
 
 (*declare [[ML_debugger, ML_exception_debugger]]*)
