@@ -7,8 +7,10 @@
   Protocol:
     Client sends: theory_names (msgpack string list — the roots to interpret)
                   force (msgpack bool – when true, re-interpret already-finished theories)
-                  parallel (msgpack int option – NONE uses Isabelle worker count)
     Server streams: packString messages during interpretation (from tracing)
+
+  Concurrency width is the session's own -o threads=N, i.e. Multithreading.max_threads (),
+  which is what Isabelle's future worker pool bounds itself by. There is no per-call override.
     Server sends:   packUnit when done successfully
     On error:       sends packString "ERROR: ..." then packUnit
 *)
@@ -37,7 +39,6 @@ val _ = REPL_Server.register_app "Semantic_Store.collect" (fn (cin, cout, state)
       let
         val thy_names = read (unpackList unpackString)
         val force = read unpackBool
-        val parallel = read (unpackOption unpackInt)
         val thys = map Thy_Info.get_theory thy_names
         val _ = List.app Theory_Hash.store_theory_hash thys
         val _ = Remote_Procedure_Calling.load ["Isabelle_Semantic_Embedding"]
@@ -69,8 +70,7 @@ val _ = REPL_Server.register_app "Semantic_Store.collect" (fn (cin, cout, state)
         val _ = set_channels (fn msgs => List.app send msgs)
 
         val _ = \<^try>\<open>
-                  Semantic_Store.interpret_with_parallel parallel force
-                    (map Context.Theory thys)
+                  Semantic_Store.interpret_with_parallel force (map Context.Theory thys)
                   catch exn => (restore_channels (); Exn.reraise exn)\<close>
         val _ = restore_channels ()
         val _ = done ()

@@ -22,8 +22,16 @@ signature SEMANTIC_STORE = sig
   (* Interpret all uninterpreted ancestor theories of the current context,
      plus the current proof context if applicable. Calls Python via RPC
      to generate plain-English translations using a Claude agent. *)
+  (* Concurrency width is the session's own -o threads=N (Multithreading.max_threads). *)
   val interpret : bool -> Context.generic -> unit
-  val interpret_with_parallel : int option -> bool -> Context.generic list -> unit
+  val interpret_with_parallel : bool -> Context.generic list -> unit
+
+  (* The two pieces interpret_with_parallel is built from, exposed so a test can drive the
+     scheduler with a cheap body -- no network, no LLM spend. `schedule_dag label body cone`
+     forks one Future per cone node under Isabelle's DAG scheduler and returns the bodies'
+     results in topological order. *)
+  val collect_cone : theory list -> theory list
+  val schedule_dag : string -> (theory -> unit -> 'a) -> theory list -> 'a list
 
   (* Remove all LMDB entries whose theory hashes are non-persistent
      (i.e., from non-loaded theories). Returns the number of entries deleted. *)
@@ -1314,140 +1322,153 @@ fun interpret' (context : Context.generic) : usage * usage =
     end
   end
 
-(* Ancestor closure of `roots`, in topological order (parents first), with a
-   shared `seen` so a theory common to several roots appears exactly once.
-   Descends into ancestors even past a skipped theory, so an uncollected ancestor
-   of a finished theory is never missed (we no longer assume "interpreted" implies
-   all ancestors interpreted); the skipped theory itself is not re-collected. *)
-fun collect_cone (skip : theory -> bool) (roots : theory list) : theory list =
+(* Theories that are never interpreted: infrastructure sessions, and the three base
+   theories every HOL theory sits on. They are still TRAVERSED THROUGH -- see collect_cone. *)
+fun is_excluded_theory thy =
+  is_infra_session thy orelse
+  member (op =) base_theory_ids (Context.theory_identifier thy)
+
+(* Whole ancestor cone of `roots`, in topological order (parents first), with a shared
+   `seen` across roots so a common ancestor appears exactly once. Already-interpreted
+   theories are included: interpret_cone turns them into relay tasks, so a work node still
+   waits for its uninterpreted *transitive* ancestors.
+
+   `seen` means "visited", nothing more. An excluded theory is walked through and merely not
+   collected. Stopping at one -- as this used to -- left its non-excluded ancestors out of the
+   cone entirely: a single-root collect of Elliptic_Axclass, whose sole import is the infra
+   theory HOL-Decision_Procs.Reflective_Field, yielded a cone of one and interpreted it against
+   an empty store; and HOL.Typerep / HOL.Predicate / HOL.Lazy_Sequence / HOL.Limited_Sequence,
+   which sit behind HOL.Code_Evaluation, were missed even by a full-AFP run. *)
+fun collect_cone (roots : theory list) : theory list =
   let
     val seen = Inthashtab.empty 64
-    val _ = List.app (Inthashtab.update seen o rpair ()) base_theory_ids
     fun collect thy acc =
       let val id = Context.theory_identifier thy
       in
-        if Inthashtab.defined seen id orelse is_infra_session thy
-        then acc
+        if Inthashtab.defined seen id then acc
         else
           let val _ = Inthashtab.update seen (id, ())
               val acc' = fold collect (Theory.parents_of thy) acc
-          in if skip thy then acc' else acc' @ [thy] end
+          in if is_excluded_theory thy then acc' else thy :: acc' end
       end
-  in fold collect roots [] end
+  in rev (fold collect roots []) end
 
 fun skip_interpreted (force : bool) thy = not force andalso is_interpreted thy
 
-(* Scheduler state for DAG-parallel interpretation (one Isabelle session).
-   Default width N = Multithreading.max_threads (), optionally overridden by
-   callers such as semantics_manage.py.
-   blocking interpret' runs on off-pool Isabelle_Thread workers, concurrency bounded
-   by `running < n`, a theory is admitted only after all its in-set ancestors are
-   `done` (so its agent can read their interpretations from LMDB). Failure policy is
-   HARD CRASH: the first error sets `failed`, all siblings are interrupted, and the
-   exception is reraised out of `interpret` (the pipeline is resume-by-design). *)
-type sched_state =
-  {running: int, completed: int, done: Intset.T,
-   failed: exn option, total: usage, hist: usage}
+(* Fork one Future per cone node under Isabelle's own DAG scheduler, and join.
+   This is Thy_Info.schedule_theories (Pure/Thy/thy_info.ML:252-270) -- the code Isabelle
+   uses to load theories in parallel -- specialised to per-node deps: Graph.schedule folds
+   the cone in topological order and hands each node its immediate predecessors' futures,
+   Task_Queue (a Task_Graph underneath) enforces transitivity, and the worker pool bounds
+   concurrency at Multithreading.max_threads () = the REPL's -o threads=N.
 
-fun interpret_parallel (n : int) (theories : theory list) : usage * usage =
+   Failure policy is HARD CRASH, and Future supplies it: a job that raises cancels the shared
+   `grp`, so every later task runs with ok = false and its body never executes
+   (future.ML:230-245, 446-454); Par_Exn.release_first then reraises the first genuine
+   (non-interrupt) exception (par_exn.ML:50-56).
+
+   `body` is a parameter so the scheduler can be exercised by a test with a cheap body,
+   with no network and no LLM spend. *)
+fun schedule_dag (label : string) (body : theory -> unit -> 'a) (cone : theory list) : 'a list =
+  if null cone then []
+  else
+    Thread_Attributes.uninterruptible_body (fn run =>
+      let
+        val id = Context.theory_identifier
+        (* Keyed by the canonical theory identifier, not the long name: Graph.new_node raises
+           DUP on a repeated key, and long-name uniqueness is an assumption we need not make.
+           collect_cone already dedups on this same id. *)
+        val nodes = fold (fn thy => Int_Graph.new_node (id thy, thy)) cone Int_Graph.empty
+
+        (* Contract -- do not drop -- a parent that collect_cone excluded from the cone: walk
+           through it to its nearest in-cone ancestors. Reachability in the resulting graph is
+           then exactly `Theory.ancestors_of C ∩ cone`, i.e. what the deps used to be. Dropping
+           the edge instead made Elliptic_Locale, whose sole import is the infra theory
+           HOL-Decision_Procs.Reflective_Field, a zero-in-degree source that would be
+           interpreted against an empty store; 182 cone theories lost at least one ancestor.
+           The test is `not (Int_Graph.defined nodes ...)`, so whatever collect_cone excludes,
+           for whatever reason, is contracted -- including any future exclusion.
+
+           The memo MUST stay local to this call: in_cone_preds is a function of (thy, cone),
+           not of thy alone. A structure-level memo would hand back a stale [] for
+           Reflective_Field computed under a one-theory cone and silently reinstate the very
+           bug this fixes -- besides racing, as Inthashtab is unsynchronised. *)
+        val memo = Inthashtab.empty 64
+        fun in_cone_preds thy =
+          (case Inthashtab.lookup memo (id thy) of
+            SOME ps => ps
+          | NONE =>
+              let
+                val ps =
+                  maps (fn p =>
+                         if Int_Graph.defined nodes (id p) then [p] else in_cone_preds p)
+                       (Theory.parents_of thy)
+                val _ = Inthashtab.update memo (id thy, ps)
+              in ps end)
+
+        val graph = nodes |> fold (fn thy =>
+              fold (fn q => Int_Graph.add_edge (id q, id thy)) (in_cone_preds thy)) cone
+
+        val grp = Future.worker_subgroup ()   (* = Future.new_group (Future.worker_group ()) *)
+
+        (* No sequential arm keyed on `max_threads () > 1`: upstream thy_info keeps one only
+           for Thread_Data.is_virtual (ML embedded in the JVM, where there are no real
+           threads), and our REPL is a standalone Poly/ML process -- thread_data.ML:43
+           hard-codes is_virtual = false. Going through Future unconditionally is what gives
+           us group cancellation on failure and an interrupt that lands on the join; a
+           sequential arm would silently lose both. *)
+        val futures = graph |> Int_Graph.schedule (fn deps => fn (_, thy) =>
+          (singleton o Future.forks)
+            {name = label ^ ":" ^ Context.theory_long_name thy,
+             group = SOME grp,
+             deps = map (Future.task_of o #2) deps,
+             pri = 0, interrupts = true}
+            (body thy))
+
+        val results =
+          (case Exn.capture_body (fn () => run Future.join_results futures) of
+            Exn.Res res => res
+          | Exn.Exn exn =>
+             (if Exn.is_interrupt_proper exn then Future.cancel_group grp else ();
+              Exn.reraise exn))
+      in
+        Par_Exn.release_first results
+      end)
+
+fun interpret_cone (force : bool) (cone : theory list) : usage * usage =
   let
-    val collected_ids = Intset.make (map Context.theory_identifier theories)
-    (* deps = transitive ancestors restricted to the collected set, so a skipped /
-       already-interpreted intermediate never drops a real prerequisite edge. *)
-    val nodes = map (fn thy =>
-      {id = Context.theory_identifier thy,
-       thy = thy,
-       deps =
-         Theory.ancestors_of thy
-         |> map Context.theory_identifier
-         |> filter (Intset.member collected_ids)
-         |> Intset.make}) theories
-    val total_count = length nodes
+    (* An already-interpreted theory still gets a task: it relays the dependency edge on to
+       its descendants without doing any work. *)
+    fun body thy () =
+      if skip_interpreted force thy then (zero_usage, zero_usage)
+      else
+        let val r = interpret' (Context.Theory thy)
+            val _ = mark_interpreted thy
+        in r end
+    fun add2 ((c1, h1), (c2, h2)) = (add_usage (c1, c2), add_usage (h1, h2))
+  in
+    fold (fn r => fn acc => add2 (acc, r))
+      (schedule_dag "Semantic_Store.interpret" body cone) (zero_usage, zero_usage)
+  end
 
-    val st = Synchronized.var "Semantic_Store.interpret_sched"
-      ({running = 0, completed = 0, done = Intset.empty, failed = NONE,
-        total = zero_usage, hist = zero_usage} : sched_state)
-
-    fun admit {id = _, thy = _, deps} =
-      Synchronized.guarded_access st
-        (fn (s as {running, completed, done, failed, total, hist}) =>
-          if is_some failed then SOME (false, s)
-          else if running < n andalso Intset.subset (deps, done)
-          then SOME (true, {running = running + 1, completed = completed,
-                            done = done, failed = failed, total = total, hist = hist})
-          else NONE)
-
-    fun finish id (cur, cum) =
-      Synchronized.change st
-        (fn {running, completed, done, failed, total, hist} =>
-          {running = running - 1, completed = completed + 1,
-           done = Intset.insert id done, failed = failed,
-           total = add_usage (total, cur), hist = add_usage (hist, cum)})
-
-    fun set_failed exn =
-      Synchronized.change st
-        (fn {running, completed, done, failed, total, hist} =>
-          {running = running, completed = completed, done = done,
-           failed = SOME (the_default exn failed), total = total, hist = hist})
-
-    (* `\<^try> ... catch` re-raises interrupts and only routes genuine errors to
-       set_failed; bare `handle exn =>` would be a compile error here. *)
-    fun worker (node as {id, thy, deps = _}) () =
-      \<^try>\<open>
-        if admit node
-        then
-          let val (cur, cum) = interpret' (Context.Theory thy)
-              val _ = mark_interpreted thy
-          in finish id (cur, cum) end
-        else ()  (* failure already recorded: skip cleanly, no deadlock *)
-      catch exn => set_failed exn\<close>
-
-    val params =
-      Isabelle_Thread.interrupts (Isabelle_Thread.params "Semantic_Store.interpret")
-    val handles = map (fn node => Isabelle_Thread.fork params (worker node)) nodes
-
-    (* Wait until a failure occurs or all theories have finished. *)
-    val _ = Synchronized.guarded_access st
-      (fn (s as {failed, completed, running = _, done = _, total = _, hist = _}) =>
-        if is_some failed orelse completed = total_count
-        then SOME ((), s) else NONE)
-
-    val {failed, total, hist, running = _, completed = _, done = _} =
-      Synchronized.value st
-    val _ = if is_some failed
-            then List.app Isabelle_Thread.interrupt_thread handles else ()
-    val _ = List.app Isabelle_Thread.join handles
-    val _ = case failed of SOME e => Exn.reraise e | NONE => ()
-  in (total, hist) end
-
-(* Interpret the merged ancestor cone of `roots` under one bounded-width DAG.
-   A `Context.Proof` root additionally has its own proof-local entities interpreted,
-   last and sequentially, and is never marked (a proof context has no theory hash). *)
-fun interpret_with_parallel parallel (force : bool) (roots : Context.generic list) : unit =
+(* Interpret the merged ancestor cone of `roots` under one DAG, at the width the REPL was
+   started with (-o threads=N). A `Context.Proof` root additionally has its own proof-local
+   entities interpreted, last and sequentially, and is never marked (a proof context has no
+   theory hash). *)
+fun interpret_with_parallel (force : bool) (roots : Context.generic list) : unit =
   let
-    val theories = collect_cone (skip_interpreted force) (map Context.theory_of roots)
+    val cone = collect_cone (map Context.theory_of roots)
+    val work = filter_out (skip_interpreted force) cone
     val proofs = filter (fn Context.Proof _ => true | _ => false) roots
     (* count includes the proof contexts, matching the old guard which folded them
        into `contexts` *)
-    val n_units = length theories + length proofs
+    val n_units = length work + length proofs
     val _ = if n_units = 0 then () else
       tracing ("[Semantic_Store] interpreting " ^ Int.toString n_units ^ " theories")
 
-    val n =
-      (case parallel of
-        NONE => Multithreading.max_threads ()
-      | SOME n =>
-          if n >= 1 then n
-          else error "Semantic_Store.interpret: parallel worker count must be positive")
+    (* Nothing to do (the common resume case): do not build a graph or fork relay tasks. *)
     val (ttotal, thist) =
-      if n <= 1
-      then
-        fold (fn ctx => fn (acc, hacc) =>
-          let val (cur, cum) = interpret' ctx
-              val _ = Context.cases mark_interpreted (K ()) ctx
-          in (add_usage (acc, cur), add_usage (hacc, cum)) end)
-        (map Context.Theory theories) (zero_usage, zero_usage)
-      else interpret_parallel n theories
+      if null work then (zero_usage, zero_usage) else interpret_cone force cone
 
     (* Proof contexts run LAST and sequentially; interpreted but never marked. *)
     val (ptotal, phist) =
@@ -1465,7 +1486,7 @@ fun interpret_with_parallel parallel (force : bool) (roots : Context.generic lis
     ()
   end
 
-fun interpret force context = interpret_with_parallel NONE force [context]
+fun interpret force context = interpret_with_parallel force [context]
 
 fun mk_interpret_theory (context : Context.generic) (names : string list) : unit =
   let

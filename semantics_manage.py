@@ -38,15 +38,6 @@ THEORY_HASH_DB_PATH = os.path.join(THEORY_HASH_CACHE_DIR, "theory_hash.lmdb")
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _positive_int(value: str) -> int:
-    try:
-        n = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    if n < 1:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return n
-
 
 def _load_theory_names() -> dict[bytes, str]:
     """Load hash→name mapping from theory_hash.lmdb."""
@@ -590,8 +581,9 @@ def cmd_collect(args: argparse.Namespace) -> None:
 
                 print("Running app...", flush=True)
                 await c.run_app("Semantic_Store.collect")
-                # Interpret-only protocol: (theory_names, force, parallel).
-                await c._write(targets, args.reinterpret, args.parallel)
+                # Interpret-only protocol: (theory_names, force). Concurrency width is the
+                # REPL's own -o threads=N; there is no per-call override.
+                await c._write(targets, args.reinterpret)
 
                 has_error = False
                 try:
@@ -876,8 +868,9 @@ p_collect.add_argument("--re-embed", action="store_true",
 p_collect.add_argument("--yes-embed", action="store_true",
     help="Proceed with the chained embed without confirmation (needed when stdin is not a "
          "TTY, e.g. in a fleet).")
-p_collect.add_argument("--parallel", type=_positive_int, metavar="N",
-    help="Override interpretation parallelism / DAG width (default: Isabelle worker count)")
+# Interpretation runs on Isabelle's future worker pool, so its DAG width is the REPL's own
+# `-o threads=N` (Multithreading.max_threads). Start the REPL with the width you want:
+#   ./repl_server.sh 127.0.0.1:6666 <SESSION> <outdir> -o threads=32
 
 # list
 p_list = sub.add_parser("list", help="List all theories in the semantic database")
