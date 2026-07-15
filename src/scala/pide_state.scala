@@ -287,18 +287,24 @@ object DB_Snapshots {
           val theory_names = Export.read_theory_names(db, session_name)
 
           // (3) source-path -> genuine long-name, via each theory's own PIDE/files export.
-          // files0-head is byte-identical to a Sources.name (Isabelle's own theory_source
-          // round-trips it through read_sources — verified on AFP-DEP1-0: 411/411 theories,
-          // including all 13 duplicate bases).  A full path is UNIQUE, so theories that merely
-          // share a base name (Transitive_Models.Renaming vs Forcing.Renaming compiled in one
+          // files0-head is byte-identical to a Sources.name (both are File.symbolic_path of the
+          // same theory node path, frozen into this db at build time — structural, verified on
+          // AFP-DEP1-0: 411/411 theories, all 13 duplicate bases).  A full path is UNIQUE, so
+          // theories sharing a base name (Transitive_Models.Renaming vs Forcing.Renaming in one
           // flat session) each resolve to their own long-name — no ambiguity, nothing skipped.
+          // read_theory_names returns only THIS session's theories, so every FILES export lives
+          // in the already-open `db` (Session_Context.get would read the identical row): read it
+          // directly here, without opening a second handle to the same file or the ancestor
+          // hierarchy — avoids a redundant same-file open and a needless error_database throw
+          // surface, and keeps the whole index in the one db already opened at line 269.
           val long_by_path: Map[String, String] =
-            using(Export.open_session_context0(store, session_name)) { ctx =>
-              (for {
-                tn <- theory_names.iterator
-                (path, _) <- ctx.theory(tn).files(permissive = true).iterator
-              } yield path -> tn).toMap
-            }
+            (for {
+              tn <- theory_names.iterator
+              entry <- Export.read_entry(db, Export.Entry_Name(session_name, tn, Export.FILES),
+                                         store.cache).iterator
+              (_, path) <- XML.Decode.list(XML.Decode.pair(XML.Decode.int, XML.Decode.string))(
+                             entry.yxml()).headOption.iterator
+            } yield path -> tn).toMap
 
           // (4) Base counts — used ONLY to keep the name-based FALLBACK conservative; the
           // digest mapping below is precise regardless of any base-name collision.
