@@ -218,9 +218,17 @@ jobs:
             python3 -c "import sys; b=open(sys.argv[1],'rb').read(); sys.exit(0 if b'\r\n' in b else 1)" "$work/python-scripts/$h.bat" \
               || { echo "::error::python-scripts/$h.bat is not CRLF"; exit 1; }
           done
-          # The console script must ship too -- it is the documented way to fetch the DB.
-          [ -f "$work/python-scripts/isabelle-semantics" ] \
-            || { echo "::error::the isabelle-semantics entry point did not ship"; exit 1; }
+          # Deliberately NO payload check for the isabelle-semantics console script: with
+          # build.python.entry_points, conda generates the wrapper at LINK time from
+          # info/link.json, so it is correctly absent from the payload this step unpacks.
+          # It is covered where it means something -- the recipe's own test runs
+          # `isabelle-semantics --help` on every leg, and the verify job below runs it out
+          # of a real installed environment.
+          if [ -e "$work/python-scripts/isabelle-semantics" ] \
+             || [ -e "$work/python-scripts/isabelle-semantics.exe" ]; then
+            echo "::error::pip's launcher shipped alongside the conda entry point"
+            exit 1
+          fi
           echo "  OK  both halves, both hook sets"
 
       - uses: actions/upload-artifact@v4

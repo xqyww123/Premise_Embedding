@@ -54,6 +54,18 @@ build:
     # the matrix would be 5 subdirs x 3 pythons = 15 builds differing only in a
     # python_abi pin.
     version_independent: true
+    entry_points:
+      # Declared here rather than left to pip, exactly as isabelle-rpc's recipe does.
+      # conda generates the wrapper itself at LINK time, so it lands in bin/ or Scripts/
+      # in the form that platform needs.
+      #
+      # Leaving it to pip is broken on Windows and silently fine elsewhere: pip emits a
+      # 106 KB `isabelle-semantics.exe` launcher with the BUILD prefix's interpreter path
+      # baked into it, which then ships unchanged (it is a binary, and binary_relocation
+      # is off).  The unix legs got a shebang script and worked, so only the win-64 leg
+      # failed -- measured on run 29674332208, where every other test passed and
+      # `isabelle-semantics --help` exited 1.
+      - isabelle-semantics = Isabelle_Semantic_Embedding.semantics_manage:main
   # Do not rewrite the compiled artifacts' load commands.  rattler-build relinks binaries
   # by default so their rpaths point into the conda prefix; on macOS that fails outright
   # on a wheel not linked with spare Mach-O header padding -- measured on the rocksdict
@@ -116,6 +128,15 @@ build:
       if not list(pkg.glob("_vecgather*.so")) + list(pkg.glob("_vecgather*.pyd")):
           die("the _vecgather extension module did not ship")
       print("  OK  kernel +", "_vecgather present")
+
+      # Remove pip's own console-script launcher.  build.python.entry_points makes conda
+      # generate the wrapper at link time, and shipping pip's alongside it would leave two
+      # files claiming the same name -- one of which (Windows' .exe) has the build prefix
+      # baked in and cannot work on a user's machine.  One source of truth.
+      for d in ("bin", "Scripts"):
+          for p in (PREFIX / d).glob("isabelle-semantics*"):
+              print("removing pip's launcher:", p.name)
+              p.unlink()
 
       # --- the Isabelle half ----------------------------------------------------
       # An explicit whitelist, NOT a whole-tree copy.  This working tree can hold >3 GB of
