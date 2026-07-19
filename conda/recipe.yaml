@@ -293,7 +293,18 @@ tests:
   - python:
       imports:
         - Isabelle_Semantic_Embedding
-      pip_check: true
+      # NO pip_check.  It is a false positive here and cannot be made to pass: conda-forge
+      # ships `faiss-cpu` as a 17 KB metapackage that pulls in `faiss`, and neither
+      # registers a pip `.dist-info`.  pip therefore reads our dist-info, looks for a
+      # distribution named faiss-cpu, finds none, and reports "requires faiss-cpu, which
+      # is not installed" -- about a package that IS installed and IS importable.
+      #
+      # The script test below replaces it with something strictly stronger: pip_check
+      # reads metadata, whereas those lines EXECUTE the imports.  That is the actual
+      # failure mode this project has hit (naming conda's `lmdb`, the C library, instead
+      # of `python-lmdb`: it resolved, installed green, the session built, and only
+      # `import lmdb` failed -- which pip_check would not have caught either, since the
+      # dist-info requirement `lmdb` was nominally satisfied).
   - script:
       # The import above proves site-packages was found.  These prove the two COMPILED
       # artifacts are real and loadable on this host -- which is the whole reason this
@@ -302,6 +313,14 @@ tests:
       # rather than at a user's first query.
       - python -c "from Isabelle_Semantic_Embedding import _vecgather; print('_vecgather ok')"
       - python -c "from Isabelle_Semantic_Embedding._vecarith import library_path; print('kernel:', library_path())"
+      # Every declared dependency must actually IMPORT.  `import Isabelle_Semantic_Embedding`
+      # alone does not reach them: __init__ pulls in premise_selection, semantics, hover,
+      # theory_structure and semantic_interpretation, but NOT semantic_embedding (faiss,
+      # diskcache) and NOT r2_sync (filelock, platformdirs, zstandard).  boto3 and
+      # transformers are declared dependencies imported lazily at their use sites, so
+      # nothing else here would notice if their conda names were wrong.
+      - python -c "import Isabelle_Semantic_Embedding.semantic_embedding, Isabelle_Semantic_Embedding.r2_sync, Isabelle_Semantic_Embedding.experience_index, Isabelle_Semantic_Embedding.premise_selection; print('all package modules import')"
+      - python -c "import faiss, boto3, transformers, zstandard, filelock, platformdirs, diskcache, msgpack, lmdb, rocksdict, httpx, numpy, yaml, claude_agent_sdk; print('all declared dependencies import')"
       # The console script must be on PATH -- `isabelle-semantics pull` is the documented
       # way to fetch the semantic DB, and until 0.1.1 it was not runnable after an install.
       - isabelle-semantics --help
