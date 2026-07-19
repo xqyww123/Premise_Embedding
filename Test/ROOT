@@ -1,0 +1,16 @@
+(* Kept OUT of the top-level ROOT so that ROOT stays shippable.
+
+   `isabelle components -u` exposes a component's whole ROOT.  The conda package ships
+   the session source but deliberately NOT this directory (Test/ carries, among other
+   things, ~1.2 GB of local build output).  With the test session still declared in the
+   top-level ROOT, every `isabelle build` in a user's environment would then fail on a
+   session whose directory `"Test"` does not exist -- including builds of entirely
+   unrelated sessions, because Isabelle reads every registered ROOT at startup.
+
+   Run these with an explicit -d, e.g.
+       isabelle build -d . -d Test Semantic_Embedding_Test *)
+
+session Semantic_Embedding_Test = Semantic_Embedding +
+  theories
+    Infra_Decl_Test
+    Command_At_Position_Test

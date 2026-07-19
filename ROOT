@@ -4,8 +4,3 @@ session Semantic_Embedding = HOL +
     Performant_Isabelle_ML
   theories
     Semantic_Embedding
-
-session Semantic_Embedding_Test in "Test" = Semantic_Embedding +
-  theories
-    Infra_Decl_Test
-    Command_At_Position_Test
