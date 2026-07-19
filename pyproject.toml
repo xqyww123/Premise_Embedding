@@ -80,6 +80,11 @@ dependencies = [
 include = ["Isabelle_Semantic_Embedding", "Isabelle_Semantic_Embedding.*"]
 exclude = ["contrib", "contrib.*"]
 
+[project.scripts]
+# semantics_manage used to be a top-level script, so it never shipped in the wheel and
+# the documented `semantics_manage.py pull` was not runnable after an install.
+isabelle-semantics = "Isabelle_Semantic_Embedding.semantics_manage:main"
+
 [tool.setuptools.package-data]
 # libisabelle_vector.so is compiled by CMake and staged into the build tree by
 # setup.py's build_py, not tracked in the source tree; listing it keeps
@@ -87,4 +92,13 @@ exclude = ["contrib", "contrib.*"]
 # artifact, _vecgather, is an ext_module and needs no entry here -- build_ext
 # places it. (.dylib / .dll will join this list when those platforms land.)
 Isabelle_Semantic_Embedding = ["embedding_config_template.yaml", "config_template.yaml",
-                               "libisabelle_vector.so"]
+                               "libisabelle_vector.so",
+                               # The deformalisation agent runs with this directory as its
+                               # cwd and setting_sources=["project"], so the three skills
+                               # under .claude/ ARE its Isabelle knowledge -- without them
+                               # it still runs, just uninformed.  They never shipped before.
+                               #
+                               # The dot component must be spelled out: setuptools' glob
+                               # skips hidden entries, so "Agent_Interpretation_Dir/**/*"
+                               # silently matches NOTHING here.  Measured, not assumed.
+                               "Agent_Interpretation_Dir/.claude/**/*"]

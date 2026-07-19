@@ -204,13 +204,19 @@ def settings() -> Settings:
 
 
 def manage_script() -> str:
-    """Absolute path of semantics_manage.py, for telling a user what to run.
+    """What to tell a user to run, in a form they can actually paste.
 
-    It sits beside the package directory in a source checkout.  A wheel does not
-    ship it (it is a script, not package data), so fall back to the bare name.
+    Installed (wheel or conda), the ``isabelle-semantics`` console script is on
+    PATH and is the right thing to print.  In a source checkout there is no such
+    script, so fall back to the absolute path of the module -- runnable as
+    ``python <path>``.  The old code printed a bare "semantics_manage.py" when the
+    file was not beside the package, which was never runnable: the module ships
+    INSIDE the package now, so that branch could not have helped anyway.
     """
-    p = pathlib.Path(__file__).resolve().parent.parent / "semantics_manage.py"
-    return str(p) if p.exists() else "semantics_manage.py"
+    exe = shutil.which("isabelle-semantics")
+    if exe:
+        return exe
+    return str(pathlib.Path(__file__).resolve().parent / "semantics_manage.py")
 
 
 def config_path() -> str:

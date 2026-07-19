@@ -840,103 +840,115 @@ def cmd_embed(args: argparse.Namespace) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-parser = argparse.ArgumentParser(
-    description="Manage the Isabelle semantic interpretation database.")
-sub = parser.add_subparsers(dest="command", required=True)
 
-# collect
-p_collect = sub.add_parser("collect", help="Collect semantic interpretations for theories")
-p_collect.add_argument("theory", nargs="+",
-    help="Theory name(s) to interpret (e.g., HOL.List HOL.Map). Their ancestor cones "
-         "are merged and interpreted under one DAG.")
-p_collect.add_argument("--repl-addr", default="127.0.0.1:6666", help="Isa-REPL server address")
-p_collect.add_argument("--rpc-addr", default="127.0.0.1:27182", help="RPC host address")
-p_collect.add_argument("--session", default="HOL", help="Session qualifier for theory name resolution")
-p_collect.add_argument("--model", default="claude-opus-4-8[1m]",
-    help="LLM model for semantic interpretation (default: claude-opus-4-8[1m])")
-p_collect.add_argument("--embed-models", default="",
-    help="Comma-separated canonical (HuggingFace) embedding model names "
-         "(e.g., 'Qwen/Qwen3-Embedding-8B'). NOTE: all listed models are embedded "
-         "via the one active driver+base_url, so they must be served by the same "
-         "endpoint.")
-p_collect.add_argument("--reinterpret", action="store_true",
-    help="Re-interpret already-finished theories to pick up new entities")
-p_collect.add_argument("--migrate-on-hash-change", action="store_true",
-    help="Copy old data to new hash instead of re-interpreting when hash changes")
-p_collect.add_argument("--re-embed", action="store_true",
-    help="Re-embed vectors for --embed-models (force, whole DB), not just the missing ones")
-p_collect.add_argument("--yes-embed", action="store_true",
-    help="Proceed with the chained embed without confirmation (needed when stdin is not a "
-         "TTY, e.g. in a fleet).")
-# Interpretation runs on Isabelle's future worker pool, so its DAG width is the REPL's own
-# `-o threads=N` (Multithreading.max_threads). Start the REPL with the width you want:
-#   ./repl_server.sh 127.0.0.1:6666 <SESSION> <outdir> -o threads=32
+def main() -> None:
+    """Console entry point (``isabelle-semantics``).
 
-# list
-p_list = sub.add_parser("list", help="List all theories in the semantic database")
+    The parser and dispatch used to run at import time, which is fine for
+    ``python semantics_manage.py`` and impossible for an entry point: importing
+    the module would parse argv and exit.  Wrapped so it can be both.
+    """
+    parser = argparse.ArgumentParser(
+        description="Manage the Isabelle semantic interpretation database.")
+    sub = parser.add_subparsers(dest="command", required=True)
 
-# remove
-p_remove = sub.add_parser("remove", help="Remove theories from the database")
-p_remove.add_argument("identifiers", nargs="+",
-    help="Theory names or universal key hex prefixes (from 'list' output)")
-p_remove.add_argument("--force", action="store_true", help="Skip confirmation prompt")
+    # collect
+    p_collect = sub.add_parser("collect", help="Collect semantic interpretations for theories")
+    p_collect.add_argument("theory", nargs="+",
+        help="Theory name(s) to interpret (e.g., HOL.List HOL.Map). Their ancestor cones "
+             "are merged and interpreted under one DAG.")
+    p_collect.add_argument("--repl-addr", default="127.0.0.1:6666", help="Isa-REPL server address")
+    p_collect.add_argument("--rpc-addr", default="127.0.0.1:27182", help="RPC host address")
+    p_collect.add_argument("--session", default="HOL", help="Session qualifier for theory name resolution")
+    p_collect.add_argument("--model", default="claude-opus-4-8[1m]",
+        help="LLM model for semantic interpretation (default: claude-opus-4-8[1m])")
+    p_collect.add_argument("--embed-models", default="",
+        help="Comma-separated canonical (HuggingFace) embedding model names "
+             "(e.g., 'Qwen/Qwen3-Embedding-8B'). NOTE: all listed models are embedded "
+             "via the one active driver+base_url, so they must be served by the same "
+             "endpoint.")
+    p_collect.add_argument("--reinterpret", action="store_true",
+        help="Re-interpret already-finished theories to pick up new entities")
+    p_collect.add_argument("--migrate-on-hash-change", action="store_true",
+        help="Copy old data to new hash instead of re-interpreting when hash changes")
+    p_collect.add_argument("--re-embed", action="store_true",
+        help="Re-embed vectors for --embed-models (force, whole DB), not just the missing ones")
+    p_collect.add_argument("--yes-embed", action="store_true",
+        help="Proceed with the chained embed without confirmation (needed when stdin is not a "
+             "TTY, e.g. in a fleet).")
+    # Interpretation runs on Isabelle's future worker pool, so its DAG width is the REPL's own
+    # `-o threads=N` (Multithreading.max_threads). Start the REPL with the width you want:
+    #   ./repl_server.sh 127.0.0.1:6666 <SESSION> <outdir> -o threads=32
 
-# reindex
-p_reindex = sub.add_parser("reindex",
-    help="Rebuild experience_index.lmdb from the EXPERIENCE records in semantics.lmdb")
+    # list
+    p_list = sub.add_parser("list", help="List all theories in the semantic database")
 
-# fsck
-p_fsck = sub.add_parser("fsck", help="Check semantics.lmdb invariants")
-p_fsck.add_argument("--fix", action="store_true",
-    help="Repair the derived artefacts: rebuild the experience index, and re-key "
-         "records whose XOR prefix disagrees with their constituent list.")
+    # remove
+    p_remove = sub.add_parser("remove", help="Remove theories from the database")
+    p_remove.add_argument("identifiers", nargs="+",
+        help="Theory names or universal key hex prefixes (from 'list' output)")
+    p_remove.add_argument("--force", action="store_true", help="Skip confirmation prompt")
 
-# embed
-p_embed = sub.add_parser("embed",
-    help="Embed every interpreted entity that lacks a vector for MODEL, over the whole "
-         "database (offline; no Isabelle). Incremental.")
-p_embed.add_argument("models", nargs="+", metavar="MODEL",
-    help="Canonical (HuggingFace) embedding model name(s), e.g. 'Qwen/Qwen3-Embedding-8B'. "
-         "All are served by the one active driver+base_url.")
-p_embed.add_argument("--yes", action="store_true",
-    help="Proceed without the confirmation prompt (required when stdin is not a TTY).")
-p_embed.add_argument("--force", action="store_true",
-    help="Re-embed even entities that already have a vector for the model.")
-p_embed.add_argument("--kinds", default="",
-    help="Comma-separated EntityKinds to restrict to (e.g. 'experience'); default all. "
-         "Use '--kinds experience --force' for the §5 experience-vector migration "
-         "(re-embed every experience under the single document-text convention).")
-p_embed.add_argument("--driver", default="",
-    help="Override the embedding driver class (else env EMBEDDING_DRIVER / default).")
-p_embed.add_argument("--base-url", dest="base_url", default="",
-    help="Override the embedding endpoint base_url (else env EMBEDDING_BASE_URL / default).")
+    # reindex
+    p_reindex = sub.add_parser("reindex",
+        help="Rebuild experience_index.lmdb from the EXPERIENCE records in semantics.lmdb")
 
-# status
-p_status = sub.add_parser("status",
-    help="Compare the local database with the Cloudflare R2 snapshot (one HEAD request)")
+    # fsck
+    p_fsck = sub.add_parser("fsck", help="Check semantics.lmdb invariants")
+    p_fsck.add_argument("--fix", action="store_true",
+        help="Repair the derived artefacts: rebuild the experience index, and re-key "
+             "records whose XOR prefix disagrees with their constituent list.")
 
-# push
-p_push = sub.add_parser("push",
-    help="Upload the local database to R2, OVERWRITING the shared remote "
-         "(human-only; needs credentials)")
-p_push.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
-p_push.add_argument("--dry-run", action="store_true", help="Say what would happen")
-p_push.add_argument("--force", action="store_true",
-    help="Push even when the database is open elsewhere, or when the remote has "
-         "moved since this machine last synced (which would discard the difference).")
+    # embed
+    p_embed = sub.add_parser("embed",
+        help="Embed every interpreted entity that lacks a vector for MODEL, over the whole "
+             "database (offline; no Isabelle). Incremental.")
+    p_embed.add_argument("models", nargs="+", metavar="MODEL",
+        help="Canonical (HuggingFace) embedding model name(s), e.g. 'Qwen/Qwen3-Embedding-8B'. "
+             "All are served by the one active driver+base_url.")
+    p_embed.add_argument("--yes", action="store_true",
+        help="Proceed without the confirmation prompt (required when stdin is not a TTY).")
+    p_embed.add_argument("--force", action="store_true",
+        help="Re-embed even entities that already have a vector for the model.")
+    p_embed.add_argument("--kinds", default="",
+        help="Comma-separated EntityKinds to restrict to (e.g. 'experience'); default all. "
+             "Use '--kinds experience --force' for the §5 experience-vector migration "
+             "(re-embed every experience under the single document-text convention).")
+    p_embed.add_argument("--driver", default="",
+        help="Override the embedding driver class (else env EMBEDDING_DRIVER / default).")
+    p_embed.add_argument("--base-url", dest="base_url", default="",
+        help="Override the embedding endpoint base_url (else env EMBEDDING_BASE_URL / default).")
 
-# pull
-p_pull = sub.add_parser("pull",
-    help="Download the R2 snapshot and merge it into the local database")
-p_pull.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
-p_pull.add_argument("--dry-run", action="store_true", help="Say what would happen")
-p_pull.add_argument("--no-backup", action="store_true",
-    help="Skip the pre-merge backup. The merge then has no way back.")
-p_pull.add_argument("--force", action="store_true",
-    help="Merge even when the local copy is already current, or the database is "
-         "open in another process.")
+    # status
+    p_status = sub.add_parser("status",
+        help="Compare the local database with the Cloudflare R2 snapshot (one HEAD request)")
 
-args = parser.parse_args()
-{"collect": cmd_collect, "list": cmd_list, "remove": cmd_remove,
- "reindex": cmd_reindex, "fsck": cmd_fsck, "embed": cmd_embed,
- "status": cmd_status, "push": cmd_push, "pull": cmd_pull}[args.command](args)
+    # push
+    p_push = sub.add_parser("push",
+        help="Upload the local database to R2, OVERWRITING the shared remote "
+             "(human-only; needs credentials)")
+    p_push.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+    p_push.add_argument("--dry-run", action="store_true", help="Say what would happen")
+    p_push.add_argument("--force", action="store_true",
+        help="Push even when the database is open elsewhere, or when the remote has "
+             "moved since this machine last synced (which would discard the difference).")
+
+    # pull
+    p_pull = sub.add_parser("pull",
+        help="Download the R2 snapshot and merge it into the local database")
+    p_pull.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+    p_pull.add_argument("--dry-run", action="store_true", help="Say what would happen")
+    p_pull.add_argument("--no-backup", action="store_true",
+        help="Skip the pre-merge backup. The merge then has no way back.")
+    p_pull.add_argument("--force", action="store_true",
+        help="Merge even when the local copy is already current, or the database is "
+             "open in another process.")
+
+    args = parser.parse_args()
+    {"collect": cmd_collect, "list": cmd_list, "remove": cmd_remove,
+     "reindex": cmd_reindex, "fsck": cmd_fsck, "embed": cmd_embed,
+     "status": cmd_status, "push": cmd_push, "pull": cmd_pull}[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
