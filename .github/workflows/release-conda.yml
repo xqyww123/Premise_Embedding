@@ -284,6 +284,17 @@ jobs:
           "$PY" -m pip install --quiet conda-index
           "$PY" -m conda_index "$CH"
           echo "CH=$CH" >> "$GITHUB_ENV"
+          # A file:// URL, built separately from the PATH.  On Windows $RUNNER_TEMP is
+          # `D:\a\_temp`, so the obvious `file://$CH` yields `file://D:\a\_temp/ch`, which
+          # conda reads as host `d` and rejects with "HTTP 404 UNAVAILABLE OR INVALID for
+          # channel a/_temp/ch".  It needs three slashes and forward separators.  The unix
+          # legs are unaffected, which is why this passed four times over -- measured on
+          # run 29674605406.
+          if [ "$RUNNER_OS" = Windows ]; then
+            echo "CHURL=file:///$(printf '%s' "$CH" | tr '\\' '/')" >> "$GITHUB_ENV"
+          else
+            echo "CHURL=file://$CH" >> "$GITHUB_ENV"
+          fi
 
       - name: Create the environment
         run: |
@@ -291,7 +302,8 @@ jobs:
           # conda-forge IS required here, unlike the pure-session components: this package
           # run-depends on python and fourteen python libraries.  conda.qiyuan.me carries
           # isabelle, isabelle-rpc, isabelle-performant-ml and rocksdict.
-          conda create -y -n v -c "file://$CH" -c https://conda.qiyuan.me -c conda-forge \
+          echo "local channel: $CHURL"
+          conda create -y -n v -c "$CHURL" -c https://conda.qiyuan.me -c conda-forge \
             --override-channels isabelle-semantic-embedding
           conda list -n v | grep -E 'isabelle|rocksdict|python '
 
