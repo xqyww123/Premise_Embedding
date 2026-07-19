@@ -8,7 +8,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Isabelle_Semantic_Embedding"
-version = "0.1.0"
+# Read from ./VERSION rather than written here, because there are now two consumers:
+# the wheel and the conda recipe (conda/recipe.yaml, fed by release-conda.yml). Two
+# independent literals for one number is how they drift, and the drift is silent --
+# a conda package whose version disagrees with the dist-info it installs.
+dynamic = ["version"]
 description = "Isabelle Semantic Embedding"
 readme = "README.md"
 license = "LGPL-2.1-or-later"
@@ -75,6 +79,9 @@ dependencies = [
 
 [project.urls]
 "Homepage" = "https://github.com/xqyww123/Premise_Embedding"
+
+[tool.setuptools.dynamic]
+version = { file = "VERSION" }
 
 [tool.setuptools.packages.find]
 include = ["Isabelle_Semantic_Embedding", "Isabelle_Semantic_Embedding.*"]

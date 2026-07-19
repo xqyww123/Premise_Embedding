@@ -28,6 +28,22 @@ on:
       - "pyproject.toml"
       - ".github/workflows/wheels.yml"
   workflow_dispatch:
+  # release-conda.yml calls this to get the very wheels it packages, rather than
+  # reimplementing the two-toolchain build -- any drift between a copy and this file
+  # would be silent, and the failure it hides (five SIMD targets dropped by MSVC) is
+  # itself silent.
+  workflow_call:
+    inputs:
+      publish_to_pypi:
+        # A STRING with a sentinel default, not a boolean, and the reason is a real
+        # GitHub Actions trap: for a `push` event the `inputs` context is empty, and an
+        # unset boolean input compares EQUAL to false (expressions cast both to 0).  A
+        # boolean gate would therefore switch PyPI publishing off for the tag pushes it
+        # exists to serve.  A non-numeric string casts to NaN, so `!= 'no'` is true when
+        # unset and false only when a caller passes it explicitly.
+        description: "Pass 'no' to skip the PyPI publish (the conda release does)"
+        type: string
+        default: "yes"
 
 permissions:
   contents: read
@@ -367,7 +383,11 @@ jobs:
   # that fell back to it would fail confusingly. Platforms without a wheel here get
   # a clean "no matching distribution" instead.
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # `inputs.publish_to_pypi != 'no'` rather than a boolean test -- see the input's
+    # comment.  When release-conda.yml calls this workflow it passes 'no', because the
+    # tag push already ran this workflow standalone and that run owns the PyPI upload;
+    # a second attempt would fail on "file already exists".
+    if: startsWith(github.ref, 'refs/tags/v') && inputs.publish_to_pypi != 'no'
     needs: [wheel, intel-mac, abi3]
     runs-on: ubuntu-24.04
     environment: pypi

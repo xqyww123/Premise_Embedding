@@ -1,0 +1,328 @@
+schema_version: 1
+
+# isabelle-semantic-embedding: ONE package carrying both halves of this repo -- the
+# Isabelle session (ROOT + theories + Tools/ + the Scala component under etc/ and lib/)
+# and the Python package Isabelle_Semantic_Embedding with its two compiled artifacts.
+#
+# BOTH HALVES, ONE PACKAGE, for the isabelle-rpc reason and more so: Tools/simd_vector.ML
+# resolves the SIMD kernel's path by RPC into the Python package (simd_vector.ML:42-53 ->
+# semantics.py's @isabelle_remote_procedure "Vector_Arith.library_path"), and
+# Tools/semantic_store.ML's query_knn is a thin RPC to the Python side.  The ML half is
+# not merely less useful without the Python half; it raises "Fail to load the Isabelle
+# Vector library" (simd_vector.ML:227).
+#
+# NOT noarch.  The package carries libisabelle_vector.{so,dylib} / isabelle_vector.dll and
+# _vecgather.abi3.{so,pyd}, each pinned to one architecture.  It IS python-version
+# independent, via abi3 -- see build.python.version_independent below.
+#
+# THE TWO NATIVE ARTIFACTS ARE NOT BUILT HERE.  wheels.yml builds them on native runners
+# with the two toolchains that leg requires -- MinGW64 for the SIMD kernel, because
+# Highway marks AVX3 and above HWY_BROKEN_MSVC and MSVC would SILENTLY drop five targets;
+# MSVC for _vecgather, which is what setuptools drives -- and release-conda.yml hands the
+# resulting wheel to this recipe in conda/wheelhouse/.  Reproducing that dance inside a
+# conda build sandbox would buy nothing and would lose wheels.yml's SIMD-target
+# assertions, which are the checks that catch the silent failure.
+#
+# Nor is the wheel merely INSTALLED here for convenience: rebuilding from source would run
+# setup.py's bdist_wheel.get_tag, whose _platform_tag hard-requires universal2 on Mach-O
+# and whose _check_extension_arch then demands the same of _vecgather.  A per-subdir conda
+# build can satisfy neither.
+#
+# RELEASE DISCIPLINE, mandatory: the conda version must never fall BEHIND PyPI's.  If PyPI
+# gets ahead, `pip install -U` takes over, its uninstall removes conda's dist-info, and
+# the Isabelle half -- the session under share/, the pre-unlink hook, the etc/components
+# registration -- is orphaned beyond conda's reach.  PyPI is at 0.1.0; this starts at
+# 0.1.1, released to both channels together.
+
+context:
+  version: ${{ env.get("ISA_COMPONENT_VERSION", default="0.0.0") }}
+
+source:
+  - path: ../
+
+package:
+  name: isabelle-semantic-embedding
+  version: ${{ version }}
+
+build:
+  number: 0
+  python:
+    # ABI3 / CEP 20.  wheels.yml builds cp311-abi3 (setup.py, py_limited_api = cp311), so
+    # ONE artifact per subdir serves CPython 3.11 through 3.14 -- a claim wheels.yml's
+    # `abi3` job proves by importing this exact binary under all four.  Without this the
+    # matrix would be 5 subdirs x 4 pythons = 20 builds differing only in a python_abi pin.
+    version_independent: true
+  # Do not rewrite the compiled artifacts' load commands.  rattler-build relinks binaries
+  # by default so their rpaths point into the conda prefix; on macOS that fails outright
+  # on a wheel not linked with spare Mach-O header padding -- measured on the rocksdict
+  # repackaging, "larger updated load commands do not fit".  Our wheel has exactly that
+  # property (built by wheels.yml, not by conda) and its .dylib is fat universal2, which
+  # is the sharper case.
+  #
+  # The rewrite is pointless here anyway: the kernel links against system libraries and
+  # nothing in the prefix, and _vecgather is limited-API C.  There is no rpath wanting a
+  # fix.
+  dynamic_linking:
+    binary_relocation: false
+  script:
+    # python, NOT bash.  rattler-build has no bash in the build environment on Windows
+    # ("interpreter `bash` was not found"), and this is an ARCH package, so unlike the
+    # noarch siblings it really does build on a Windows runner.  Measured on the rocksdict
+    # repackaging, which hit exactly this.  One script for all five platforms.
+    interpreter: python
+    content: |
+      import os, pathlib, shutil, subprocess, sys, sysconfig
+
+      NAME = "isabelle-semantic-embedding"
+      SRC    = pathlib.Path(os.environ["SRC_DIR"])
+      PREFIX = pathlib.Path(os.environ["PREFIX"])
+      TARGET = os.environ["target_platform"]
+
+      def die(msg):
+          print(f"::error::{msg}")
+          raise SystemExit(1)
+
+      # --- the Python half ------------------------------------------------------
+      # The wheel THIS pipeline built, in THIS workflow run, on a native runner.  Not
+      # from PyPI.  --no-deps: conda resolves the dependencies, pip must not.
+      # glob "*.whl", NOT "Isabelle_Semantic_Embedding-*.whl".  setuptools >= 77
+      # normalises the distribution name in the filename, so the artifact is really
+      # `isabelle_semantic_embedding-0.1.1-cp311-abi3-...whl` -- lowercase.  pathlib's
+      # glob is case-sensitive on POSIX, so the capitalised pattern matched NOTHING on
+      # all four unix legs and only survived on win-64, where fnmatch normcases.  The
+      # directory holds exactly one artifact by construction (one download-artifact of
+      # one leg's wheel), so the count assertion is the real check.
+      whls = sorted((SRC / "conda" / "wheelhouse").glob("*.whl"))
+      if len(whls) != 1:
+          die(f"expected exactly one wheel in conda/wheelhouse/, found {[w.name for w in whls]}")
+      print("installing", whls[0].name)
+      subprocess.run([sys.executable, "-m", "pip", "install", str(whls[0]),
+                      "--no-deps", "--no-build-isolation", "-vv"], check=True)
+
+      # Assert BOTH compiled artifacts survived.  They come from different toolchains and
+      # are staged by different setuptools commands (build_py for the kernel, build_ext
+      # for the extension), so one can be missing while the other is fine -- and that
+      # failure would surface at run time, on a user's machine.
+      pkg = pathlib.Path(sysconfig.get_paths()["purelib"]) / "Isabelle_Semantic_Embedding"
+      kernel = {"linux": "libisabelle_vector.so",
+                "osx":   "libisabelle_vector.dylib",
+                "win":   "isabelle_vector.dll"}.get(TARGET.split("-")[0])
+      if kernel is None:
+          die(f"unhandled target_platform {TARGET}")
+      if not (pkg / kernel).is_file():
+          die(f"the SIMD kernel ({kernel}) did not ship")
+      if not list(pkg.glob("_vecgather*.so")) + list(pkg.glob("_vecgather*.pyd")):
+          die("the _vecgather extension module did not ship")
+      print("  OK  kernel +", "_vecgather present")
+
+      # --- the Isabelle half ----------------------------------------------------
+      # An explicit whitelist, NOT a whole-tree copy.  This working tree can hold >3 GB of
+      # untracked build output and DB snapshots (Tools/Vector_Arith/contrib/highway-*/build
+      # alone measured 1.2 GB, Isabelle_Semantic_Embedding.tar.zst 757 MB).  A CI checkout
+      # is clean; the whitelist is what makes that not matter.
+      dest = PREFIX / "share" / NAME
+      dest.mkdir(parents=True, exist_ok=True)
+
+      JUNK_SUFFIX = (".swp", ".swo", ".bak", ".ll", ".phi-cache", "~")
+
+      def junk(n):
+          return n.endswith(JUNK_SUFFIX) or n.startswith("#") or n.startswith(".#") \
+                 or n == "__pycache__"
+
+      def ignore(_dir, names):
+          return [n for n in names if junk(n)]
+
+      for f in ["ROOT", "Semantic_Embedding.thy", "Sledgehammer_Embedding.thy",
+                "Semantic_Collection_App.thy", "COPYING", "COPYING.LIB", "README.md"]:
+          shutil.copy2(SRC / f, dest / f)
+
+      # The Scala component.  etc/settings puts the jar on Isabelle's classpath;
+      # etc/build.props declares it with no_build = true (Isabelle will NOT compile it) and
+      # registers isabelle.semantic_embedding.PIDE_State_Functions as a service.  All three
+      # are required for `isabelle components -u` to yield a WORKING component: without
+      # etc/settings the jar never reaches the classpath and the service silently does not
+      # exist.  src/scala/ ships because build.props names it under `sources`.
+      for d in ["etc", "lib", "src"]:
+          shutil.copytree(SRC / d, dest / d, ignore=ignore, dirs_exist_ok=True)
+
+      # Tools/ wholesale rather than the nine ML_file lines: enumerating them is how an
+      # indirectly-referenced file gets silently dropped.  BUT Vector_Arith must go -- it
+      # is the C++ kernel's source tree plus vendored Highway, and a developer's checkout
+      # has build/ and hwybuild/ inside it.  The compiled kernel ships in site-packages,
+      # placed by the wheel; ML reaches it through the library_path RPC, never through
+      # this directory.
+      shutil.copytree(SRC / "Tools", dest / "Tools",
+                      ignore=lambda d, ns: ignore(d, ns) + (["Vector_Arith"] if pathlib.Path(d) == SRC / "Tools" else []),
+                      dirs_exist_ok=True)
+
+      # What must be present.  Two of these are loaded by the SHIPPED SESSION
+      # (semantic_store.ML and pide_state.ML, via Semantic_Embedding.thy); simd_vector.ML
+      # is not -- it is loaded only by Sledgehammer_Embedding.thy, which ROOT deliberately
+      # does not list, so it ships as source for users who load it with an explicit -d.
+      # Asserting it anyway is still worth it: it is the ML end of the kernel bridge, and
+      # dropping it would be silent.
+      for must in ["ROOT", "etc/settings", "etc/build.props", "lib/semantic_embedding.jar",
+                   "Tools/simd_vector.ML",     # ML end of the kernel bridge (not in ROOT)
+                   "Tools/semantic_store.ML",  # query_knn
+                   "Tools/pide_state.ML"]:     # Semantic_Embedding.thy:7
+          if not (dest / must).is_file():
+              die(f"{must} did not reach the component directory")
+      if (dest / "Tools" / "Vector_Arith").exists():
+          die("Tools/Vector_Arith leaked into the package")
+
+      # A size ceiling.  The failure this guards is a FAT package, not a broken one, and
+      # nothing else in the pipeline would notice.
+      #
+      # 2 MB, not 20.  Measured from `git ls-files`: the whitelisted set is ~519 KB, and
+      # the thing this guards against -- Tools/Vector_Arith -- is 9.2 MB TRACKED on a
+      # clean checkout.  (The 1.2 GB figure people quote is a developer's build/ and
+      # hwybuild/, which .gitignore excludes.)  A 20 MB ceiling therefore sails straight
+      # past the only leak that can actually happen on CI; it would have been decorative.
+      kb = sum(p.stat().st_size for p in dest.rglob("*") if p.is_file()) >> 10
+      if kb >= 2048:
+          die(f"component payload is {kb} KB -- something leaked")
+      print(f"  OK  component payload {kb} KB")
+
+      # --- link hooks -----------------------------------------------------------
+      # Verbatim in effect from isabelle-rpc / isabelle-performant-ml.  What is
+      # load-bearing:
+      #   * BOTH sets written unconditionally.  conda picks by the RUNNING platform and
+      #     returns success in SILENCE when the file is absent, so a .sh-only package
+      #     installs cleanly on Windows and is never registered.  (This is an arch
+      #     package, so unlike the noarch siblings a target_platform guard would actually
+      #     work here -- write both anyway.  Two files, one fewer class of "a fix that
+      #     looks applied and isn't".)
+      #   * the .bat is CRLF and exits /b 0 on every path: a nonzero post-link makes conda
+      #     roll the whole install back (measured, isabelle-packaging-ci run 29637825807).
+      #   * the path goes over in CYGWIN form: `isabelle components` parses it with
+      #     Path.explode, whose Path.check_elem rejects `:` and `\`.
+      #   * the throwaway `getenv -b ISABELLE_HOME` warm-up is the difference between the
+      #     hook working and silently doing nothing.  Cygwin heals on the FIRST isabelle
+      #     call, but that call's Java classpath is computed before the heal, so the first
+      #     invocation is precisely the one that cannot run a Scala tool -- and
+      #     `components` IS a Scala tool.  That matters doubly here: this component's
+      #     whole reason to be registered includes a Scala service.
+      (PREFIX / "bin").mkdir(parents=True, exist_ok=True)
+      (PREFIX / "Scripts").mkdir(parents=True, exist_ok=True)
+
+      for action, verb in [("post-link", "-u"), ("pre-unlink", "-x")]:
+          sh = PREFIX / "bin" / f".{NAME}-{action}.sh"
+          sh.write_text(
+              '#!/bin/bash\n'
+              f'"$PREFIX/isa/bin/isabelle" components {verb} "$PREFIX/share/{NAME}" 2>/dev/null \\\n'
+              f'  || echo "warning: \'isabelle components {verb} {NAME}\' failed; '
+              'the session may be unavailable"\n'
+              'exit 0\n', newline="\n")
+          sh.chmod(0o755)
+
+          bat = PREFIX / "Scripts" / f".{NAME}-{action}.bat"
+          bat.write_text("\r\n".join([
+              '@echo off',
+              f'set "COMP=%PREFIX%\\share\\{NAME}"',
+              'set "DL=%COMP:~0,1%"',
+              'set "REST=%COMP:~2%"',
+              'set "REST=%REST:\\=/%"',
+              'set "CYG=/cygdrive/%DL%%REST%"',
+              'call "%PREFIX%\\isa\\bin\\isabelle.bat" getenv -b ISABELLE_HOME >nul 2>&1',
+              f'call "%PREFIX%\\isa\\bin\\isabelle.bat" components {verb} "%CYG%" >nul 2>&1',
+              'exit /b 0',
+              '']), newline="")
+
+      post = (PREFIX / "bin" / f".{NAME}-post-link.sh").read_text()
+      if f"share/{NAME}" not in post:
+          die("the post-link hook does not name the component directory")
+      if b"\r\n" not in (PREFIX / "Scripts" / f".{NAME}-post-link.bat").read_bytes():
+          die("the .bat hook is not CRLF")
+
+requirements:
+  host:
+    # 3.11 is the abi3 floor (Py_buffer / PyObject_GetBuffer entered the limited API there
+    # and not earlier -- pybuffer.h).  Pinned exactly: with version_independent, the host
+    # python is what the abi3 tag is minted against.
+    - python 3.11.*
+    - pip
+    - setuptools >=77   # first setuptools reading `license` as an SPDX expression
+  run:
+    # .4, not .0: r2_sync's tar.zst extraction passes tarfile's `filter="data"`, the PEP
+    # 706 arg backported only to CPython 3.11.4.
+    - python >=3.11.4
+    # Bounded to the Isabelle SERIES this session and this Scala component are built
+    # against.  The base package keeps a constant name at a per-release version, so
+    # unbounded lets conda's newest-wins resolution pair this with a future Isabelle it
+    # was never built for.
+    - isabelle >=2025.2,<2025.3
+    # ROOT:1  session Semantic_Embedding = HOL + sessions Isabelle_RPC Performant_Isabelle_ML
+    # Session dependencies pyproject.toml cannot express.  isabelle-rpc is ALSO a pyproject
+    # dependency, and it comes from conda.qiyuan.me, not conda-forge.
+    - isabelle-rpc >=0.3.1
+    - isabelle-performant-ml >=0.1.0,<0.2.0
+    #
+    # The fourteen pyproject dependencies under their CONDA names.  TWO differ from PyPI,
+    # and in both cases the WRONG name resolves and installs green:
+    #
+    #   msgpack -> msgpack-python   (conda-forge has NO package called `msgpack`)
+    #   lmdb    -> python-lmdb      (conda-forge `lmdb` is the C LIBRARY, 0.9.x -- it
+    #                                installs green and dies at `import lmdb`.  This exact
+    #                                mistake already shipped a broken package in this
+    #                                project; see isabelle-rpc's recipe.)
+    #
+    # And `zstandard` is CORRECT as it stands -- there is no `python-zstandard` on
+    # conda-forge.  Do not "fix" it by analogy with the two above.
+    - msgpack-python
+    - python-lmdb >=2.1.1   # floor, not a pin: 2.1.0 raised a FALSE MDB_CORRUPTED on
+                            # values larger than a page (py-lmdb #431)
+    # rocksdict is NOT abi3 -- every wheel is tied to one CPython -- so it is what really
+    # bounds this package's python range.  conda-forge has it for three subdirs only, at
+    # 0.3.23; conda.qiyuan.me carries 0.3.29 for all five subdirs and CPython 3.11-3.14.
+    - rocksdict
+    - platformdirs
+    - transformers
+    - numpy
+    - faiss-cpu
+    - httpx
+    - diskcache
+    - claude-agent-sdk
+    - pyyaml
+    - boto3
+    - filelock
+    - zstandard
+
+tests:
+  - python:
+      imports:
+        - Isabelle_Semantic_Embedding
+      pip_check: true
+  - script:
+      # The import above proves site-packages was found.  These prove the two COMPILED
+      # artifacts are real and loadable on this host -- which is the whole reason this
+      # package is per-platform.  library_path() loads the kernel through ctypes and
+      # checks it exports top_k_q15_gather, so a stale or wrong-arch library fails HERE
+      # rather than at a user's first query.
+      - python -c "from Isabelle_Semantic_Embedding import _vecgather; print('_vecgather ok')"
+      - python -c "from Isabelle_Semantic_Embedding._vecarith import library_path; print('kernel:', library_path())"
+      # The console script must be on PATH -- `isabelle-semantics pull` is the documented
+      # way to fetch the semantic DB, and until 0.1.1 it was not runnable after an install.
+      - isabelle-semantics --help
+
+about:
+  homepage: https://github.com/xqyww123/Isabelle_Semantic_Embedding
+  summary: "Semantic retrieval for Isabelle: deformalization, a vector store, and a SIMD KNN kernel"
+  description: |
+    Semantic DB management, deformalization (Isabelle entities -> English via Claude),
+    and vector-based semantic retrieval for Isabelle/HOL.
+
+    This package ships both halves of the project: the Isabelle session and Scala
+    component, registered with `isabelle components -u` from a conda link hook, and the
+    Python package `Isabelle_Semantic_Embedding` with its Highway SIMD kernel and the
+    `_vecgather` extension module.  The ML side resolves and dlopens the very library the
+    Python side loads, so neither half is useful alone.
+
+    The ~1.5 GB semantic database is NOT part of this package.  It is per-user data with
+    its own lifecycle, distributed over Cloudflare R2.  Everything degrades gracefully
+    without it -- retrieval simply returns nothing -- and it is fetched with
+    `isabelle-semantics pull`.
+  license: LGPL-2.1-or-later
+  license_file:
+    - ../COPYING
+    - ../COPYING.LIB
+  repository: https://github.com/xqyww123/Isabelle_Semantic_Embedding

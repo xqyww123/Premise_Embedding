@@ -1,0 +1,393 @@
+# Build and publish isabelle-semantic-embedding to https://conda.qiyuan.me.
+#
+# This package is per-platform -- five subdirs -- because it carries two compiled
+# artifacts: the Highway SIMD kernel (libisabelle_vector.{so,dylib} / isabelle_vector.dll)
+# and the _vecgather CPython extension.  It is nonetheless ONE artifact per subdir rather
+# than one per (subdir, python), because _vecgather is abi3: see the recipe's
+# build.python.version_independent.
+#
+# The natives are NOT built here.  `natives` CALLS wheels.yml, which owns the
+# two-toolchain build (MinGW64 for the kernel, MSVC for _vecgather) and the assertions
+# that catch its silent failure mode.  Calling rather than copying is the point: a copy
+# would drift, and the drift would be invisible.
+#
+# Tag pushes run wheels.yml standalone as well -- that run owns the PyPI upload, and the
+# call from here passes publish_to_pypi='no' so the two do not race for the same
+# filename.  The natives are therefore built twice on a tag.  That is deliberate: it keeps
+# the proven PyPI release path untouched and keeps the two publishes from blocking each
+# other.
+name: release-conda
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and verify only -- do NOT publish"
+        type: boolean
+        default: true
+      build_number:
+        description: "BUMP if republishing the same VERSION"
+        type: string
+        default: "0"
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release-conda
+  cancel-in-progress: false
+
+# No top-level `permissions:` block, and it is NOT what makes the wheels.yml call safe.
+# Omitting the block does not grant `id-token: write` either -- the repo default is read,
+# which never includes it.  The call is safe purely because publish_to_pypi='no' SKIPS
+# wheels.yml's publish job, so its `id-token: write` block is never resolved.  Anyone
+# calling wheels.yml from here without passing 'no' gets "requesting 'id-token: write' but
+# only allowed 'id-token: none'", whatever this file declares.
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        # Step outputs do not cross jobs; this is exported through the job `outputs:`
+        # block above.
+        run: |
+          set -euo pipefail
+          v=$(tr -d '[:space:]' < VERSION)
+          [ -n "$v" ] || { echo "::error::VERSION is empty"; exit 1; }
+          case "$v" in *-*) echo "::error::conda versions cannot contain '-': $v"; exit 1 ;; esac
+          # pyproject reads this same file (tool.setuptools.dynamic), so the wheel and the
+          # conda package cannot disagree by construction.  Assert the tag agrees too.
+          if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
+            [ "${GITHUB_REF_NAME#v}" = "$v" ] \
+              || { echo "::error::tag ${GITHUB_REF_NAME} disagrees with VERSION ($v)"; exit 1; }
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "version $v"
+
+  # wheels.yml's own `wheel` job (plus its intel-mac and abi3 proofs), called -- not
+  # copied.  'no' keeps its PyPI publish from firing; see this file's header.
+  natives:
+    uses: ./.github/workflows/wheels.yml
+    with:
+      publish_to_pypi: "no"
+
+  conda-build:
+    needs: [natives, version]
+    name: "conda ${{ matrix.target.subdir }}"
+    runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # An object-valued key, NOT `include:`.  `include` entries whose keys do not
+        # appear in the base matrix are merged into every combination in order, each
+        # overwriting the last -- measured on release-rocksdict, where five platform
+        # entries produced three jobs all wearing the LAST platform.
+        #
+        # NATIVE runners throughout: rattler-build's target_platform defaults to the host,
+        # and the recipe's tests import the compiled extension, which cannot run under a
+        # foreign architecture.
+        #
+        # macos-15-intel, not macos-13: the macos-13 label is retired and a job asking for
+        # it queues forever without ever erroring.
+        #
+        # osx-64 and osx-arm64 take the SAME wheel: wheels.yml builds one universal2
+        # artifact for both, and its intel-mac job is what proves the x86_64 slice is real.
+        # conda has no fat-binary concept, so one wheel becomes two packages.
+        target:
+          - {subdir: linux-64,      runner: ubuntu-latest,   artifact: wheel-x86_64}
+          - {subdir: linux-aarch64, runner: ubuntu-24.04-arm, artifact: wheel-aarch64}
+          - {subdir: osx-64,        runner: macos-15-intel,  artifact: wheel-universal2}
+          - {subdir: osx-arm64,     runner: macos-15,        artifact: wheel-universal2}
+          - {subdir: win-64,        runner: windows-latest,  artifact: wheel-amd64}
+    defaults:
+      run:
+        shell: bash -l {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The wheel this same run built, into the directory `source: path: ../` carries into
+      # $SRC_DIR.  conda/wheelhouse/ must NOT be gitignored or it never gets there.
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.target.artifact }}
+          path: conda/wheelhouse
+
+      - name: Install rattler-build
+        run: |
+          set -euo pipefail
+          # Map explicitly; do NOT interpolate `uname -m`.  rattler-build's assets say
+          # `aarch64` where macOS says `arm64`, so the uname form 404s there while working
+          # on linux-aarch64 by pure coincidence.
+          case "${{ matrix.target.subdir }}" in
+            linux-64)      asset=rattler-build-x86_64-unknown-linux-musl ;;
+            linux-aarch64) asset=rattler-build-aarch64-unknown-linux-musl ;;
+            osx-64)        asset=rattler-build-x86_64-apple-darwin ;;
+            osx-arm64)     asset=rattler-build-aarch64-apple-darwin ;;
+            win-64)        asset=rattler-build-x86_64-pc-windows-msvc.exe ;;
+            *) echo "::error::no rattler-build asset mapped for ${{ matrix.target.subdir }}"; exit 1 ;;
+          esac
+          curl -fsSL -o rattler-build "https://github.com/prefix-dev/rattler-build/releases/download/v0.69.1/$asset"
+          chmod +x rattler-build
+          ./rattler-build --version
+
+      - name: Build
+        env:
+          ISA_COMPONENT_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ls -l conda/wheelhouse/
+          # --build-num, NOT --build-number: rattler-build exits 2 on the long form.
+          # conda.qiyuan.me is needed as well as conda-forge: isabelle-rpc and
+          # isabelle-performant-ml (and our rocksdict) live there, not on conda-forge.
+          ./rattler-build build \
+            --recipe conda/recipe.yaml \
+            --output-dir out \
+            --build-num "${{ inputs.build_number || '0' }}" \
+            -c https://conda.qiyuan.me -c conda-forge
+          find out -name '*.conda' -print
+
+      - name: "Sanity: the payload really contains both halves"
+        run: |
+          set -euo pipefail
+          pkg=$(find out -name 'isabelle-semantic-embedding-*.conda' | head -1)
+          [ -n "$pkg" ] || { echo "::error::no package produced"; exit 1; }
+          python3 -m pip install --quiet zstandard \
+            || python3 -m pip install --quiet --break-system-packages zstandard
+          work=$(mktemp -d)
+          # A .conda is a zip of two zstd tarballs; listing the zip shows only
+          # ['metadata.json','pkg-*.tar.zst','info-*.tar.zst'] and proves nothing.
+          python3 -c "import sys,zipfile,tarfile,io,zstandard; z=zipfile.ZipFile(sys.argv[1]); b=next(n for n in z.namelist() if n.startswith('pkg-') and n.endswith('.tar.zst')); r=zstandard.ZstdDecompressor().stream_reader(io.BytesIO(z.read(b))); tarfile.open(fileobj=io.BytesIO(r.read())).extractall(sys.argv[2])" "$pkg" "$work"
+
+          comp="$work/share/isabelle-semantic-embedding"
+          for f in ROOT etc/settings etc/build.props lib/semantic_embedding.jar \
+                   Tools/simd_vector.ML Tools/semantic_store.ML; do
+            [ -f "$comp/$f" ] || { echo "::error::missing $f"; find "$comp" | head -40; exit 1; }
+          done
+          [ ! -e "$comp/Tools/Vector_Arith" ] \
+            || { echo "::error::Tools/Vector_Arith leaked into the package"; exit 1; }
+
+          case "${{ matrix.target.subdir }}" in
+            linux-*) kernel=libisabelle_vector.so ;;
+            osx-*)   kernel=libisabelle_vector.dylib ;;
+            win-*)   kernel=isabelle_vector.dll ;;
+          esac
+          # No -maxdepth: the payload is lib/python3.X/site-packages/... on unix but
+          # Lib/site-packages/... on Windows.  A depth limit passes on one and fails the
+          # other on a perfectly good package.
+          find "$work" -name "$kernel" | grep -q . \
+            || { echo "::error::the SIMD kernel ($kernel) is not in the payload"; exit 1; }
+          find "$work" \( -name '_vecgather*.so' -o -name '_vecgather*.pyd' \) | grep -q . \
+            || { echo "::error::_vecgather is not in the payload"; exit 1; }
+          # -iname, not -name: setuptools >= 77 normalises the distribution name, so the
+          # directory is `isabelle_semantic_embedding-0.1.1.dist-info` -- lowercase.  The
+          # capitalised, case-sensitive form could never match, on any platform.
+          find "$work" -iname 'isabelle_semantic_embedding-*.dist-info' -type d | grep -q . \
+            || { echo "::error::no dist-info -- pip would not see this package"; exit 1; }
+          # The hooks: both sets, and the .bat really is CRLF.  The CRLF check is python
+          # rather than `grep -U` (-U is GNU-only and this step also runs on macOS), and
+          # it is ON ONE LINE: a multi-line -c body would have to start at column 0,
+          # which ends the enclosing YAML block scalar and makes the whole workflow
+          # unparseable.
+          for h in .isabelle-semantic-embedding-post-link .isabelle-semantic-embedding-pre-unlink; do
+            [ -f "$work/bin/$h.sh" ] || { echo "::error::missing bin/$h.sh"; exit 1; }
+            [ -f "$work/Scripts/$h.bat" ] || { echo "::error::missing Scripts/$h.bat"; exit 1; }
+            python3 -c "import sys; b=open(sys.argv[1],'rb').read(); sys.exit(0 if b'\r\n' in b else 1)" "$work/Scripts/$h.bat" \
+              || { echo "::error::Scripts/$h.bat is not CRLF"; exit 1; }
+          done
+          echo "  OK  both halves, both hook sets"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conda-${{ matrix.target.subdir }}
+          path: out/**/*.conda
+          if-no-files-found: error
+
+  # Install and USE each package BEFORE publishing.  Publishing is the point of no return:
+  # the channel never deletes, so a package with a broken post-link becomes the newest
+  # resolvable version and stays broken until someone hand-deletes the object from R2.
+  verify:
+    needs: [conda-build, version]
+    name: "verify ${{ matrix.target.subdir }}"
+    runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - {subdir: linux-64,      runner: ubuntu-latest}
+          - {subdir: linux-aarch64, runner: ubuntu-24.04-arm}
+          - {subdir: osx-64,        runner: macos-15-intel}
+          - {subdir: osx-arm64,     runner: macos-15}
+          - {subdir: win-64,        runner: windows-latest}
+    defaults:
+      run:
+        shell: bash -l {0}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: conda-${{ matrix.target.subdir }}
+          path: ${{ runner.temp }}/legs
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-update-conda: true
+
+      - name: Index a local channel and install from it
+        run: |
+          set -euo pipefail
+          CH="$RUNNER_TEMP/ch"
+          mkdir -p "$CH/${{ matrix.target.subdir }}" "$CH/noarch"
+          find "$RUNNER_TEMP/legs" -name '*.conda' -exec cp {} "$CH/${{ matrix.target.subdir }}/" \;
+          ls -l "$CH/${{ matrix.target.subdir }}/"
+          # Never bare `python`: setup-miniconda leaves /usr/bin/python first on PATH and
+          # conda_index is not installed there.  But the interpreter's path is NOT
+          # $CONDA/bin/python everywhere -- on Windows, Miniconda's layout is
+          # %CONDA%\python.exe with Scripts\ and Library\bin\ and NO bin/ at all.  The
+          # $CONDA/bin/python idiom is inherited from the sibling workflows, every one of
+          # which is ubuntu-only; this matrix includes Windows.
+          if [ "$RUNNER_OS" = Windows ]; then PY="$CONDA/python.exe"; else PY="$CONDA/bin/python"; fi
+          [ -x "$PY" ] || { echo "::error::no conda python at $PY"; ls "$CONDA"; exit 1; }
+          "$PY" -m pip install --quiet conda-index
+          "$PY" -m conda_index "$CH"
+          echo "CH=$CH" >> "$GITHUB_ENV"
+
+      - name: Create the environment
+        run: |
+          set -euo pipefail
+          # conda-forge IS required here, unlike the pure-session components: this package
+          # run-depends on python and fourteen python libraries.  conda.qiyuan.me carries
+          # isabelle, isabelle-rpc, isabelle-performant-ml and rocksdict.
+          conda create -y -n v -c "file://$CH" -c https://conda.qiyuan.me -c conda-forge \
+            --override-channels isabelle-semantic-embedding
+          conda list -n v | grep -E 'isabelle|rocksdict|python '
+
+      - name: "The component is REGISTERED (read it, do not infer)"
+        run: |
+          set -euo pipefail
+          eval "$(conda shell.bash hook)"; conda activate v
+          if [ "$RUNNER_OS" = Windows ]; then
+            ISA="$CONDA_PREFIX/Scripts/isabelle.bat"
+          else
+            ISA="$CONDA_PREFIX/bin/isabelle"
+          fi
+          # NOT $CONDA_PREFIX/isa/bin/isabelle -- that is the distribution's unix launcher,
+          # which ships on Windows too and which Git-Bash happily calls executable.
+          hu=$("$ISA" getenv -b ISABELLE_HOME_USER)
+          # On Windows `isabelle getenv` returns /cygdrive/c/...; Git-Bash wants /c/...
+          # GUARDED on the prefix rather than on $RUNNER_OS: an unconditional strip turns
+          # a path that is already in Git-Bash form into `/C:\Users\...` -- silently, and
+          # the grep below would then fail for a reason that has nothing to do with the
+          # hook.
+          case "$hu" in /cygdrive/*) hu="/${hu#/cygdrive/}" ;; esac
+          echo "ISABELLE_HOME_USER=$hu"
+          cat "$hu/etc/components"
+          grep -q 'isabelle-semantic-embedding' "$hu/etc/components" \
+            || { echo "::error::the post-link hook did not register the component"; exit 1; }
+
+      - name: "The Python half imports and the KERNEL loads"
+        run: |
+          set -euo pipefail
+          eval "$(conda shell.bash hook)"; conda activate v
+          # THE test for this package.  library_path() dlopens the kernel and checks it
+          # exports top_k_q15_gather, so a wrong-arch or missing library fails here.  The
+          # path must lie under site-packages: a path under Tools/Vector_Arith/build would
+          # mean a developer checkout leaked into the environment.
+          cd "$RUNNER_TEMP"
+          # ON ONE LINE.  A multi-line `-c` body would have to begin at column 0, which
+          # terminates this YAML block scalar and makes the entire workflow file
+          # unparseable -- GitHub then runs NOTHING and reports it only as a repo-level
+          # annotation, not as a failed run.
+          python -c "from Isabelle_Semantic_Embedding._vecarith import library_path; p=library_path(); print('kernel:', p); assert 'site-packages' in p.replace('\\\\','/'), p"
+          python -c "from Isabelle_Semantic_Embedding import _vecgather; print('_vecgather ok')"
+          isabelle-semantics --help > /dev/null && echo "  OK  console script on PATH"
+          # Without the dist-info, pip would fetch PyPI's copy over conda's files.
+          python -m pip install "Isabelle_Semantic_Embedding==${{ needs.version.outputs.version }}" 2>&1 \
+            | tee /tmp/pipout || true
+          grep -qi 'already satisfied' /tmp/pipout \
+            || { echo "::error::pip does not see the conda-installed package"; cat /tmp/pipout; exit 1; }
+
+      - name: "A fresh environment with NO semantic DB does not hard-fail"
+        run: |
+          set -euo pipefail
+          eval "$(conda shell.bash hook)"; conda activate v
+          cd "$RUNNER_TEMP"
+          # premise_selection.py opens its rocksdict cache without creating the PARENT
+          # directory (its `embed` does semantic_DB_dir() then Rdict(...), and
+          # _paths.semantic_DB_dir returns the override VERBATIM without makedirs), and on
+          # a truly fresh install nothing has created it yet.  This is the one plausible
+          # hard-fail site for a first-run user, and it is exactly the state a conda
+          # install leaves behind.
+          #
+          # This must EXERCISE that open, not merely import the module: the Rdict call
+          # lives inside the `embed` coroutine, so an import-only check touches no
+          # directory, never reads SEMANTIC_DB_DIR, and stays green against a package
+          # that hard-fails on a cold cache.  It was written that way first; that check
+          # was a bare importability test wearing this step's name.
+          export SEMANTIC_DB_DIR="$RUNNER_TEMP/fresh-db-does-not-exist"
+          [ ! -e "$SEMANTIC_DB_DIR" ] || { echo "::error::the probe dir must NOT pre-exist"; exit 1; }
+          cd "$RUNNER_TEMP"
+          python -c "import os, rocksdict; from rocksdict import Rdict; from Isabelle_Semantic_Embedding._paths import semantic_DB_dir; d=semantic_DB_dir(); print('db dir:', d, 'pre-exists:', os.path.isdir(d)); f=os.path.join(d,'probe_q15n95.db'); db=Rdict(f, options=rocksdict.Options(raw_mode=True)); db[b'k']=b'v'; db.close(); print('cold-cache open OK')"
+
+      - name: "The session BUILDS from the installed package"
+        if: ${{ !startsWith(matrix.target.subdir, 'win') }}
+        run: |
+          set -euo pipefail
+          eval "$(conda shell.bash hook)"; conda activate v
+          # No -c.  A clean build would delete session images; this is an incremental
+          # build in a throwaway runner environment.
+          isabelle build -v Semantic_Embedding
+          # A control: an invented session name must ERROR.  Without it, a `build` that
+          # silently did nothing would read as a pass.
+          if isabelle build -v Semantic_Embedding_No_Such_Session 2>/dev/null; then
+            echo '::error::the control passed -- isabelle build is not proving anything'
+            exit 1
+          fi
+          echo "  OK  session builds, control errors"
+
+  # publish-conda.yml takes ONE artifact laid out as <subdir>/*.conda, so the per-leg
+  # artifacts are merged into that shape here rather than teaching the shared workflow
+  # about matrices.
+  collect:
+    needs: verify
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: conda-*
+          path: ${{ runner.temp }}/legs
+      - name: Merge into <subdir>/ layout
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/merged"
+          find "$RUNNER_TEMP/legs" -name '*.conda' | while read -r f; do
+            sub=$(basename "$(dirname "$f")")
+            mkdir -p "$RUNNER_TEMP/merged/$sub"
+            cp "$f" "$RUNNER_TEMP/merged/$sub/"
+          done
+          find "$RUNNER_TEMP/merged" -name '*.conda' | sort
+          n=$(find "$RUNNER_TEMP/merged" -name '*.conda' | wc -l)
+          [ "$n" -eq 5 ] || { echo "::error::expected 5 packages, found $n"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conda-packages
+          path: ${{ runner.temp }}/merged/**/*.conda
+          if-no-files-found: error
+
+  publish:
+    needs: collect
+    if: ${{ !inputs.dry_run }}
+    uses: xqyww123/isabelle-packaging-ci/.github/workflows/publish-conda.yml@main
+    with:
+      artifact: conda-packages
+      package_name: isabelle-semantic-embedding
+    # Passed EXPLICITLY, never `secrets: inherit`: a reusable workflow receives the CALLING
+    # repo's secrets, and `inherit` forwards empty strings while disabling the callee's
+    # `required: true` checks -- so a missing secret becomes a silent no-op instead of a
+    # named failure.
+    secrets:
+      CONDA_R2_ACCESS_KEY_ID: ${{ secrets.CONDA_R2_ACCESS_KEY_ID }}
+      CONDA_R2_SECRET_ACCESS_KEY: ${{ secrets.CONDA_R2_SECRET_ACCESS_KEY }}
