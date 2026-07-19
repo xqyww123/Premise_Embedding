@@ -36,12 +36,21 @@ concurrency:
   group: release-conda
   cancel-in-progress: false
 
-# No top-level `permissions:` block, and it is NOT what makes the wheels.yml call safe.
-# Omitting the block does not grant `id-token: write` either -- the repo default is read,
-# which never includes it.  The call is safe purely because publish_to_pypi='no' SKIPS
-# wheels.yml's publish job, so its `id-token: write` block is never resolved.  Anyone
-# calling wheels.yml from here without passing 'no' gets "requesting 'id-token: write' but
-# only allowed 'id-token: none'", whatever this file declares.
+# `id-token: write` is required even though the job that uses it never runs.
+#
+# wheels.yml's publish job declares `permissions: id-token: write` for PyPI trusted
+# publishing, and this workflow calls wheels.yml.  GitHub validates a called workflow's
+# permission requests when it BUILDS THE RUN -- before any `if:` is evaluated -- so
+# publish being skipped by publish_to_pypi='no' does not help.  Without this block the
+# whole run dies as `startup_failure`, which reports as "This run likely failed because
+# of a workflow file issue" and produces no jobs and no readable annotation.  Measured:
+# run 29673364672.
+#
+# Granting it is safe: an OIDC token is minted only in a job that requests one, and the
+# only such job is skipped here.
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   version:
