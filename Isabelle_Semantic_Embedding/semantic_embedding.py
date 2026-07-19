@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 import httpx
 import numpy as np
 import lmdb
-import faiss
 import diskcache
 from ._paths import semantic_DB_dir
 
@@ -145,7 +144,17 @@ class Embedding_Provider(ABC):
 
     def _normalize(self, result: EmbedResult) -> EmbedResult:
         if self.normalize:
-            faiss.normalize_L2(result.vectors)
+            # numpy, not faiss.normalize_L2. This was the only faiss call left in the
+            # project -- retrieval is the SIMD LMDB scan, not a faiss index -- and it
+            # cost a dependency on faiss + libfaiss for one row-wise divide.
+            #
+            # Semantics match fvec_renorm_L2 exactly, including the part that is easy to
+            # get wrong: faiss scales a row only when its norm is > 0, leaving an
+            # all-zero row untouched rather than producing NaN. Hence `where=`.
+            # In-place, like faiss: callers rely on result.vectors being mutated.
+            v = result.vectors
+            n = np.linalg.norm(v, axis=1, keepdims=True)
+            np.divide(v, n, out=v, where=n != 0)
         return result
 
     def _apply_template(self, texts: list[str], role: str,

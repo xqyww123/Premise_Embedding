@@ -25,7 +25,7 @@ from Isabelle_Semantic_Embedding._paths import semantic_DB_dir
 from Isabelle_RPC_Host.universal_key import is_xor_prefixed_key
 
 # NOTE: Isabelle_Semantic_Embedding is imported lazily, inside the subcommands.
-# Importing it pulls in faiss, httpx and the Claude SDK — seconds of startup that
+# Importing it pulls in transformers, httpx and the Claude SDK — seconds of startup that
 # `list` and `remove` have no use for.
 
 CACHE_DIR = semantic_DB_dir()

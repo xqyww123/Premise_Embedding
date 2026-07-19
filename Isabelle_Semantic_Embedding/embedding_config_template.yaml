@@ -32,8 +32,8 @@ default_scores:
   llama-nv-embed-reasoning-3b: {score: 0.3, local: 0.5}
 
 # Per-model: L2-normalize the returned vectors. Required for models whose server
-# does NOT return unit vectors, so that faiss L2 distance maps to cosine (the
-# topk score formula 1 - dist/2 assumes unit vectors). Models not listed: false.
+# does NOT return unit vectors, so that L2 distance maps to cosine (the topk score
+# formula 1 - dist/2 assumes unit vectors). Models not listed: false.
 # NOTE: the existing Qwen/Qwen3-Embedding-8B vector store was built normalized;
 # do not flip this off for it.
 normalize:

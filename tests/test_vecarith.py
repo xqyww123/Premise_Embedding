@@ -6,7 +6,7 @@ learns that the extension module it just built can actually be imported by the
 interpreter the wheel claims to serve, and that the kernel beside it loads and
 computes. Nothing here needs Isabelle, a vector store, or the network.
 
-The package's ``__init__`` pulls in transformers, faiss and Isabelle_RPC_Host, none
+The package's ``__init__`` pulls in transformers and Isabelle_RPC_Host, none
 of which these artifacts depend on, so the submodules are loaded directly under a
 stub parent. That stub is not a convenience: making ``from . import _vecgather``
 resolve through the real package directory is precisely the step that fails on an

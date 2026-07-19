@@ -280,7 +280,6 @@ requirements:
     - platformdirs
     - transformers
     - numpy
-    - faiss-cpu
     - httpx
     - diskcache
     - claude-agent-sdk
@@ -293,18 +292,21 @@ tests:
   - python:
       imports:
         - Isabelle_Semantic_Embedding
-      # NO pip_check.  It is a false positive here and cannot be made to pass: conda-forge
-      # ships `faiss-cpu` as a 17 KB metapackage that pulls in `faiss`, and neither
-      # registers a pip `.dist-info`.  pip therefore reads our dist-info, looks for a
-      # distribution named faiss-cpu, finds none, and reports "requires faiss-cpu, which
-      # is not installed" -- about a package that IS installed and IS importable.
+      # pip_check defaults to TRUE -- deleting the line does not switch it off, only
+      # `pip_check: false` does.  It is left on, and it passes now that faiss is gone:
+      # conda-forge shipped `faiss-cpu` as a 17 KB metapackage pulling in `faiss`, with
+      # no pip `.dist-info` on either, so pip read our dist-info, looked for a
+      # distribution named faiss-cpu, found none, and failed every leg over a package
+      # that WAS installed and importable.
       #
-      # The script test below replaces it with something strictly stronger: pip_check
-      # reads metadata, whereas those lines EXECUTE the imports.  That is the actual
-      # failure mode this project has hit (naming conda's `lmdb`, the C library, instead
-      # of `python-lmdb`: it resolved, installed green, the session built, and only
-      # `import lmdb` failed -- which pip_check would not have caught either, since the
-      # dist-info requirement `lmdb` was nominally satisfied).
+      # Keeping it is worth something concrete: when it reported only that one name, it
+      # simultaneously proved the other thirteen requirements resolve to real
+      # distributions.  But it reads METADATA, so it cannot catch this project's actual
+      # failure mode -- naming conda's `lmdb` (the C library) instead of `python-lmdb`
+      # resolved, installed green, built the session, and died only at `import lmdb`,
+      # with the dist-info requirement nominally satisfied throughout.  The script test
+      # below covers that by EXECUTING the imports.  The two are complementary.
+      pip_check: true
   - script:
       # The import above proves site-packages was found.  These prove the two COMPILED
       # artifacts are real and loadable on this host -- which is the whole reason this
@@ -320,7 +322,7 @@ tests:
       # transformers are declared dependencies imported lazily at their use sites, so
       # nothing else here would notice if their conda names were wrong.
       - python -c "import Isabelle_Semantic_Embedding.semantic_embedding, Isabelle_Semantic_Embedding.r2_sync, Isabelle_Semantic_Embedding.experience_index, Isabelle_Semantic_Embedding.premise_selection; print('all package modules import')"
-      - python -c "import faiss, boto3, transformers, zstandard, filelock, platformdirs, diskcache, msgpack, lmdb, rocksdict, httpx, numpy, yaml, claude_agent_sdk; print('all declared dependencies import')"
+      - python -c "import boto3, transformers, zstandard, filelock, platformdirs, diskcache, msgpack, lmdb, rocksdict, httpx, numpy, yaml, claude_agent_sdk; print('all declared dependencies import')"
       # The console script must be on PATH -- `isabelle-semantics pull` is the documented
       # way to fetch the semantic DB, and until 0.1.1 it was not runnable after an install.
       - isabelle-semantics --help
