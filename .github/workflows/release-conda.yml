@@ -374,11 +374,33 @@ jobs:
           cd "$RUNNER_TEMP"
           python -c "import os, rocksdict; from rocksdict import Rdict; from Isabelle_Semantic_Embedding._paths import semantic_DB_dir; d=semantic_DB_dir(); print('db dir:', d, 'pre-exists:', os.path.isdir(d)); f=os.path.join(d,'probe_q15n95.db'); db=Rdict(f, options=rocksdict.Options(raw_mode=True)); db[b'k']=b'v'; db.close(); print('cold-cache open OK')"
 
+      # The Scala component this package registers is what makes the build step
+      # load-bearing, and it is EXACTLY the part that differs by platform.  This step used
+      # to be skipped on Windows for speed; 0.1.1 shipped a win-64 artifact whose
+      # etc/settings had been rewritten to CRLF by the Windows checkout, which put a
+      # carriage return into the classpath and left `isabelle build` unable to build ANY
+      # session there -- not even HOL.  Every other check in this job passed.  The cost of
+      # running it on Windows is minutes; the cost of skipping it was a broken release.
       - name: "The session BUILDS from the installed package"
-        if: ${{ !startsWith(matrix.target.subdir, 'win') }}
         run: |
           set -euo pipefail
           eval "$(conda shell.bash hook)"; conda activate v
+          # The specific regression, asserted before the build so its failure is
+          # unambiguous: a CR anywhere in the component's settings poisons every variable
+          # that file assigns, and the symptom (a path with a line break in the middle)
+          # looks nothing like its cause.
+          st="$CONDA_PREFIX/share/isabelle-semantic-embedding/etc/settings"
+          # python, not `grep -U`: -U is GNU-only and this step now runs on macOS too.
+          python -c "import sys; sys.exit(1 if b'\r' in open(sys.argv[1],'rb').read() else 0)" "$st" \
+            || { echo "::error::etc/settings contains a carriage return -- bash appends it to every variable that file assigns"; exit 1; }
+          # And the value that actually broke, read back from Isabelle's own settings
+          # machinery rather than inferred from the file.  Not <prefix>/isa/bin/isabelle:
+          # that is the distribution's unix launcher, which ships on Windows too.
+          if [ "$RUNNER_OS" = Windows ]; then ISA="$CONDA_PREFIX/Scripts/isabelle.bat"
+          else ISA="$CONDA_PREFIX/bin/isabelle"; fi
+          "$ISA" getenv -b ISABELLE_SEMANTIC_EMBEDDING_HOME > /tmp/seh
+          python -c "import sys; sys.exit(1 if b'\r' in open(sys.argv[1],'rb').read() else 0)" /tmp/seh \
+            || { echo "::error::ISABELLE_SEMANTIC_EMBEDDING_HOME carries a carriage return"; od -c /tmp/seh; exit 1; }
           # No -c.  A clean build would delete session images; this is an incremental
           # build in a throwaway runner environment.
           isabelle build -v Semantic_Embedding

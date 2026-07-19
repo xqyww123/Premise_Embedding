@@ -1,0 +1,36 @@
+# Line endings are LF in the repository AND in every working tree, on every platform.
+#
+# This is not a style preference.  `etc/settings` is an Isabelle component settings file,
+# which bash SOURCES.  When bash sources a CRLF file, the trailing carriage return becomes
+# part of the last token on the line, so
+#
+#     ISABELLE_SEMANTIC_EMBEDDING_HOME="$COMPONENT"
+#
+# assigns the component path plus a CR.  The next line appends "/lib/semantic_embedding.jar"
+# to it, putting the CR in the MIDDLE of a path, and Isabelle rejects the classpath with
+#
+#     *** Illegal char <\r> at index 100: ...isabelle-semantic-embedding<CR>\lib\...jar
+#
+# after which EVERY Scala-backed entry point fails -- `isabelle build` could not build any
+# session at all, not even HOL.
+#
+# How it happened: the win-64 conda leg runs on windows-latest, where git's core.autocrlf
+# defaults to true, so actions/checkout rewrote this LF file to CRLF; the recipe then
+# copied those bytes into the package verbatim.  The linux and macOS legs were unaffected,
+# which is why the same source produced one broken artifact out of five.  Shipped as
+# isabelle-semantic-embedding 0.1.1 and found only when isabelle-minilang's Windows smoke
+# could not register its own component.
+#
+# `text=auto eol=lf` covers the whole tree rather than just etc/settings, because the same
+# hazard applies to anything else a shell or Isabelle reads, and because the file that
+# bites you is the one nobody thought to list.
+* text=auto eol=lf
+
+# Genuinely binary: never touch these.
+*.jar    binary
+*.so     binary
+*.dylib  binary
+*.dll    binary
+*.zst    binary
+*.png    binary
+*.pdf    binary
