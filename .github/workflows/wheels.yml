@@ -337,7 +337,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11" # also the abi3 floor: the wheel must load here
+          # The package floor (pyproject requires-python), not the abi3 floor. This said
+          # "3.11" and pip now refuses the wheel there -- correctly, because four modules
+          # need PEP 695 syntax. What this job exists to prove is the x86_64 SLICE of the
+          # fat kernel, which is a property of the binary and is unaffected by the
+          # interpreter version.
+          python-version: "3.12"
       - uses: actions/download-artifact@v4
         with: { name: wheel-universal2, path: dist }
       - shell: bash

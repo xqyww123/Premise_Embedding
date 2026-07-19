@@ -45,15 +45,18 @@ jobs:
       matrix:
         include:
           # Each wheel gets a host that can actually run it, and between them the
-          # rows cover every interpreter the cp311-abi3 tag promises to serve.
-          - { runner: ubuntu-24.04, python: "3.11", label: linux-x86_64 }
+          # rows cover every interpreter this package supports.  That range starts at
+          # 3.12 -- the PACKAGE floor (PEP 695 syntax in four modules), which is above
+          # the cp311-abi3 tag's ABI floor.  Rows pinned to 3.11 failed once pip began
+          # honouring the corrected requires-python.
+          - { runner: ubuntu-24.04, python: "3.12", label: linux-x86_64 }
           - { runner: ubuntu-24.04, python: "3.14", label: linux-x86_64 }
           - { runner: ubuntu-24.04-arm, python: "3.12", label: linux-aarch64 }
           - { runner: macos-15, python: "3.12", label: macos-arm64 }
           # The one host that can tell a real x86_64 slice from a universal2 tag.
           # macos-15-intel: the macOS 13 image is retired, and a job requesting a dead
           # label queues indefinitely instead of failing.
-          - { runner: macos-15-intel, python: "3.11", label: macos-intel }
+          - { runner: macos-15-intel, python: "3.12", label: macos-intel }
           - { runner: windows-2022, python: "3.13", label: windows-amd64 }
 
     steps:
@@ -109,7 +112,7 @@ jobs:
     steps:
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11" # the floor: resolution must succeed at the boundary
+          python-version: "3.12" # the floor: resolution must succeed at the boundary
 
       - name: Every dependency exists and is satisfiable
         shell: bash
