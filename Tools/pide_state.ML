@@ -149,12 +149,39 @@ fun absolutize_id_based_pos {write_to_temp_file} positions =
 
 (* Expand Isabelle path variables and make absolute.
    Fast path: skip if already an absolute path without variables. *)
+(* NORMALISE FIRST.  `s` reaches here from outside ML -- Position.file_of, or a path
+   Python sent back after receiving it from Theory_Structure.get_theory_file_path, which
+   is deliberately a PLATFORM path because Python does native file I/O.  On Windows that
+   is `C:\...`, which fails the `isPrefix "/"` test, falls through to Path.explode, and
+   raises: Path.check_elem rejects `:` and `\`.  Four SCALA callbacks reach this --
+   hover_message, goto_definition, entity_at_position, command_at_position -- so on
+   Windows they threw rather than degraded.  Those four want the result in Isabelle's
+   INTERNAL form, which is what this returns: pide_state.scala matches it against
+   `version.nodes … _.node` and feeds it to `Path.explode`.
+
+   The two RPC consumers are NOT these: offset_to_line_column and line_column_to_offset
+   send the string over MessagePack to position.py, which does `os.path.realpath` and
+   `open` in NATIVE Python.  Internal form is exactly wrong there, so those two go through
+   rpc_path, which composes this function with a conversion back to platform form.
+
+   ML_System.standard_path is the sanctioned normalisation for a string from outside
+   Isabelle's path world (Isabelle uses it that way at Pure/General/file.ML:76 for the OS
+   cwd, and Pure/ML/exn_properties.ML:27 for PolyML's messages).  It is shape-agnostic --
+   C:\x, C:/x and /cygdrive/c/x all normalise, `~~/...` passes through untouched -- and
+   on non-Windows it is `fn path => path`, so every line below behaves exactly as before
+   on Linux and macOS.
+
+   Note the fast path is applied to the NORMALISED string, which is the point: a Windows
+   platform path becomes /cygdrive/c/... and then takes the fast path, as it should. *)
 fun expand_path s =
   if s = "" then ""
-  else if String.isPrefix "/" s andalso not (Char.contains s #"$")
-    andalso not (String.isSubstring "./" s)
-  then s
-  else File.absolute_path (Path.explode s) |> Path.implode;
+  else
+    let val s = ML_System.standard_path s in
+      if String.isPrefix "/" s andalso not (Char.contains s #"$")
+        andalso not (String.isSubstring "./" s)
+      then s
+      else File.absolute_path (Path.explode s) |> Path.implode
+    end;
 
 (* Extract file path and offset from a Position.T, absolutizing if needed *)
 fun pos_file_offset pos =
@@ -223,11 +250,25 @@ val line_column_to_offset_cmd :
 
 end (*local MessagePack*)
 
+(* PLATFORM path, not expand_path's internal form.  The receiver is position.py, which
+   does os.path.realpath + open in native Python, so on Windows expand_path's
+   /cygdrive/c/... would be a guaranteed FileNotFoundError.  Composing over expand_path
+   keeps the variable-expansion and absolutisation it does, then converts at the boundary.
+
+   ML_System.platform_path, NOT File.platform_path.  The latter takes a Path.T, which
+   would mean exploding expand_path's result -- but expand_path's fast path deliberately
+   returns the string WITHOUT exploding it, and Path.check_elem rejects ' ? * < > | " ,
+   every one of which is a legal POSIX filename character.  Routing through Path.T would
+   therefore turn working Linux calls into hard errors (neither caller has a \<^try>).
+   ML_System.platform_path is string -> string and is `fn path => path` off Windows, so
+   this really is a no-op there. *)
+fun rpc_path file_path = ML_System.platform_path (expand_path file_path);
+
 fun offset_to_line_column file_path offset =
-  Remote_Procedure_Calling.call_command offset_to_line_column_cmd (expand_path file_path, offset);
+  Remote_Procedure_Calling.call_command offset_to_line_column_cmd (rpc_path file_path, offset);
 
 fun line_column_to_offset file_path line column =
-  Remote_Procedure_Calling.call_command line_column_to_offset_cmd (expand_path file_path, line, column);
+  Remote_Procedure_Calling.call_command line_column_to_offset_cmd (rpc_path file_path, line, column);
 
 (* Goto definition and hover message: Scala handles both live PIDE + DB fallback *)
 
@@ -325,13 +366,46 @@ fun toplevel_state_at_position file_path symbol_offset =
 
 (* --- Re-evaluation cache for finished theories --- *)
 
+(* The FILE PROPERTY Position.file sets (position.ML:148 -- `label` is a separate field,
+   read elsewhere in this file via Position.label_of).
+
+   Isabelle has TWO conventions for it, and this picks one deliberately.  The loader path
+   uses the symbolic form (`~~/src/...`): Build/resources.ML:315,334, ML/ml_context.ML:216
+   and Thy/thy_info.ML:368 all spell it `Position.file (File.symbolic_path path)`.  The
+   PIDE path instead labels with the document node name: PIDE/document.ML:773,
+   PIDE/command.ML:64, Build/resources.ML:340.  Since these positions are produced by
+   re-lexing a file we just read from disk -- a loader-shaped act, not a document-node one
+   -- the symbolic form is the closer fit, and it is what makes messages readable
+   (File.symbolic_path folds prefixes listed in ISABELLE_DIRECTORIES, file.ML:51).
+   Either way this is cosmetic: the offsets are independent of the name, verified.
+
+   FALLS BACK to the raw string, deliberately.  This value is display text -- it reaches
+   error messages and PIDE markup, and callers here only ever read Position.offset_of
+   back out -- while Path.explode rejects ' ? * < > | " (path.ML:71), every one of them
+   legal in a POSIX filename.  A strict version would turn a cosmetic improvement into a
+   hard failure on Linux for such a file.  So: nicer name when it is derivable, the raw
+   string when it is not.  (Not *exactly* the previous behaviour in every case -- where
+   explode succeeds on a degenerate input the string is rewritten, e.g. "" becomes "."
+   and "./Foo.thy" becomes "Foo.thy".  None of these reach here: File.read rejects them
+   first.) *)
+fun file_label file_path =
+  the_default file_path
+    (try (File.symbolic_path o Path.explode o ML_System.standard_path) file_path);
+
 (* Cache: file_path -> sorted list of (symbol_offset, Toplevel.state).
-   Populated on first access by re-evaluating the theory from its parents. *)
+   Populated on first access by re-evaluating the theory from its parents.
+
+   KEYED ON THE NORMALISED PATH.  The same file arrives from the wire spelled either way
+   on Windows (`C:\...` as Python sends it, `/cygdrive/c/...` after normalisation), and a
+   raw key would file those as two distinct theories -- not a correctness bug, but
+   build_reeval_cache replays an entire theory, so a spurious miss costs minutes.
+   Identity on Linux and macOS, where the two spellings coincide. *)
+fun cache_key file_path = ML_System.standard_path file_path;
 val reeval_cache : (int * Toplevel.state) list Symtab.table Synchronized.var =
   Synchronized.var "PIDE_State.reeval_cache" Symtab.empty;
 
 fun lookup_reeval_cache file_path symbol_offset =
-  case Symtab.lookup (Synchronized.value reeval_cache) file_path of
+  case Symtab.lookup (Synchronized.value reeval_cache) (cache_key file_path) of
     NONE => NONE
   | SOME entries =>
       let fun find [] = NONE
@@ -352,18 +426,29 @@ fun lookup_reeval_cache file_path symbol_offset =
    SCOPE, precisely: this fixes the callers that reach theory_of_file -- the
    position_context_unpacker / context_at_position route, and build_reeval_cache, which
    calls theory_of_file OUTSIDE its own \<^try> and so genuinely crashed.  It does NOT
-   fix hover_message, goto_definition, entity_at_position or command_at_position: those
-   reach the same platform string through `expand_path`, which explodes it separately and
-   is a distinct fix.  Do not read this comment as covering them.
+   cover hover_message, goto_definition, entity_at_position or command_at_position:
+   those reach the same platform string through `expand_path`, which was fixed separately
+   (see its own comment above).  Do not read this comment as covering them.
 
-   ML_System.standard_path is the sanctioned normalisation for a string that came from
-   outside Isabelle's path world -- Isabelle itself uses it in exactly that role at
-   Pure/General/file.ML:76 (the OS cwd) and Pure/ML/exn_properties.ML:27 (PolyML's
-   compiler messages).  It is shape-agnostic: C:\x, C:/x and /cygdrive/c/x all normalise,
-   and on non-Windows it is `fn path => path`. *)
+   Why ML_System.standard_path is the right tool for a string from outside Isabelle's
+   path world, and why it is a no-op on Linux and macOS: see expand_path's comment above.
+   The reasoning is identical and is not repeated here. *)
+(* NONE, not an exception, when the path will not explode.  Path.explode rejects
+   ' * ? < > | " and a mid-element $ (path.ML:71) -- all legal in a POSIX filename, and
+   Isabelle itself opens such files happily (verified: a theory under a directory named
+   Don't_Touch loads clean).  standard_path only removes the WINDOWS-specific offenders
+   `:` and `\`; it does nothing about these, on any platform.
+
+   This used to raise, and build_reeval_cache calls it OUTSIDE its own \<^try> (below), so
+   the error escaped to the RPC boundary as an unexplained "Illegal character" for anyone
+   whose project sat under such a directory.  The return type was already string option
+   and every caller already handles NONE, so NONE is both the honest and the cheap
+   answer. *)
 fun theory_of_file file_path =
+  case try (Path.explode o ML_System.standard_path) file_path of
+    NONE => NONE
+  | SOME target =>
   let
-    val target = Path.explode (ML_System.standard_path file_path)
     fun matches name =
       \<^try>\<open>
         let val thy = Thy_Info.get_theory name
@@ -385,8 +470,9 @@ fun theory_of_file file_path =
 
    Coordinate contract: the returned (start, end) are 1-based, file-global
    *symbol* offsets, matching the live branch (src/scala/pide_state.scala:104
-   uses var pos = 1).  We obtain this by lexing with Position.file file_path,
-   whose offset starts at 1 (Pure/General/position.ML:163). *)
+   uses var pos = 1).  We obtain this by lexing with Position.file, whose offset starts
+   at 1 (Pure/General/position.ML:163) -- independently of the name it is given, so
+   file_label's fallback cannot affect the coordinate contract. *)
 
 (* Keywords for lexing the WIP file:
      1. preferred: the real theory matched by theory_of_file, via
@@ -399,7 +485,7 @@ fun keywords_of_wip_file file_path text =
     SOME thy_name => Thy_Header.get_keywords (Thy_Info.get_theory thy_name)
   | NONE =>
       let
-        val text_pos = Position.file file_path
+        val text_pos = Position.file (file_label file_path)
         val header = Thy_Header.read text_pos text
         (* resolve each import to a loaded theory by base-name match *)
         val loaded = Thy_Info.get_names ()
@@ -444,7 +530,7 @@ fun keywords_of_wip_file file_path text =
 fun command_spans_of_text file_path text : (string * int * int) list =
   \<^try>\<open>
     let
-      val tpos = Position.file file_path
+      val tpos = Position.file (file_label file_path)
       val kws = keywords_of_wip_file file_path text
       val toks = Token.explode kws tpos text
       val spans = Outer_Syntax.parse_spans toks
@@ -476,7 +562,12 @@ fun command_spans_of_text file_path text : (string * int * int) list =
   \<close>;
 
 fun command_spans_of_file file_path : (string * int * int) list =
-  \<^try>\<open>command_spans_of_text file_path (File.read (Path.explode file_path))
+  (* standard_path: file_path arrives from the wire and is a PLATFORM path on Windows.
+     Without it Path.explode raises and the \<^try> below turns that into [] plus a
+     warning naming this function -- so command spans degrade to nothing there, with the
+     cause visible only to whoever reads the warnings. *)
+  \<^try>\<open>command_spans_of_text file_path
+      (File.read (Path.explode (ML_System.standard_path file_path)))
     catch exn =>
       (warning ("PIDE_State.command_spans_of_file: " ^ Runtime.exn_message exn); [])\<close>;
 
@@ -538,9 +629,18 @@ fun build_reeval_cache file_path =
       \<^try>\<open>
         let
           val thy = Thy_Info.get_theory thy_name
-          val path = Path.explode file_path
+          (* standard_path for the same reason as command_spans_of_file above: a raw
+             platform path raises here, and this function's \<^try> turns that into []
+             plus a warning -- the re-eval cache just stops working on Windows. *)
+          val path = Path.explode (ML_System.standard_path file_path)
           val text = File.read path
-          val text_pos = Position.file file_path
+          (* No try around symbolic_path here -- but NOT because holding a Path.T makes it
+             total.  It is not: symbolic_path runs Path.expand, which calls getenv_strict
+             and errors on an unset variable (path.ML:228-236), so a filename containing
+             `$` would raise.  It is safe only because File.read on the line above runs
+             the same Path.expand and raises first.  Reordering these two lines would make
+             that live; file_label exists for the sites that have no such predecessor. *)
+          val text_pos = Position.file (File.symbolic_path path)
           val header = Thy_Header.read text_pos text
           val parents = Theory.parents_of thy
           val master_dir = Resources.master_directory thy
@@ -559,7 +659,7 @@ fun build_reeval_cache file_path =
           val _ = writeln ("PIDE_State: cached " ^ string_of_int (length entries) ^
             " states for " ^ thy_name)
         in
-          Synchronized.change reeval_cache (Symtab.update (file_path, entries));
+          Synchronized.change reeval_cache (Symtab.update (cache_key file_path, entries));
           entries
         end
         catch exn => (warning ("PIDE_State.build_reeval_cache: " ^ Runtime.exn_message exn); [])
@@ -567,7 +667,7 @@ fun build_reeval_cache file_path =
 
 fun reeval_context_at_position file_path symbol_offset =
   let
-    val entries = case Symtab.lookup (Synchronized.value reeval_cache) file_path of
+    val entries = case Symtab.lookup (Synchronized.value reeval_cache) (cache_key file_path) of
         SOME e => e
       | NONE => build_reeval_cache file_path
   in
