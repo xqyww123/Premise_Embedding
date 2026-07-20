@@ -19,7 +19,6 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     CLINotFoundError,
     HookMatcher,
-    ProcessError,
     ThinkingConfigAdaptive,
     create_sdk_mcp_server,
     tool,
@@ -978,9 +977,13 @@ async def _run_agent(options: ClaudeAgentOptions, depth: int = 0) -> None:
         # unrecognised agent error.  Recycling cannot change any of these outcomes;
         # it would only burn 8 x 2 s and bury the cause under the last failure.
         raise
-    except (CLINotFoundError, ProcessError) as e:
-        # The CLI is missing or exited non-zero.  Deterministic: not worth a retry.
-        raise FatalAgentError(None, f"Claude Code CLI failure: {e}") from e
+    except CLINotFoundError as e:
+        # No CLI to run: deterministic, and no amount of recycling conjures one.
+        # ProcessError is deliberately NOT here -- the SDK raises it for EVERY non-zero
+        # exit (subprocess_cli.py:700-707), including an OOM kill or a segfault
+        # mid-stream, which a fresh subprocess recovers from.  Those keep falling to the
+        # bounded recycle handler below.
+        raise FatalAgentError(None, f"Claude Code CLI not found: {e}") from e
     except Exception:
         # An unexpected transport/SDK failure can escape receive_response with
         # no preceding error ResultMessage, bypassing the loops above and

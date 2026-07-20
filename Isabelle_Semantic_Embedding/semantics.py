@@ -120,6 +120,10 @@ persist_wip: bool = os.getenv("SEMANTIC_PERSIST_WIP", "") != ""
 # lowest ceiling anywhere in the tree (semantics_manage's `remove` used 1<<33).
 SEMANTICS_MAP_SIZE: int = 1 << 32   # 4 GiB
 
+# How many theory names the "not interpreted" warning spells out before eliding.
+# Enough to act on, short enough that the remedy at the end stays visible.
+_WARN_THEORY_LIMIT: int = 10
+
 
 def _iter_vector_store_envs() -> 'Iterator[lmdb.Environment]':
     """Every ``vector_*.lmdb`` store on disk, as an open (process-cached) environment.
@@ -1240,10 +1244,48 @@ class Semantic_Vector_Store(Vector_Store):
         if not gate:
             n_blocked = len(missing) - len(ready)
             if n_blocked:
-                await self.connection.warning(
-                    f"[Semantic_Embedding] {n_blocked} entities missing semantic embeddings, "
-                    f"but auto_interpret_for_embedding is disabled. "
-                    f"Set [[auto_interpret_for_embedding = true]] to enable automatic interpretation and embedding.")
+                # Name the theories, not just a count of entities: the count says
+                # something is missing, the names say what to do about it -- they are
+                # what the user feeds to `run_semantic_interpretation`.  Same filtering
+                # as the gate-on branch above (skip xor-prefixed keys, the current
+                # theory, and infra theories), so both paths report the same set.
+                from Isabelle_RPC_Host.universal_key import is_xor_prefixed_key
+                from Isabelle_RPC_Host.context import theory_long_name
+                ready_keys = {k for k, _ in ready}
+                blocked: dict[bytes, int] = {}
+                for k in missing:
+                    if k in ready_keys or is_xor_prefixed_key(k):
+                        continue
+                    th = destruct_key(k).theory
+                    if not Semantic_DB.is_thy_interpreted(th):
+                        blocked[th] = blocked.get(th, 0) + 1
+                current_thy = await theory_long_name(self.connection)
+                named: list[tuple[str, int]] = []
+                for th, n in blocked.items():
+                    name = await self.connection.callback("Theory_Hash.theory_name_of", th)
+                    if name is not None and name != current_thy and not is_thy_skipped(name):
+                        named.append((name, n))
+                # Warn only when we can NAME something.  n_blocked alone is the wrong
+                # trigger: it counts the keys this filter deliberately drops (current
+                # theory, skipped infra theories, unknown hashes, xor-prefixed thm keys),
+                # none of which `run_semantic_interpretation` can ever resolve.  Firing on
+                # those produced "0 theories and 4 entities ... : " -- a dangling colon,
+                # an empty list, and a remedy that does nothing -- on every single lookup,
+                # permanently, with no way for the user to clear it.  Count entities over
+                # the SAME named set too, so the two numbers cannot disagree.
+                if named:
+                    named.sort()
+                    names = [nm for nm, _ in named]
+                    n_ents = sum(n for _, n in named)
+                    shown = ", ".join(names[:_WARN_THEORY_LIMIT])
+                    more = (f", ... (and {len(names) - _WARN_THEORY_LIMIT} more)"
+                            if len(names) > _WARN_THEORY_LIMIT else "")
+                    await self.connection.warning(
+                        f"[Semantic_Embedding] {len(names)} theories and {n_ents} entities "
+                        f"have not been interpreted or embedded: {shown}{more}\n"
+                        f"These gaps can significantly degrade AoA's performance, though they "
+                        f"do not stop it from working.\n"
+                        f"Run `run_semantic_interpretation` to interpret and embed them.")
         if not ready:                                    # C1: nothing embeddable -> do NOT mark theories
             if gate:
                 await self.connection.tracing(
