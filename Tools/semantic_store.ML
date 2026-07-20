@@ -33,6 +33,12 @@ signature SEMANTIC_STORE = sig
   val collect_cone : theory list -> theory list
   val schedule_dag : string -> (theory -> unit -> 'a) -> theory list -> 'a list
 
+  (* The theories in the ancestor cone of `roots` that actually need interpretation:
+     exactly the work set interpret_with_parallel will act on.  Lets a caller size the
+     job -- and ask the user about it -- before committing to LLM spend.  Costs one
+     `Semantic_Store.is_interpreted` RPC per cone node. *)
+  val plan_interpretation : bool -> theory list -> theory list
+
   (* Remove all LMDB entries whose theory hashes are non-persistent
      (i.e., from non-loaded theories). Returns the number of entries deleted. *)
   val clean_wip : unit -> int
@@ -64,6 +70,10 @@ signature SEMANTIC_STORE = sig
      Empty string means disabled (use env var RERANKER_MODEL or no reranking). *)
   val reranker_model : string Config.T
 
+  (* Config option: echo interpretation-progress / token-usage chatter to the
+     output panel.  Off by default; `declare [[Semantic_Store_verbose]]`. *)
+  val Semantic_Store_verbose : bool Config.T
+
   (* Search k nearest entities by semantic similarity to a query string.
      Returns ((score, entity) list, warnings). Warnings include notices about
      undeclared free variables in term patterns. *)
@@ -88,6 +98,11 @@ signature SEMANTIC_STORE = sig
      theory-key component is the XOR of those hashes), [] for all other
      kinds; it is stored in the record for deletion/migration by theory.
      Exposed for tests. *)
+  (* Pull the human-readable part out of a Python failure message, when Python
+     marked it as already actionable (USER_ERROR_MARKER).  NONE means "unclassified,
+     keep the traceback".  Exposed for tests. *)
+  val extract_user_error : string -> string option
+
   val build_entries : Context.generic ->
     (Universal_Key.entity * string * Position.T * Universal_Key.universal_key * int option) list ->
     (Universal_Key.entity * string * string * int * Universal_Key.universal_key * string
@@ -159,6 +174,18 @@ val reranker_model = Attrib.setup_config_string
   \<^binding>\<open>reranker_model\<close> (K "")
 val _ = Config.register_rpc_option "Semantic_Embedding.reranker_model"
           (Config.string_value reranker_model)
+
+(* Whether Semantic_Store echoes its interpretation-progress / token-usage
+   chatter to the output panel.  false (default) — quiet, which is what callers
+   embedding this in a larger run (notably the `aoa` method) want; enable with
+   `declare [[Semantic_Store_verbose]]` when diagnosing the store itself. *)
+val Semantic_Store_verbose = Attrib.setup_config_bool
+  \<^binding>\<open>Semantic_Store_verbose\<close> (K false)
+
+fun vtracing context msg =
+  if Config.get_generic context Semantic_Store_verbose then tracing msg else ()
+fun vtracing_global thy msg =
+  if Config.get_global thy Semantic_Store_verbose then tracing msg else ()
 
 structure Thm_Dedup = Hash_Table(struct
   type key = Universal_Key.universal_key
@@ -1030,6 +1057,26 @@ fun make_entity_callbacks (init_context: Context.generic) (ctxt_unpack: Context_
       (SOME (not o is_infra_thm)) (rule_cache case_static case_members) ctxt_unpack
   } end
 
+(* Python marks an exception message as ALREADY human-readable by prefixing it with
+   this string (semantic_interpretation.py: USER_ERROR_MARKER).  For such a failure --
+   "not logged in", a billing problem, entities left unanswered -- the Python traceback
+   carries nothing the reader can act on, so we report the marked text alone.  A message
+   WITHOUT the marker is one we could not classify: there is no honest one-liner to give,
+   and the traceback is the only lead, so it is passed through whole. *)
+val user_error_marker = "[SEMANTIC_INTERPRETATION_USER_ERROR] "
+
+fun extract_user_error msg =
+  let val (_, rest) = Substring.position user_error_marker (Substring.full msg)
+  in
+    if Substring.isEmpty rest then NONE
+    else SOME (Substring.string (Substring.triml (size user_error_marker) rest))
+  end
+
+fun interpretation_rpc_error message =
+  (case extract_user_error message of
+    SOME human => error human
+  | NONE => error (String.concat ["Semantic interpretation RPC failed: ", message]))
+
 fun interpret' (context : Context.generic) : usage * usage =
   let
     (* 1. Get theory information *)
@@ -1313,8 +1360,8 @@ fun interpret' (context : Context.generic) : usage * usage =
       val (_, _, current, cumulative) =
         Remote_Procedure_Calling.call_command cmd rpc_arg
           handle Remote_Procedure_Calling.Remote_Calling_Failure {message, ...} =>
-            error (String.concat ["Semantic interpretation RPC failed: ", message])
-      val _ = tracing (String.concat [
+            interpretation_rpc_error message
+      val _ = writeln (String.concat [
         "[Semantic_Store] ", thy_name, ": ", fmt_usage current,
         " (historical: ", fmt_usage cumulative, ")"])
     in
@@ -1455,16 +1502,37 @@ fun interpret_cone (force : bool) (cone : theory list) : usage * usage =
    started with (-o threads=N). A `Context.Proof` root additionally has its own proof-local
    entities interpreted, last and sequentially, and is never marked (a proof context has no
    theory hash). *)
+fun plan_interpretation (force : bool) (roots : theory list) : theory list =
+  filter_out (skip_interpreted force) (collect_cone roots)
+
 fun interpret_with_parallel (force : bool) (roots : Context.generic list) : unit =
   let
     val cone = collect_cone (map Context.theory_of roots)
+    (* Same set plan_interpretation reports, by construction: the command shows the user
+       a count, then this runs the work.  `cone` itself is still needed below -- interpret_cone
+       turns its already-interpreted nodes into relay tasks so a work node waits for its
+       uninterpreted transitive ancestors. *)
     val work = filter_out (skip_interpreted force) cone
     val proofs = filter (fn Context.Proof _ => true | _ => false) roots
     (* count includes the proof contexts, matching the old guard which folded them
        into `contexts` *)
     val n_units = length work + length proofs
+    (* Read the flag off the first root; with no roots there is nothing to report. *)
+    (* Progress the user asked for, not opt-in diagnostics -- so NOT the
+       Semantic_Store_verbose-gated `vtracing` (with the gate off this run reported nothing
+       at all in Isabelle, which is how a silent failure stayed silent), and NOT `tracing`
+       either: tracing is capped by `editor_tracing_messages` (default 1000) and exceeding
+       it pops Isabelle's own blocking "Tracing paused" dialog (isabelle_process.ML:35-60),
+       which a large cone would hit.  writeln has no such cap. *)
+    fun vtr msg = writeln msg
+    (* Opening block: says what the run is FOR, in words.  Emitted once, before any
+       parallel work, so it is the one multi-line message that cannot be interleaved. *)
     val _ = if n_units = 0 then () else
-      tracing ("[Semantic_Store] interpreting " ^ Int.toString n_units ^ " theories")
+      vtr (String.concat [
+        "[Semantic_Store] Interpreting ", Int.toString n_units, " theories: their ",
+        "constants, theorems, types and locales will be translated into English\n",
+        "descriptions and stored in the semantic database.\n",
+        "Interrupting is safe -- descriptions are saved as they arrive, and re-running resumes."])
 
     (* Nothing to do (the common resume case): do not build a graph or fork relay tasks. *)
     val (ttotal, thist) =
@@ -1479,9 +1547,10 @@ fun interpret_with_parallel (force : bool) (roots : Context.generic list) : unit
 
     val total = add_usage (ttotal, ptotal)
     val hist = add_usage (thist, phist)
-    val _ = tracing (String.concat [
-        "[Semantic_Store] total: ", fmt_usage total,
-        " (historical: ", fmt_usage hist, ")"])
+    val _ = vtr (String.concat [
+        "[Semantic_Store] Done: ", Int.toString n_units, " theories. This run cost ",
+        fmt_usage total, "; everything spent on these theories so far: ",
+        fmt_usage hist, "."])
   in
     ()
   end
@@ -1494,7 +1563,7 @@ fun mk_interpret_theory (context : Context.generic) (names : string list) : unit
     val uninterpreted = filter (not o is_interpreted) theories
     val contexts = map Context.Theory uninterpreted
     val _ = if null contexts then () else
-      tracing ("[Semantic_Store] mk_interpret_theory: interpreting " ^
+      writeln ("[Semantic_Store] mk_interpret_theory: interpreting " ^
                Int.toString (length contexts) ^ " theories")
   in
     List.app (fn ctx =>
@@ -1534,7 +1603,7 @@ fun interpret_entities (context : Context.generic) (entities : Universal_Key.ent
     if null missing then ()
     else
       let
-        val _ = tracing ("[Semantic_Store] interpret_entities: " ^
+        val _ = vtracing context ("[Semantic_Store] interpret_entities: " ^
                   Int.toString (length missing) ^ " of " ^
                   Int.toString (length entities) ^ " entities need interpretation")
         (* 3. Get names and positions *)
@@ -1597,7 +1666,7 @@ fun update_thm_cache thy =
          caching #concealed/is_hidden re-validation is intentionally NOT performed,
          matching the monotonic Thm_Cache theorem semantics (see plan risk 6). *)
       val (ni, nl, nn, nc) = classify_rule_entries is_infra_induct_thm unique_new
-      val _ = tracing (String.concat [
+      val _ = vtracing_global thy (String.concat [
         "[Semantic_Store] Thm_Cache updated: ", Int.toString (length unique_new), " new entries (",
         Int.toString (length cached + length unique_new), " total) in ",
         Int.toString (Time.toMilliseconds (Time.- (Time.now (), t0))), "ms"])

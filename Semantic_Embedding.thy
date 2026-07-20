@@ -1,5 +1,6 @@
 theory Semantic_Embedding
   imports HOL.Record Isabelle_RPC.Remote_Procedure_Calling
+  keywords "run_semantic_interpretation" :: diag
 begin
 
 (*declare [[ML_debugger, ML_exception_debugger]]*)
@@ -12,6 +13,7 @@ ML_file \<open>Tools/explain_term.ML\<close>
 ML_file \<open>Tools/theory_structure.ML\<close>
 ML_file \<open>Tools/locale_instance.ML\<close>
 ML_file \<open>Tools/semantic_store.ML\<close>
+ML_file \<open>Tools/interpret_command.ML\<close>
 
 (*
 declare [[ML_print_depth = 1000]]

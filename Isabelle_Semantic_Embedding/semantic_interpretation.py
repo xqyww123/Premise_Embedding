@@ -17,7 +17,9 @@ from Isabelle_RPC_Host.unicode import pretty_unicode
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    CLINotFoundError,
     HookMatcher,
+    ProcessError,
     ThinkingConfigAdaptive,
     create_sdk_mcp_server,
     tool,
@@ -27,11 +29,13 @@ try:
 except ImportError:
     RateLimitEvent = None
 from claude_agent_sdk.types import (
+    AssistantMessage,
     HookInput,
     HookContext,
     HookJSONOutput,
     PreToolUseHookInput,
     ResultMessage,
+    SystemMessage,
 )
 
 from .base import ToolCall_ret, mk_ret as _mk_ret
@@ -118,8 +122,10 @@ _HINT_SAME_LOCALE = "Generated from the same locale interpretation as the fore e
 _MAX_AGENT_RECYCLES = 8
 
 # Consecutive retry rounds with no newly-answered entry after which the retry
-# loop abandons the still-missing entries (left as None) rather than spinning.
-_MAX_STALLED_RETRIES = 3
+# loop gives up on the still-missing entries.  Giving up RAISES: an entry that
+# never gets an interpretation is a failure, never a silently-empty result.
+# See the completeness invariant on `interpret_file`.
+_MAX_STALLED_RETRIES = 10
 
 # Standing instructions for the interpretation agent.  These are batch- and
 # file-independent, so they live in the system prompt rather than the per-batch
@@ -286,6 +292,10 @@ class InterpretationTask:
         self.run_cache_read_tokens = 0
         self.run_output_tokens = 0
         self.run_cost_usd = 0.0
+        # (error_status, error) of every `api_retry` system message seen this run.
+        # The terminal ResultMessage of an expired credential is byte-identical to
+        # that of a dead network; this trail is the only thing that tells them apart.
+        self.api_retry_errors: list[tuple[Any, Any]] = []
 
     def __enter__(self) -> InterpretationTask:
         return self
@@ -497,6 +507,10 @@ async def _answer_tool(args: dict[str, Any]) -> ToolCall_ret:
     total_answered = sum(1 for v in task.results.values() if v is not None)
     _log.info("answer: submitted %d, batch_remaining %d, %d/%d done",
                count, batch_remaining, total_answered, len(task.results))
+    # The only fine-grained sign of life during a long theory.  Always name the theory:
+    # several run concurrently, so an unqualified "20 of 244" would be unattributable.
+    await _report(f"{task.theory_longname}: "
+                  f"{total_answered} of {len(task.results)} done.")
     if batch_remaining == 0:
         next_prompt = task.advance_batch()
         if next_prompt is None:
@@ -572,6 +586,46 @@ async def _permission_control(
 
 # --- Agent runner ---
 
+async def _report(msg: str, *, warn: bool = False) -> None:
+    """Put one progress line in front of the user, in Isabelle.
+
+    Everything this pipeline knows used to go only to the host log file
+    ($ISABELLE_HOME_USER/log/RPC_*), which neither frontend ever shows: the REPL app
+    hijacks *ML* output channels, and the jEdit command has no hijack at all.  So a run
+    could stall, retry, or fail for a reason plainly visible in the log while Isabelle
+    showed nothing.  Connection.writeln/warning is the existing route back (the global
+    `log` callback), so use it -- and keep logging too, so the log stays complete.
+
+    writeln, not tracing: tracing is capped by the `editor_tracing_messages` option
+    (default 1000) and exceeding it pops Isabelle's own blocking "Tracing paused" dialog
+    (isabelle_process.ML:35-60).  A large cone would hit that.
+    """
+    (_log.warning if warn else _log.info)("%s", msg)
+    conn = Connection.current()
+    if conn is None:
+        return          # no live call (unit tests, offline use) -- the log line stands
+    try:
+        await (conn.warning(msg) if warn else conn.writeln(msg))
+    except Exception:
+        # Reporting must never be able to fail the interpretation it is reporting on.
+        _log.exception("could not forward this line to Isabelle")
+
+
+def _model_error_text(message: Any) -> str:
+    """The model's own words for a failure, e.g.
+    'Failed to authenticate. API Error: 403 ...'.
+
+    Worth surfacing verbatim: the SDK's error enum is coarse -- it reports a 403
+    out-of-quota as `authentication_failed` -- so our summary of it can be actively
+    misleading, while this text says exactly what went wrong."""
+    content = getattr(message, "content", None)
+    if not isinstance(content, list):
+        return ""
+    texts = [t for b in content
+             if isinstance(t := getattr(b, "text", None), str) and t.strip()]
+    return " ".join(texts).strip()
+
+
 def _log_message(message: Any) -> None:
     """Log model output and thinking from a response message."""
     content = getattr(message, "content", None)
@@ -637,6 +691,124 @@ class PoisonedSessionError(Exception):
     resume) and continues with the still-missing entries."""
     pass
 
+# Prefix marking an exception message as ALREADY human-readable: the Isabelle
+# side reports only the marked line and suppresses the Python traceback, which
+# for a recognised condition ("not logged in") carries no information a user can
+# act on.  Anything WITHOUT this marker keeps its full traceback -- for the
+# unrecognised bucket there is no one-liner to give, and the stack is the only
+# lead.  Matched by Semantic_Store's RPC failure handler in semantic_store.ML.
+USER_ERROR_MARKER = "[SEMANTIC_INTERPRETATION_USER_ERROR] "
+
+
+class FatalAgentError(Exception):
+    """A failure that retrying cannot fix: authentication, billing, a malformed
+    request, or an unrecognised agent error.
+
+    Raised the moment it is detected and NEVER recycled -- unlike a poisoned
+    session or a transport blip, no amount of client recycling changes the
+    outcome, and the 8 x 2 s recycle loop would only bury the cause.
+
+    `human` is a one-line actionable message; when given it is emitted under
+    USER_ERROR_MARKER so Isabelle can drop the traceback."""
+
+    def __init__(self, human: str | None = None, detail: str = ""):
+        self.human = human
+        self.detail = detail
+        msg = (USER_ERROR_MARKER + human) if human else (detail or "unexpected agent failure")
+        if human and detail:
+            msg = f"{msg}\n({detail})"
+        super().__init__(msg)
+
+
+# ---------------------------------------------------------------------------
+# User-facing failure text.  Kept together so the wording can be reviewed in one
+# place rather than hunted through the control flow.
+# ---------------------------------------------------------------------------
+
+# One message for both "never logged in" and "login expired".  They are NOT
+# distinguishable at the point we must raise: a live unauthenticated session
+# reports AssistantMessage.error = 'authentication_failed' before the terminal
+# ResultMessage (the only carrier of the "Not logged in" text) ever arrives.  The
+# remedy is identical either way, so guessing would add a wrong claim and no value.
+_MSG_AUTH_FAILED = (
+    "Semantic interpretation failed: Claude Code could not authenticate. "
+    "Run 'claude' and use /login (it may not be logged in, or the login may have "
+    "expired), then retry.")
+
+_MSG_BILLING = (
+    "Semantic interpretation failed: the Claude account has a billing problem. "
+    "Check the account, then retry.")
+
+_MSG_INVALID_REQUEST = (
+    "Semantic interpretation failed: the request was rejected as invalid. "
+    "This is a bug - please report it with the RPC host log.")
+
+def _msg_unanswered(theory: str, missing: list[str], total: int) -> str:
+    shown = ", ".join(missing[:10])
+    more = f" (and {len(missing) - 10} more)" if len(missing) > 10 else ""
+    return (f"Semantic interpretation failed: theory {theory} left {len(missing)} of "
+            f"{total} entities uninterpreted after {_MAX_STALLED_RETRIES} retry rounds: "
+            f"{shown}{more}\n"
+            f"The theory has NOT been marked as interpreted; re-running will retry it.")
+
+class TransientAgentError(Exception):
+    """A server-side failure worth one more attempt.  Falls into `_run_agent`'s
+    recycle handler, which is bounded by _MAX_AGENT_RECYCLES."""
+    pass
+
+
+def _raise_for_agent_error(task: InterpretationTask,
+                           err: str | None,
+                           result_msg: Any,
+                           model_text: str = "") -> None:
+    """Classify a failure and raise.  Never returns.
+
+    `err` is AssistantMessage.error when we have it; otherwise `result_msg` is a
+    failed ResultMessage and the class is inferred from the api_retry trail plus
+    its own fields.  `model_text` is the model's own description of the failure; it is
+    appended to every recognised class because our own summary can be wrong -- the SDK
+    reports an out-of-quota 403 as `authentication_failed`, so "log in again" would be
+    exactly the wrong advice and only this text reveals it."""
+    def fatal(summary: str) -> None:
+        raise FatalAgentError(
+            summary + (f'\nThe model reported: "{model_text}"' if model_text else ""))
+
+    if err == "rate_limit":
+        raise RateLimitError()
+    if err == "server_error":
+        raise TransientAgentError("agent reported a server error")
+    if err == "authentication_failed":
+        fatal(_MSG_AUTH_FAILED)
+    if err == "billing_error":
+        fatal(_MSG_BILLING)
+    if err == "invalid_request":
+        fatal(_MSG_INVALID_REQUEST)
+
+    # err is None or "unknown": infer from what the run left behind.
+    statuses = {s for s, _ in task.api_retry_errors}
+    kinds = {k for _, k in task.api_retry_errors}
+    result_text = (getattr(result_msg, "result", None) or "") if result_msg else ""
+    status = getattr(result_msg, "api_error_status", None) if result_msg else None
+
+    # Never authenticated: the CLI fails locally in ~100 ms with no retries at all,
+    # so an empty api_retry trail is itself part of the signature.
+    if "not logged in" in result_text.lower():
+        fatal(_MSG_AUTH_FAILED)
+    if status == 401 or 401 in statuses or "authentication_failed" in kinds:
+        fatal(_MSG_AUTH_FAILED)
+
+    # Unrecognised: there is no honest one-liner, so let the full traceback through.
+    detail = f"error={err!r} api_error_status={status!r} result={result_text[:500]!r}"
+    if model_text:
+        detail += f" model_said={model_text[:500]!r}"
+    if task.api_retry_errors:
+        detail += f" api_retry={task.api_retry_errors[:10]!r}"
+    errors = getattr(result_msg, "errors", None) if result_msg else None
+    if errors:
+        detail += f" errors={errors!r}"
+    raise FatalAgentError(None, detail)
+
+
 def _handle_message(task: InterpretationTask, message: Any) -> None:
     """Process one message from a `receive_response` loop: log it, accumulate
     usage for ResultMessages, and raise ReachLimitError/RateLimitError on a
@@ -653,6 +825,26 @@ def _handle_message(task: InterpretationTask, message: Any) -> None:
             raise ReachLimitError()
         return
     _log_message(message)
+
+    # `api_retry` system messages are the ONLY place that distinguishes an expired
+    # credential from an unreachable network: both terminate with an identical
+    # ResultMessage (error_during_execution / aborted_streaming) whose `errors`
+    # carry only an opaque [ede_diagnostic] string.  Record them as they stream by
+    # so the terminal message can be classified.
+    if isinstance(message, SystemMessage) and message.subtype == "api_retry":
+        data = message.data or {}
+        task.api_retry_errors.append(
+            (data.get("error_status"), data.get("error")))
+        return
+
+    # The structured error enum (claude_agent_sdk.types.AssistantMessageError) is
+    # the primary classification -- it is stable across CLI versions, unlike the
+    # result text.
+    if isinstance(message, AssistantMessage):
+        err = getattr(message, "error", None)
+        if err is not None:
+            _raise_for_agent_error(task, err, None, _model_error_text(message))
+
     content = getattr(message, "content", None)
     if content is not None and isinstance(content, list) and content:
         block = content[0]
@@ -663,12 +855,13 @@ def _handle_message(task: InterpretationTask, message: Any) -> None:
             if "Rate limit" in text:
                 raise RateLimitError()
     if isinstance(message, ResultMessage):
+        status = getattr(message, "api_error_status", None)
         # A hard request-level rejection (e.g. 400 from a lone surrogate in the
         # transcript) carries its text in `errors`, NOT `result` (which is None
         # here), so the result-string checks below would miss it.  Detect via
         # the language-independent api_error_status, and raise BEFORE
         # _accumulate_usage so the poisoned round does not flush cost.
-        if message.is_error and getattr(message, "api_error_status", None) == 400:
+        if message.is_error and status == 400:
             raise PoisonedSessionError()
         _accumulate_usage(task, message)
         if message.is_error and message.result:
@@ -676,6 +869,16 @@ def _handle_message(task: InterpretationTask, message: Any) -> None:
                 raise ReachLimitError()
             if "Rate limit" in message.result:
                 raise RateLimitError()
+        # FAIL-SAFE.  Everything above is a whitelist of conditions we recognise;
+        # this is the catch-all that makes an unrecognised failure loud instead of
+        # silent.  Without it, an is_error result we have no branch for -- which is
+        # exactly what an unauthenticated CLI produces -- flows on as if the round
+        # had succeeded, the entries stay unanswered, and the theory ends up marked
+        # interpreted with nothing in it.
+        #
+        # NB: do NOT branch on `subtype`.  It is 'success' even on an auth failure.
+        if message.is_error:
+            _raise_for_agent_error(task, None, message)
 
 async def _run_agent(options: ClaudeAgentOptions, depth: int = 0) -> None:
     task = _local_task.get()
@@ -704,22 +907,30 @@ async def _run_agent(options: ClaudeAgentOptions, depth: int = 0) -> None:
                                if task.results[k] is None]
                 if not missing_idx:
                     break
-                # Give up if the retry loop makes no progress: a chunk the agent
-                # cannot (or will not) answer — refusal, an undetected request
-                # error — must not spin forever.  Leave those entries None.
+                # Stop if the retry loop makes no progress: a chunk the agent cannot
+                # (or will not) answer — refusal, an undetected request error — must
+                # not spin forever.  Stopping RAISES rather than leaving the entries
+                # None: an entry with no interpretation is a failure, and swallowing
+                # it here is what used to let a whole cone be marked interpreted with
+                # nothing in it.  See the completeness invariant on interpret_file.
                 if prev_missing is not None and len(missing_idx) >= prev_missing:
                     stall += 1
                     if stall >= _MAX_STALLED_RETRIES:
-                        _log.error("agent: giving up %d entries after %d stalled "
+                        missing_names = [task.entries[i].name for i in missing_idx]
+                        _log.error("agent: %d entries unanswered after %d stalled "
                                    "retry rounds: %s", len(missing_idx),
-                                   stall, [task._keys[i] for i in missing_idx])
-                        break
+                                   stall, missing_names)
+                        raise FatalAgentError(_msg_unanswered(
+                            task.theory_longname, missing_names, len(task.entries)))
                 else:
                     stall = 0
                 prev_missing = len(missing_idx)
                 chunk = missing_idx[:_BATCH_SIZE]
-                _log.info("agent: retrying %d of %d missing entries",
-                          len(chunk), len(missing_idx))
+                await _report(
+                    f"{task.theory_longname}: {len(missing_idx)} of "
+                    f"{len(task.entries)} entities still have no description; "
+                    f"asking the LLM again (attempt {stall + 1} of {_MAX_STALLED_RETRIES}).",
+                    warn=True)
                 missing_text = task.format_entries(chunk)
                 header = (
                     f"You still have {len(missing_idx)} unanswered entries from theory "
@@ -755,12 +966,21 @@ async def _run_agent(options: ClaudeAgentOptions, depth: int = 0) -> None:
         # dropped) and continue with the still-missing entries — answers
         # already written persist in `task.results`, so we do not redo them.
         if depth >= _MAX_AGENT_RECYCLES:
-            _log.error("agent: poisoned session persisted after %d recycles; "
-                       "giving up remaining entries", depth)
-            return
+            # Do NOT return here: returning would hand back a task with unanswered
+            # entries and no error, which interpret_file would report as success.
+            raise FatalAgentError(None,
+                f"poisoned session (API 400) persisted after {depth} client recycles")
         _log.warning("agent: poisoned session (API 400); recycling client "
                      "(recycle %d/%d)", depth + 1, _MAX_AGENT_RECYCLES)
         return await _run_agent(options, depth + 1)
+    except FatalAgentError:
+        # Authentication, billing, a malformed request, unanswered entries, or an
+        # unrecognised agent error.  Recycling cannot change any of these outcomes;
+        # it would only burn 8 x 2 s and bury the cause under the last failure.
+        raise
+    except (CLINotFoundError, ProcessError) as e:
+        # The CLI is missing or exited non-zero.  Deterministic: not worth a retry.
+        raise FatalAgentError(None, f"Claude Code CLI failure: {e}") from e
     except Exception:
         # An unexpected transport/SDK failure can escape receive_response with
         # no preceding error ResultMessage, bypassing the loops above and
@@ -824,7 +1044,19 @@ async def interpret_file(
                 Semantic_DB.update_expr(e.universal_key, e.prop_str)
 
     uncached = [i for i, r in enumerate(results) if r is None]
-    _log.info("interpret_file: %d cached, %d to interpret", n - len(uncached), len(uncached))
+    n_cached = n - len(uncached)
+    # Say what is about to happen in words, not internal vocabulary: "entries/cached/to
+    # interpret" means nothing to someone watching from a theory buffer.
+    if not uncached:
+        await _report(f"{theory_longname}: all {n} entities are already described "
+                      f"in the database, nothing to ask.")
+    elif n_cached:
+        await _report(f"{theory_longname}: found {n} entities to describe; "
+                      f"{n_cached} are already in the database, asking the LLM for the "
+                      f"remaining {len(uncached)}.")
+    else:
+        await _report(f"{theory_longname}: found {n} entities to describe; none are in "
+                      f"the database yet, asking the LLM for all {n}.")
     current_cost = CostSummary(0, 0, 0, 0, 0.0)
     cumulative_cost = CostSummary(0, 0, 0, 0, 0.0)
 
@@ -903,6 +1135,24 @@ async def interpret_file(
             answered = sum(1 for v in task.results.values() if v is not None)
             _log.info("interpret_file: agent finished, %d/%d interpreted",
                        answered, len(task.entries))
+            # COMPLETENESS INVARIANT: interpret_file either gives every entry an
+            # interpretation or raises; the returned `interpretations` never
+            # contains None.  Isabelle relies on this -- Semantic_Store.interpret'
+            # discards the list entirely, and interpret_cone marks a theory
+            # interpreted as soon as interpret' RETURNS.  Were a partial result to
+            # get back, the theory would be recorded as done with entities missing,
+            # and only `force` could ever redo it.
+            #
+            # The retry loop above already raises when it stalls; this is the
+            # backstop that keeps the invariant true no matter how the loop is
+            # later restructured.  ANYONE RELAXING THIS must also revisit
+            # semantic_store.ML's `val (_, _, current, cumulative)` and
+            # interpret_cone's unconditional mark_interpreted.
+            if answered < len(task.entries):
+                missing_names = [e.name for e, k in zip(task.entries, task._keys)
+                                 if task.results[k] is None]
+                raise FatalAgentError(_msg_unanswered(
+                    theory_longname, missing_names, len(task.entries)))
             # Cost is flushed per round in _accumulate_usage, so this is normally
             # a no-op flush; it still returns the up-to-date cumulative totals.
             cum = task.write_cost()
@@ -913,6 +1163,8 @@ async def interpret_file(
                 task.run_cache_read_tokens, task.run_output_tokens,
                 task.run_cost_usd)
             cumulative_cost = CostSummary(*cum)
+            await _report(f"{theory_longname}: done -- {answered} entities described, "
+                          f"cost ${current_cost.cost_usd:.4f}.")
 
             # Remap agent results to original indices (cache already written
             # incrementally). Iterate _keys by position — it is 1:1 with
