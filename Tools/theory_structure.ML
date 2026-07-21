@@ -25,8 +25,6 @@ signature THEORY_STRUCTURE = sig
   val is_elimination_rule_name : string -> bool
   val is_induction_rule_name : string -> bool
   val is_case_split_rule_name : string -> bool
-  val get_entities_with_positions : Context.generic -> Universal_Key.entity list ->
-    (string * Position.T) list
   val get_theorems_with_positions_of : Context.generic -> Universal_Key.entity list ->
     (string * int * Position.T * thm * bool) list
 end
@@ -405,49 +403,6 @@ val is_case_split_rule_name = name_ends_in_any case_suffix
 
 end
 
-(* Look up name and position for a list of entities *)
-fun get_entities_with_positions context entities =
-  let
-    val thy = Context.theory_of context
-    val const_space = Consts.space_of (Context.cases Sign.consts_of Proof_Context.consts_of context)
-    val type_space = Context.cases Sign.type_space Proof_Context.type_space context
-    val class_space = Context.cases Sign.class_space Proof_Context.class_space context
-    val locale_space = Locale.locale_space thy
-    val method_space = Method.method_space context
-    val fact_space = Facts.space_of
-      (Context.cases Global_Theory.facts_of Proof_Context.facts_of context)
-    fun pos_of space name =
-      case try (Name_Space.the_entry space) name of
-        SOME entry => #pos entry | NONE => Position.none
-    fun fact_pos name =
-      let val (base, _) = parse_thm_name name
-      in pos_of fact_space base end
-    fun thm_name_pos thm =
-      if Thm.has_name_hint thm
-      then let val name = Thm_Name.print (Thm.get_name_hint thm) in (name, fact_pos name) end
-      else error "Anonymous theorem (no name hint)"
-  in
-    map (fn Universal_Key.Constant name => (name, pos_of const_space name)
-          | Universal_Key.Type name => (name, pos_of type_space name)
-          | Universal_Key.Class name => (name, pos_of class_space name)
-          | Universal_Key.Locale name => (name, pos_of locale_space name)
-          | Universal_Key.Theorem_Collection name => (name, fact_pos name)
-          | Universal_Key.Method name => (name, pos_of method_space name)
-          | Universal_Key.Named_Theorem name => (name, fact_pos name)
-          | Universal_Key.Named_Introduction_Rule name => (name, fact_pos name)
-          | Universal_Key.Named_Elimination_Rule name => (name, fact_pos name)
-          | Universal_Key.Named_Induction_Rule name => (name, fact_pos name)
-          | Universal_Key.Named_Case_Split_Rule name => (name, fact_pos name)
-          | Universal_Key.Theorem thm => thm_name_pos thm
-          | Universal_Key.Introduction_Rule thm => thm_name_pos thm
-          | Universal_Key.Elimination_Rule thm => thm_name_pos thm
-          | Universal_Key.Induction_Rule thm => thm_name_pos thm
-          | Universal_Key.Case_Split_Rule thm => thm_name_pos thm
-        ) entities
-  end
-
-(* Look up full theorem details for a list of entities.
-   Only processes theorem-like entities; others are skipped. *)
 fun get_theorems_with_positions_of context entities =
   let
     val thy = Context.theory_of context

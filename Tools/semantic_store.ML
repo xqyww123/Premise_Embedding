@@ -71,7 +71,7 @@ signature SEMANTIC_STORE = sig
   val reranker_model : string Config.T
 
   (* Config option: echo Semantic_Store's OPT-IN INTERNAL DIAGNOSTICS to the output
-     panel -- the per-entity interpret_entities detail and the Thm_Cache delta
+     panel -- the Thm_Cache delta
      timings.  Off by default; `declare [[Semantic_Store_verbose]]`.
      It does NOT gate interpretation progress or per-theory token usage: those are
      reported unconditionally via writeln, so that a run cannot fail silently. *)
@@ -88,8 +88,6 @@ signature SEMANTIC_STORE = sig
      target_type: string} ->
     (real * Universal_Key.entity) list * string list
 
-  (* Interpret a list of entities, skipping those already interpreted. *)
-  val interpret_entities : Context.generic -> Universal_Key.entity list -> unit
 
   (* Build interpretation entries from (entity, name, pos, uk) tuples:
      (entity, name, expr, line, uk, prompt_hint, provenance, constituents).
@@ -186,16 +184,14 @@ val _ = Config.register_rpc_option "Semantic_Embedding.reranker_model"
    false (default) — quiet, which is what callers embedding this in a larger run
    (notably the `aoa` method) want; enable with `declare [[Semantic_Store_verbose]]`
    when diagnosing the store itself.
-   SCOPE: only the two `vtracing` sites remain behind this flag (the per-entity
-   interpret_entities detail and the Thm_Cache delta timing).  Run-level
+   SCOPE: only one `vtracing` site remains behind this flag (the
+   Thm_Cache delta timing).  Run-level
    interpretation progress, the per-theory token/cost line and the closing summary
    are unconditional `writeln` — a run that spends money must say so whether or not
    anyone opted into diagnostics. *)
 val Semantic_Store_verbose = Attrib.setup_config_bool
   \<^binding>\<open>Semantic_Store_verbose\<close> (K false)
 
-fun vtracing context msg =
-  if Config.get_generic context Semantic_Store_verbose then tracing msg else ()
 fun vtracing_global thy msg =
   if Config.get_global thy Semantic_Store_verbose then tracing msg else ()
 
@@ -420,11 +416,9 @@ val contains_cmd
    interpretation.  The trailing provenance field (template_uk, locale_uk,
    qualifier; NONE for ordinary entries) is carried into the stored record.
    ONLY this function (build_entries) is shared by interpret' and
-   interpret_entities.  build_entries itself renders a member's coll(i) from its
+   interpret'.  build_entries itself renders a member's coll(i) from its
    member_idx; the Part C (entity_kind_int, name) uniqueness assert below runs on
-   the live interpret' path ONLY — interpret_entities (currently dead) passes
-   member_idx = NONE for every entity, so it never produces members; if it is
-   revived with rule/member entities, factor Part C out and apply it there too. *)
+   the live interpret' path. *)
 fun build_entries (context : Context.generic)
     (raw : (Universal_Key.entity * string * Position.T * Universal_Key.universal_key * int option) list)
     : (Universal_Key.entity * string * string * int * Universal_Key.universal_key * string
@@ -1309,8 +1303,6 @@ fun interpret' (context : Context.generic) : usage * usage =
        partition (facts.ML) keeping a member's coll(i) name disjoint from a
        static name(idx) of the same kind — into ONE checked invariant.  It
        should never fire unless a future change reintroduces a duplicate label.
-       NB: the second (currently dead) entry point interpret_entities does not
-       run this check; if it is revived with rule/member entities, share it.
        Scope: this check deliberately ranges over the FULL final entries (before
        the cached/uncached split), so it is STRICTER than the Python-side
        label-uniqueness guard (semantic_interpretation.py), which sees only the
@@ -1594,66 +1586,6 @@ fun make_interpret_theory_callback (ctxt_unpack : Context_Callbacks.context_unpa
     function = fn (context, names) => mk_interpret_theory context names,
     timeout = NONE
   }
-
-(* NB: unlike `interpret'`, this path does NOT enumerate dynamic-collection
-   members (it passes member_idx = NONE for every entity) — it interprets exactly
-   the `entities` it is given, under their bare names. It is currently dead (its only
-   caller in agent_server.ML is commented out), so no member entity can reach it.
-   If it is ever re-enabled with dynamic-member entities, mirror interpret's
-   member handling here. *)
-fun interpret_entities (context : Context.generic) (entities : Universal_Key.entity list) : unit =
-  let
-    (* 1. Compute universal keys *)
-    val keyed = map (fn e => (e, Universal_Key.key_of NONE context e)) entities
-    val keys = map #2 keyed
-
-    (* 2. Batch check which are already interpreted *)
-    val exists = Remote_Procedure_Calling.call_command contains_cmd keys
-    val missing = map_filter (fn ((e, uk), ex) =>
-      if ex then NONE else SOME (e, uk)) (keyed ~~ exists)
-  in
-    if null missing then ()
-    else
-      let
-        val _ = vtracing context ("[Semantic_Store] interpret_entities: " ^
-                  Int.toString (length missing) ^ " of " ^
-                  Int.toString (length entities) ^ " entities need interpretation")
-        (* 3. Get names and positions *)
-        val names_pos = Theory_Structure.get_entities_with_positions context (map #1 missing)
-        (* interpret_entities never handles dynamic members, so member_idx = NONE. *)
-        val raw_entries = map2 (fn (entity, uk) => fn (name, pos) =>
-          (entity, name, pos, uk, NONE)) missing names_pos
-
-        (* 4. Build entries and call interpret RPC *)
-        val entries = build_entries context raw_entries
-        val thy = Context.theory_of context
-        val thy_name = Context.theory_long_name thy
-        val thy_file_path = Theory_Structure.get_theory_file_path thy
-        val su = Context_Callbacks.static_context_unpacker context
-        val pu = PIDE_State.position_context_unpacker context
-        val uk_cb = Universal_Key.make_universal_key_callback pu
-        val theory_info_cb = Context_Callbacks.make_theory_long_name_and_path_callback su
-        val desugar_cb = Explain_Term.make_desugar_callback context
-        val resolve_notation_cb = Explain_Term.make_resolve_notation_callback context
-        (* pu, not su — see the comment at the interpret' site above *)
-        val {constants, theorems, types, classes, locales, named_theorems, methods,
-             introduction_rules, elimination_rules,
-             induction_rules, case_split_rules} = make_entity_callbacks context pu
-        val cmd = make_interpret_file_cmd [uk_cb, theory_info_cb, desugar_cb,
-              resolve_notation_cb,
-              constants, theorems, types, classes, locales, named_theorems, methods,
-              introduction_rules, elimination_rules,
-              induction_rules, case_split_rules]
-        val thy_key = Universal_Key.key_of_theory' thy
-        val rpc_arg = {
-          file_path = thy_file_path,
-          theory_longname = thy_name,
-          theory_key = thy_key,
-          entries = entries
-        }
-        val _ = Remote_Procedure_Calling.call_command cmd rpc_arg
-      in () end
-  end
 
 (* --- Theorem cache update hook --- *)
 
