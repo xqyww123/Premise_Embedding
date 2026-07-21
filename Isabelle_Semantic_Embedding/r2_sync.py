@@ -200,7 +200,7 @@ def settings() -> Settings:
         endpoint=endpoint,
         object_key=pick("R2_OBJECT_KEY", "object_key", DEFAULT_OBJECT_KEY),
         public_url=public_url,
-        auto_check=flag("R2_AUTO_CHECK", "auto_check", True),
+        auto_check=flag("SEMANTIC_EMBEDDING_AUTO_UPDATE", "auto_check", True),
         check_interval_hours=int(hours if hours is not None else DEFAULT_CHECK_INTERVAL_HOURS),
     )
 

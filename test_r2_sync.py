@@ -155,7 +155,8 @@ def cfg(tmp_path, monkeypatch):
     path = tmp_path / "config.yaml"
     monkeypatch.setenv("SEMANTIC_EMBEDDING_CONFIG_PATH", str(path))
     for var in ("R2_ACCOUNT_ID", "R2_BUCKET", "R2_ENDPOINT", "R2_OBJECT_KEY",
-                "R2_PUBLIC_URL", "R2_AUTO_CHECK", "R2_CHECK_INTERVAL_HOURS"):
+                "R2_PUBLIC_URL", "SEMANTIC_EMBEDDING_AUTO_UPDATE",
+                "R2_CHECK_INTERVAL_HOURS"):
         monkeypatch.delenv(var, raising=False)
 
     def write(text: str) -> None:
@@ -222,19 +223,19 @@ def test_env_beats_the_config_file(cfg, monkeypatch):
     assert r2_sync.settings().bucket == "from_env"
 
 
-def test_r2_auto_check_0_disables_it(cfg, monkeypatch):
+def test_auto_update_0_disables_it(cfg, monkeypatch):
     """The trap this exists to prevent: the package's one prior env-boolean idiom
-    is `os.getenv(x, "") != ""`, under which `R2_AUTO_CHECK=0` reads as True --
-    turning a switch ON for a user who set it to turn it off.
+    is `os.getenv(x, "") != ""`, under which `SEMANTIC_EMBEDDING_AUTO_UPDATE=0`
+    reads as True -- turning a switch ON for a user who set it to turn it off.
     """
     cfg("r2:\n  auto_check: true\n")
     assert r2_sync.settings().auto_check is True
-    monkeypatch.setenv("R2_AUTO_CHECK", "0")
+    monkeypatch.setenv("SEMANTIC_EMBEDDING_AUTO_UPDATE", "0")
     assert r2_sync.settings().auto_check is False
 
 
 def test_a_nonsense_boolean_is_an_error_not_a_guess(cfg, monkeypatch):
-    monkeypatch.setenv("R2_AUTO_CHECK", "sure")
+    monkeypatch.setenv("SEMANTIC_EMBEDDING_AUTO_UPDATE", "sure")
     with pytest.raises(ValueError, match="not a boolean"):
         r2_sync.settings()
 

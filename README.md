@@ -1,191 +1,173 @@
-# Semantic Embedding
+# Isabelle Semantic Embedding
 
-Semantic interpretation and vector search for Isabelle entities (constants, theorems, types, type classes, locales). A Claude agent translates formal definitions into plain English, which are then embedded into vectors for similarity search.
+This library provides semantic search for Isabelle: it allows users retrieve, in natural language, the semantically closest entities — including constants, theorems, theorem collections (so-called `named_theorems`), types, type classes, locales, and tactics.
 
-## Semantic DB
+The process consists of two stages: semantic interpretation and embedding. In the interpretation stage, a Claude/Codex agent automatically explains each entity in an Isabelle theory into plain English and stores the obtained English explanations in a database. In the embedding stage, an embedding model (typically an LLM of several billion parameters) embeds each explanation into a vector (usually a few thousand dimensions), which is likewise stored in the local database.
+At query time, the user's natural-language query is embedded into a vector by the same model. The system then ranks all stored entity vectors by their cosine similarity to the query vector and returns the top $k$ — the entities whose explanations are closest to the query under the model's semantic encoding.
 
-The semantic database (`Semantic_DB` singleton in `semantics.py`) stores interpretations in an LMDB file at `~/.cache/Isabelle_Semantic_Embedding/semantics.lmdb`.
 
-### Entity Records
+## 1. Installation
 
-Each entity is stored as a msgpack tuple keyed by its universal key:
-
-```
-(kind: int, name: str, expr: str, interpretation: str)
-```
-
-- `kind`: EntityKind value (1=constant, 2=lemma, 3=type, 4=typeclass, 5=locale,
-  6=named_theorems, 7=proof method; plus 0x12/0x22/0x32/0x42 for intro/elim/induction/case-split rules)
-- `name`: fully qualified name (e.g. `"HOL.List.append"`)
-- `expr`: pretty-printed type signature or proposition
-- `interpretation`: plain English description
-
-Access via `Semantic_DB[key]` (returns `SemanticRecord | None`) or `Semantic_DB[key] = record`.
-
-### Theory Status
-
-Theory keys (16-byte theory hashes) store cost tracking and interpretation status as a msgpack dict:
-
-```python
-{"input_tokens": int, "output_tokens": int, "cost_usd": float, "finished": bool}
+This library ships as part of the Isabelle-AI package. If you already have Isabelle-AI installed, no further installation is needed; otherwise:
+```bash
+conda create -n <YOUR_ENV> -c https://conda.qiyuan.me -c conda-forge isabelle-ai
 ```
 
-`Semantic_DB.is_thy_interpreted(key)` checks the `finished` flag.
+**Note**: this system currently supports Isabelle 2025-2 only. 
+Installing without the conda manager is possible, but is an expert-only path: detailed documentation is not ready for now; the author suggests asking Claude/Codex to work out a standalone installation.
 
-### Persistent vs WIP Theories
+## 2. Quick start
 
-Theory hashes use an LSB convention (defined in `Isabelle_RPC/Tools/theory_hash.ML`):
-- **Persistent** (LSB=0): from built heap images, content-hashed — stable across sessions
-- **WIP** (LSB=1): theories being edited in jEdit, name-hashed — change on every reload
+This library is not normally used directly. A typical entry point is [AoA](https://github.com/xqyww123/Isa-Mini/blob/main/IsaMini/AoA/Readme.md).
 
-WIP entities are stored persistently just like persistent ones. However, when source files are edited and entities change semantics, the stored interpretations and embeddings are **not** automatically updated — they become stale. You must explicitly call `clean_wip()` (Python) or `Semantic_Store.clean_wip()` (ML) to purge all WIP data from both the semantic DB and all vector stores, so that subsequent queries regenerate fresh interpretations and embeddings.
+## 3. Fetching the prebuilt database
 
-WIP theories are never marked as "interpreted" or "embedded finished" — `mark_interpreted` and `mark_thy_embedded` silently skip them. This ensures WIP theories are always re-processed on the next request, since their content may have changed.
+The author provides pre-computed semantic interpretations, together with their Qwen3-8B embeddings, covering part of Isabelle/HOL 2025-2 and `afp-2026-05-13`. Download them for immediate use with the following `bash`/`powershell` commands:
+```bash
+conda activate <YOUR_ENV>
+isabelle-semantics pull      # download the prebuilt database and merge it into the local DB
+isabelle-semantics status    # compare the local database against the prebuilt one
+```
+Note: complete pre-computed interpretations of the AFP, together with the exact `afp-2026-05-13` version they correspond to, will be published soon; this section will be updated accordingly.
 
-### Skipped Theories
 
-Certain infrastructure theories are never interpreted: `Pure`, `Code_Generator`, `Code_Evaluation`, `Typerep`. These are defined in `_SKIP_THEORY_LONG_NAMES` and filtered in both interpretation and entity enumeration.
+## 4. Running semantic interpretation on your own theories
 
-## Semantic Interpretation
-
-`semantic_interpretation.py` uses a Claude agent (`claude-opus-4-6`) to translate Isabelle entities into plain English. The flow:
-
-1. **ML side** (`semantic_store.ML:interpret'`): extracts constants, theorems, types, classes, locales from a theory, computes universal keys, and calls Python via RPC
-2. **Python side** (`interpret_file`): checks LMDB cache for existing interpretations, launches Claude agent for uncached entries
-3. **Agent**: receives batches of entities (20 per batch), uses MCP tools (`query`, `definition`, `hover`) to understand dependencies, submits translations via the `answer` tool
-4. **Storage**: each answer is immediately written to LMDB via `Semantic_DB[key] = SemanticRecord(...)`
-
-`Semantic_Store.interpret(context)` interprets all uninterpreted ancestor theories plus the current proof context. `interpret_theories_by_names(connection, names)` interprets specific theories by name.
-
-## Embedding Providers
-
-`Embedding_Provider` (in `semantic_embedding.py`) is the abstract base for text embedding services. A provider is selected by **three parameters** — `driver`, `base_url`, `model` — rather than a per-model registered subclass:
-
-- **driver**: a registered driver class. `OpenAI_Embedding_Provider` serves any OpenAI-compatible `/v1/embeddings` endpoint (Fireworks, OpenAI, Mistral, Aliyun DashScope, …); `Gemini_Embedding` is the native Google Gemini API. Default `OpenAI_Embedding_Provider`.
-- **base_url**: the API endpoint. Default `https://api.fireworks.ai/inference`.
-- **model**: the **canonical** model name — the HuggingFace name where one exists (e.g. `Qwen/Qwen3-Embedding-8B`), else the provider's id (e.g. `text-embedding-3-large`). Default `Qwen/Qwen3-Embedding-8B`.
-
-Build one with `make_embedding_provider(driver, base_url, model)`. The API key is read **only** from the `EMBEDDING_API_KEY` environment variable (Gemini additionally falls back to `GEMINI_API_KEY`).
-
-### YAML config
-
-All model/endpoint specifics live in a YAML config at `$ISABELLE_HOME_USER/etc/embedding_config`, seeded on first run from the bundled `embedding_config_template.yaml`. It is keyed by the canonical model name and by the base_url domain (netloc):
-
-- per model: `dimension` (**required** — determines the LMDB matrix shape; a missing entry is a hard error), `default_scores` (`{score, local}` fallbacks for un-embedded entities), `normalize` (L2-normalize returned vectors), `max_request_size`, `templates` (per-model `query`/`document` text wrappers applied before embedding; default identity `"{text}"`, literal `str.replace` over `{text}`/`{task}` so Isabelle `{ }` text is safe)
-- `providers.<domain>.normalization`: maps the canonical name to the id this endpoint expects (e.g. on `api.fireworks.ai`, `Qwen/Qwen3-Embedding-8B` → `fireworks/qwen3-embedding-8b`)
-- `providers.<domain>.batch`: the Batch API shape (`dialect: openai | mistral`, endpoint, status strings, `max_batch_size`); its presence is what enables batch for that domain
-- `task_description`: the sentence injected into a query template's `{task}` slot; its `{kinds}` slot is filled per query from the `EntityKind` filter (e.g. "constants and theorems", or "constructs" when unfiltered). Shared across models; must **not** contain literal `{text}`/`{task}`
-
-Add a model by editing the YAML; add a new driver class via `@register_embedding_driver("Name")` or `drivers/{Name}.py`. Configs are seeded once and never auto-merged, so a machine that already has `etc/embedding_config` must add `templates`/`task_description` by hand.
-
-### Caching
-
-Embedding results are cached per-string (keyed by the canonical model name + text) in a DiskCache database at `~/.cache/Isabelle_Semantic_Embedding/embed_cache/` (2 GB limit, 3-day TTL). Both `embed()` and `embed_batch()` use the cache. This cache is purely local and is **excluded** from the published DB snapshot.
-
-### Batch API
-
-When the base_url's domain has a `batch` entry in the YAML config, `OpenAI_Embedding_Provider._embed_batch` uses the OpenAI-style Batch API (e.g. for 50% cost reduction on OpenAI). It uploads a JSONL file, creates an async batch job, polls for completion, and downloads results. Large inputs are split into sub-batches of `max_batch_size` (from the YAML `batch` config) and submitted in parallel on the server side. The `dialect` (`openai`/`mistral`) selects the request/response shape.
-
-## Vector Store & Semantic Vector Store
-
-### Vector Store
-
-`Vector_Store` (in `semantic_embedding.py`) stores embedding vectors in LMDB, keyed by universal keys. Multiple stores share a global LMDB environment pool (thread-safe).
-
-Key operations:
-- `store[key]` / `store.put(key, vector)`: get/set vectors
-- `store.topk(query, domain, k)`: return top-k `(key, score)` pairs using `faiss.knn`
-- `store._auto_embed(missing, matrix, row)`: hook for subclasses to recover missing vectors
-
-### Semantic Vector Store
-
-`Semantic_Vector_Store` (in `semantics.py`) extends `Vector_Store` with:
-- **Auto-interpretation**: when vectors are missing, automatically interprets uninterpreted theories (if `auto_interpret_for_embedding` is enabled), fetches semantic texts from `Semantic_DB`, embeds them, and stores the vectors
-- **Provider resolution**: resolves `(driver, base_url, model)`, each by Isabelle config (`Semantic_Embedding.embedding_driver` / `embedding_base_url` / `embedding_model`) → env var (`EMBEDDING_DRIVER` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL`) → default (`OpenAI_Embedding_Provider` / Fireworks / `Qwen/Qwen3-Embedding-8B`)
-- **Store identity**: the LMDB vector store lives at `vector_<canonical model>.lmdb`, with the canonical name made filesystem-safe (`/` → `__`), e.g. `vector_Qwen__Qwen3-Embedding-8B.lmdb`
-- **Per-connection registry**: each `Connection` maintains a dict of stores by canonical model name, accessed via `connection.semantic_vector_store(model_name)`. NOTE: one run has a single active driver+base_url, so embedding several models at once only works for models served by that same endpoint.
-
-`lookup(query, k, kinds, domain)` combines entity filtering with k-NN search:
-- `kinds`: filter by `EntityKind` (e.g. `[ConstantK, TheoremK]`)
-- `domain=None`: search all entities of those kinds (excluding skipped theories)
-- Returns `list[tuple[float, SemanticRecord]]` sorted by similarity
-
-## Config Options
-
-Set in Isabelle via `declare [[option = value]]`:
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `auto_interpret_for_embedding` | bool | `true` | Auto-trigger interpretation when embeddings are missing |
-| `Semantic_Embedding.embedding_driver` | string | `""` | Embedding driver class (empty = env `EMBEDDING_DRIVER` or `OpenAI_Embedding_Provider`) |
-| `Semantic_Embedding.embedding_base_url` | string | `""` | Embedding endpoint base_url (empty = env `EMBEDDING_BASE_URL` or the Fireworks endpoint) |
-| `Semantic_Embedding.embedding_model` | string | `""` | Canonical (HuggingFace) embedding model name (empty = env `EMBEDDING_MODEL` or `Qwen/Qwen3-Embedding-8B`) |
-| `Semantic_Embedding.reranker_model` | string | `""` | Reranker model for re-ranking search results (empty = disabled; env var `RERANKER_MODEL`) |
-
-These are accessible from Python via `connection.config_lookup("option_name")`.
-
-## Marking entities as infrastructure (excluded from retrieval)
-
-Some entities are plumbing that should never surface in semantic retrieval. Built-in
-heuristics already drop most of them (concealed/hidden names, ADT/record/BNF machinery,
-`Minilang.*`, tool-internal collections, …). To mark additional ones by hand:
+The prebuilt database covers only part of Isabelle/HOL and `afp-2026-05-13`. To interpret and embed your own theories, use the `run_semantic_interpretation` command:
 
 ```isabelle
-declare [[infra_constant Foo.bar Baz.qux]]   (* constants (also cascades to theorems
-                                                 whose statement mentions them) *)
-declare [[infra_type   Foo.t]]               (* types *)
-declare some_lemma[infra_thm]                 (* a theorem — attached fact attribute *)
+theory My_Wonderful_Theory
+  imports "Semantic_Embedding.Semantic_Embedding" (* DONT'T FORGET ME ;-) *)
+          Some_Wonderful_Dependencies
+begin
 
-declare [[infra_constant del Foo.bar]]        (* `del` undoes any of the above *)
-declare some_lemma[infra_thm del]
+(* A lot of wonderful formalizations here *)
+
+run_semantic_interpretation                           (* interpret and embed the current theory and its ancestors *)
+run_semantic_interpretation Theory_Name1 Theory_Name2 (* interpret and embed exactly these two theories, not My_Wonderful_Theory itself *)
+
+end
 ```
 
-Notes:
-- `infra_thm` matches **by proposition** (like `named_theorems`): it stores the theorem
-  itself, so two lemmas with the same statement are treated alike, and a declaration inside
-  a `locale` correctly suppresses the exported instance at each `interpretation`. Marking a
-  trivially-shaped lemma (`x = x`, `True`) is honoured but warns, since it would suppress
-  every same-statement lemma.
-- `infra_constant`/`infra_type` resolve their (global) argument at parse time; `infra_thm`
-  is attached to the fact (`lemma[infra_thm]`, not `[[infra_thm name]]`).
-- Whole `named_theorems` *collections* are suppressed via the static blacklist in
-  `Tools/infra_filter.ML`, not via `infra_thm`.
-- Effect is read at collection time: re-collect to drop entries already written to the DB.
+Be aware that interpretation and embedding together can take a long time; please let the run finish. If you do interrupt it, most intermediate results are saved, and the next run resumes rather than starting from scratch.
 
-## Usage
 
-### Isabelle/ML
+## 5. Configuring the embedding provider
 
-```sml
-(* Interpret all ancestor theories *)
-Semantic_Store.interpret \<^context>
+By default, the system uses Claude Code with `claude-opus-4-8[1m]` for semantic interpretation, and `Qwen/Qwen3-Embedding-8B` for embedding. A Codex-based interpreter, along with the ability to switch the interpretation LLM, is under development.
 
-(* Query semantic interpretation *)
-Semantic_Store.query_semantics \<^context> (Universal_Key.Constant "List.append") false
+The embedding model can be changed through three settings — the driver, the endpoint, and the model name:
+```isabelle
+declare [[Semantic_Embedding.embedding_driver   = "OpenAI_Embedding_Provider",   (* most embedding providers speak the OpenAI-compatible protocol, so you will rarely need to change this *)
+          Semantic_Embedding.embedding_base_url = "https://api.fireworks.ai/inference",
+          Semantic_Embedding.embedding_model    = "Qwen/Qwen3-Embedding-8B"]]
+```
+Alternatively, the same three settings can be given as environment variables in `$(isabelle getenv -b ISABELLE_HOME_USER)/etc/settings`:
+```
+EMBEDDING_DRIVER=...
+EMBEDDING_BASE_URL=...
+EMBEDDING_MODEL=...
+```
+The Isabelle options take precedence: an environment variable is consulted only where the corresponding option is unset.
 
-(* k-NN search for similar entities *)
-Semantic_Store.query_knn \<^context>
-  "concatenation of two lists"
-  10
-  [Universal_Key.ConstantK, Universal_Key.TheoremK]
-  NONE
+If you self-host an embedding model (e.g. via vLLM or TGI), set `embedding_base_url` to your server's address and `embedding_model` to the model name it serves.
+
+The system guarantees that the query and the stored entities are embedded by the same model. If you change `embedding_model`, all contextual entities will therefore be re-embedded with the new model before the next semantic search — this typically costs little. Changing only `embedding_base_url` while keeping `embedding_model` unchanged triggers no re-embedding.
+
+The following subsections cover each configuration option and its available choices in turn.
+
+### 5.1 `embedding_driver`
+
+Two drivers are currently available:
+- `OpenAI_Embedding_Provider` (default) — speaks to any OpenAI-compatible /v1/embeddings endpoint: Fireworks, OpenAI, Mistral, Aliyun DashScope, ….
+- `Gemini_Embedding` — the native Google Gemini API.
+
+### 5.2 `embedding_base_url`
+
+The endpoint the embedding driver contacts, given **without** a `/v1` suffix (the driver appends `/v1/embeddings` itself). Examples:
+
+- `https://api.fireworks.ai/inference` (default)
+- `https://api.openai.com`
+- `https://api.mistral.ai`
+
+### 5.3 `embedding_model`
+
+The **canonical** model name — the HuggingFace name where one exists, else the provider's model id. The following are configured out of the box:
+
+| Canonical name | Endpoint |
+|---|---|
+| `Qwen/Qwen3-Embedding-8B` (default) | Fireworks |
+| `harrier-oss-v1-27b`, `llama-nv-embed-reasoning-3b` | Fireworks |
+| `text-embedding-3-large`, `text-embedding-3-small` | OpenAI |
+| `codestral-embed` | Mistral |
+| `gemini-embedding-2-preview` | Gemini |
+
+Other models can be added through the embedding config file (§7.1).
+
+### 5.4 API key
+
+The embedding API key is read from the single environment variable `EMBEDDING_API_KEY`, whatever the endpoint. Add the line
+```
+EMBEDDING_API_KEY=...
+```
+to `$(isabelle getenv -b ISABELLE_HOME_USER)/etc/settings`, then restart Isabelle.
+
+The `Gemini_Embedding` driver additionally falls back to `GEMINI_API_KEY`.
+
+## 6. The database
+
+All data lives in the following directory:
+| OS | Database directory |
+|---|---|
+| Linux | `~/.cache/Isabelle_Semantic_Embedding` |
+| macOS | `~/Library/Caches/Isabelle_Semantic_Embedding` |
+| Windows | `C:\Users\<USER NAME>\AppData\Local\Qiyuan\Isabelle_Semantic_Embedding\Cache` |
+
+The directory consists of the semantic database (`semantics.lmdb`), one vector store per embedding model (`vector_<model>.lmdb`), and local caches.
+
+**Warning**: the system uses [LMDB](http://www.lmdb.tech/) for its semantic and vector stores, and LMDB on a networked filesystem (NFS, Lustre) **can corrupt silently**. On compute clusters that use network filesystems, it is highly recommended to relocate the semantic database to a local disk by adding the line
+```
+SEMANTIC_DB_DIR=<PATH_ON_A_LOCAL_DISK>
+```
+to `$(isabelle getenv -b ISABELLE_HOME_USER)/etc/settings`. After changing this setting, you **must kill the background RPC process** and fully restart Isabelle. The RPC process can be found by looking for a process whose command line contains `Isabelle_RPC_Host.fork_and_launch__()`, e.g.:
+```bash
+pkill -f 'Isabelle_RPC_Host\.fork_and_launch__'
 ```
 
-### Python (within RPC handler)
-
-```python
-from Isabelle_Semantic_Embedding.semantics import Semantic_DB, SemanticRecord
-
-# Query interpretation
-rec = Semantic_DB[some_universal_key]
-if rec is not None:
-    print(rec.pretty_print)       # "constant List.append: 'a list => ..."
-    print(rec.interpretation)     # "Appends two lists together."
-
-# Vector search
-store = connection.semantic_vector_store()
-results = store.lookup("addition on natural numbers", k=5,
-                       kinds=[EntityKind.CONSTANT, EntityKind.THEOREM])
-for score, rec in results:
-    print(f"{score:.3f} {rec.pretty_print}: {rec.interpretation}")
+**Update checks.** At most once a week, the library probes the prebuilt database with a single HEAD request, and prints a notice when a newer version exists. It never downloads anything on its own — updating is always an explicit isabelle-semantics pull. The check can be turned off by setting
+```bash
+SEMANTIC_EMBEDDING_AUTO_UPDATE=false
 ```
+in `$(isabelle getenv -b ISABELLE_HOME_USER)/etc/settings`
+
+
+## 7. Technical details
+
+### 7.1 The embedding config file
+
+To use a new embedding model or a new provider endpoint, you must supply the following settings in `$(isabelle getenv -b ISABELLE_HOME_USER)/etc/embedding_config`:
+
+- `dimension` — the vector dimension, **required** for every model in use;
+- `normalize` — whether to L2-normalize the vectors the endpoint returns (default `false`). Needed when the endpoint does not return unit vectors.
+- `max_request_size`  — the maximum number of texts sent in one embedding request batch (default 2048). Some endpoints enforce hard caps (e.g. Aliyun DashScope allows only 10)
+- `default_scores` — the fallback similarity scores `{score, local}` given to entities that have no embedding vector yet. `score` for ordinary entities, `local` for entities local to the current proof context. Default: `{0.0, 0.0}`.
+- `templates`, `task_description` — the text wrappers applied to queries and documents before embedding;
+- `providers.<domain>.normalization` — maps the canonical model name (i.e., the name seen in HugginFace) to the id that the endpoint expects;
+- `providers.<domain>.batch` — its presence enables the OpenAI-style Batch API for that endpoint.
+
+The bundled [template](Isabelle_Semantic_Embedding/embedding_config_template.yaml) is an example.
+
+### 7.2 Excluding entities from retrieval
+
+Some entities are internal infrastructure: they are not meant to be used outside their own formalization, and therefore should not surface in search results. Built-in heuristics already exclude most of them (hidden names, datatype/record internals, …); to mark more by hand:
+
+```isabelle
+declare [[infra_constant Foo.bar]]      (* a constant; cascades to theorems mentioning it *)
+declare [[infra_type Foo.t]]            (* a type *)
+declare some_lemma[infra_thm]           (* a theorem *)
+declare [[infra_constant del Foo.bar]]  (* del undoes any of the above *)
+```
+
+### 7.3 Reranker
+
+A reranking stage after the vector search is implemented (option `Semantic_Embedding.reranker_model`) but disabled by default and currently unused: in our measurements it actually harms the retrieval performance.

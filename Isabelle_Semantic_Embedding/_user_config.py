@@ -83,8 +83,8 @@ def env_bool(name: str) -> 'bool | None':
     the config file); empty string means an explicit False.
 
     Anything else is an error.  Do NOT fall back on the ``os.getenv(x, "") != ""``
-    idiom used for SEMANTIC_PERSIST_WIP: under it ``R2_AUTO_CHECK=0`` reads as
-    True, so a user turning a switch off would turn it on.  Guessing is worse
+    idiom used for SEMANTIC_PERSIST_WIP: under it ``SEMANTIC_EMBEDDING_AUTO_UPDATE=0``
+    reads as True, so a user turning a switch off would turn it on.  Guessing is worse
     than refusing — a flag nobody can reliably disable is a flag nobody trusts.
     """
     raw = os.getenv(name)

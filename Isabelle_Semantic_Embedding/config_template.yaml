@@ -29,6 +29,7 @@ r2:
   # auto_check only probes the remote (one HEAD request, no transfer) at most
   # every check_interval_hours, and prints a line when a newer database exists.
   # It never downloads and never merges; you run `pull` yourself.
+  # (Env override: SEMANTIC_EMBEDDING_AUTO_UPDATE.)
   auto_check: true
 
   check_interval_hours: 168        # weekly
