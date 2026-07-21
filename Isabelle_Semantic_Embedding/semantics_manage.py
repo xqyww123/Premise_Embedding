@@ -918,7 +918,8 @@ def main() -> None:
     p_embed.add_argument("--driver", default="",
         help="Override the embedding driver class (else env EMBEDDING_DRIVER / default).")
     p_embed.add_argument("--base-url", dest="base_url", default="",
-        help="Override the embedding endpoint base_url (else env EMBEDDING_BASE_URL / default).")
+        help="Override the embedding endpoint base_url, version segment included, "
+             "e.g. https://api.openai.com/v1 (else env EMBEDDING_BASE_URL / default).")
 
     # status
     p_status = sub.add_parser("status",

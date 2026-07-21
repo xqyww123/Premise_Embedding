@@ -17,7 +17,7 @@ os.environ["EMBEDDING_API_KEY"] = "test-key-123"
 
 from Isabelle_Semantic_Embedding import semantic_embedding as se  # noqa: E402
 
-FIREWORKS = "https://api.fireworks.ai/inference"
+FIREWORKS = "https://api.fireworks.ai/inference/v1"
 
 
 def test_fireworks_qwen():
@@ -33,7 +33,7 @@ def test_fireworks_qwen():
 
 
 def test_openai_batch():
-    p = se.OpenAI_Embedding_Provider("https://api.openai.com", "text-embedding-3-large")
+    p = se.OpenAI_Embedding_Provider("https://api.openai.com/v1", "text-embedding-3-large")
     assert p.model == "text-embedding-3-large"         # no normalization needed
     assert p.dimension == 3072
     assert (p.default_score, p.default_local_score) == (0.0, 0.0)
@@ -46,7 +46,7 @@ def test_openai_batch():
 
 
 def test_mistral_batch_dialect():
-    p = se.OpenAI_Embedding_Provider("https://api.mistral.ai", "codestral-embed")
+    p = se.OpenAI_Embedding_Provider("https://api.mistral.ai/v1", "codestral-embed")
     assert p.dimension == 1536
     assert p.supports_batch is True
     assert p.max_batch_size == 1000000
@@ -61,7 +61,7 @@ def test_mistral_batch_dialect():
 def test_aliyun_request_cap():
     p = se.make_embedding_provider(
         "OpenAI_Embedding_Provider",
-        "https://dashscope-intl.aliyuncs.com/compatible-mode", "text-embedding-v4")
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "text-embedding-v4")
     assert p.dimension == 1024
     assert p.max_request_size == 10
     assert p.supports_batch is False
@@ -153,7 +153,7 @@ def test_apply_template_brace_safety():
 
 def test_apply_template_unlisted_model_is_raw():
     p = se.make_embedding_provider("OpenAI_Embedding_Provider",
-                                   "https://api.openai.com", "text-embedding-3-large")
+                                   "https://api.openai.com/v1", "text-embedding-3-large")
     assert p._apply_template(["raw {q}"], "query") == ["raw {q}"]
     assert p._apply_template(["raw {q}"], "document") == ["raw {q}"]
 
@@ -240,6 +240,128 @@ def test_apply_template_query_with_kinds():
         ["Instruct: " + rendered + "\nQuery: find X"]
     # document role ignores kinds_phrase entirely
     assert p._apply_template(["d"], "document", "constants and theorems") == ["d"]
+
+
+# --- base_url /v1 convention (2026-07) ---------------------------------------
+
+
+def test_embed_posts_to_embeddings_suffix():
+    # base_url includes the version segment; _embed appends only /embeddings.
+    import asyncio
+    p = _qwen()
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return {"data": [{"embedding": [0.0] * p.dimension}], "usage": {}}
+
+    class _Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, **kw):
+            captured["url"] = url
+            return _Resp()
+
+    orig = se.httpx.AsyncClient
+    se.httpx.AsyncClient = _Client
+    try:
+        asyncio.run(p._embed(["x"]))
+    finally:
+        se.httpx.AsyncClient = orig
+    assert captured["url"] == "https://api.fireworks.ai/inference/v1/embeddings"
+
+
+def test_batch_urls_join_origin():
+    # Batch traffic joins onto the URL origin, so /v1 never doubles even though
+    # base_url now carries it; the JSONL body `url` stays a protocol constant.
+    import asyncio
+    import json as _json
+    p = se.OpenAI_Embedding_Provider("https://api.openai.com/v1", "text-embedding-3-large")
+    urls = []
+
+    class _Resp:
+        def __init__(self, data=None, text=""):
+            self._data, self.text = data, text
+        def raise_for_status(self): pass
+        def json(self): return self._data
+
+    class _Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, **kw):
+            urls.append(url)
+            if url.endswith("/files"):
+                return _Resp({"id": "f1"})
+            return _Resp({"id": "b1"})
+        async def get(self, url, **kw):
+            urls.append(url)
+            if "/files/" in url:
+                line = _json.dumps({"custom_id": "0", "response": {"body": {
+                    "data": [{"embedding": [0.0] * p.dimension}], "usage": {}}}})
+                return _Resp(text=line)
+            return _Resp({"status": "completed", "output_file_id": "of1",
+                          "request_counts": {}})
+
+    orig = se.httpx.AsyncClient
+    se.httpx.AsyncClient = _Client
+    try:
+        asyncio.run(p._embed_batch(["x"]))
+    finally:
+        se.httpx.AsyncClient = orig
+    assert urls == [
+        "https://api.openai.com/v1/files",
+        "https://api.openai.com/v1/batches",
+        "https://api.openai.com/v1/batches/b1",
+        "https://api.openai.com/v1/files/of1/content",
+    ]
+    assert p._format_batch_line(0, "t")["url"] == "/v1/embeddings"
+    assert p._create_batch_request("f")["endpoint"] == "/v1/embeddings"
+
+
+def test_legacy_base_url_rejected():
+    # Version-less base_url for a providers-listed domain = pre-change value.
+    for legacy, model in [("https://api.fireworks.ai/inference", QWEN),
+                          ("https://api.openai.com", "text-embedding-3-large"),
+                          ("https://api.mistral.ai", "codestral-embed")]:
+        try:
+            se.OpenAI_Embedding_Provider(legacy, model)
+            raise AssertionError(f"expected ValueError for {legacy}")
+        except ValueError as e:
+            assert "/v1" in str(e)
+
+
+def test_selfhosted_versionless_root_allowed():
+    # Unlisted domains (self-hosted server roots) stay exempt from the check.
+    p = se.OpenAI_Embedding_Provider("http://localhost:8000", "text-embedding-3-large")
+    assert p.supports_batch is False
+
+
+def test_domain_normalization_case_and_port():
+    # Netloc-spelling variants must hit the same YAML providers entry: uppercase
+    # host and a scheme-default port get model normalization AND the legacy check.
+    p = se.OpenAI_Embedding_Provider("https://API.FIREWORKS.AI:443/inference/v1", QWEN)
+    assert p.model == "fireworks/qwen3-embedding-8b"
+    try:
+        se.OpenAI_Embedding_Provider("https://API.FIREWORKS.AI/inference", QWEN)
+        raise AssertionError("expected ValueError for uppercase legacy spelling")
+    except ValueError:
+        pass
+    # Explicit non-default ports survive, so a `myhost:8080` providers key works.
+    assert se._endpoint_domain("http://myhost:8080/v1") == "myhost:8080"
+    assert se._endpoint_domain("https://api.openai.com/v1") == "api.openai.com"
+
+
+def test_404_hint_suggests_version_segment():
+    class _R:
+        status_code = 404
+    e = Exception()
+    e.response = _R()   # type: ignore[attr-defined]
+    p = se.OpenAI_Embedding_Provider("http://localhost:8000", "text-embedding-3-large")
+    assert "version segment" in p._http_error_hint(e)
+    p2 = se.OpenAI_Embedding_Provider("http://localhost:8000/v1", "text-embedding-3-large")
+    assert "version segment" not in p2._http_error_hint(e)
 
 
 if __name__ == "__main__":

@@ -180,7 +180,7 @@ async def test_resolve_one_config_beats_env():
 
 
 def test_make_embedding_provider_post_assignment():
-    FIREWORKS = "https://api.fireworks.ai/inference"
+    FIREWORKS = "https://api.fireworks.ai/inference/v1"
     QWEN = "Qwen/Qwen3-Embedding-8B"
     p = SE.make_embedding_provider("OpenAI_Embedding_Provider", FIREWORKS, QWEN,
                                    api_key="explicit-key")
@@ -205,7 +205,7 @@ async def test_reranker_bind_connection_env():
     p = await SE.reranker_provider("qwen3-reranker-8b", conn)
     assert p.api_key == "isa-rk"
     assert p.model == "isa-model"
-    assert p.base_url == "https://api.fireworks.ai/inference", \
+    assert p.base_url == "https://api.fireworks.ai/inference/v1", \
         "unset everywhere -> constructor default survives"
     p2 = await SE.reranker_provider("qwen3-reranker-8b")     # no connection
     assert p2.api_key == os.getenv("QWEN3_RERANKER_API_KEY")

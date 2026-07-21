@@ -76,12 +76,16 @@ templates:
 task_description: "Given a natural-language description, retrieve the most relevant Isabelle/HOL {kinds}"
 
 # Per-domain provider config. Key = the netloc of base_url
-# (e.g. "https://api.fireworks.ai/inference" -> "api.fireworks.ai").
+# (e.g. "https://api.fireworks.ai/inference/v1" -> "api.fireworks.ai").
 #   normalization: maps canonical model name -> the model id this endpoint
 #                  expects in the API request body. Unlisted models pass through
 #                  unchanged.
 #   batch:         presence enables the OpenAI-style Batch API for this domain.
 #                  `dialect` selects the request/response shape (openai|mistral).
+#                  `endpoint` is a wire-protocol absolute path joined onto the
+#                  URL origin (scheme+host), NOT onto base_url -- so it keeps its
+#                  version segment (e.g. /v1/batches) even though base_url also
+#                  carries one.
 providers:
   api.fireworks.ai:
     normalization:

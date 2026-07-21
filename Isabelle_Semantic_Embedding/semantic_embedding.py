@@ -73,6 +73,22 @@ async def _resolve_env(connection, name: str) -> str | None:
     return os.getenv(name)
 
 
+def _is_version_segment(seg: str) -> bool:
+    """``v1``, ``v1beta``, ``v4``, ... -- an API version path segment."""
+    return len(seg) > 1 and seg[0] == "v" and seg[1].isdigit()
+
+
+def _endpoint_domain(base_url: str) -> str:
+    """The YAML ``providers:`` key for a base_url: lowercase host, scheme-default
+    port stripped. An explicit non-default port is kept, so a hypothetical
+    ``myhost:8080`` key still matches. Raw netloc would miss the lookup for
+    ``API.FIREWORKS.AI`` or ``...:443`` spellings."""
+    p = urlsplit(base_url)
+    host = p.hostname or ""
+    default = {"https": 443, "http": 80}.get(p.scheme)
+    return host if p.port in (None, default) else f"{host}:{p.port}"
+
+
 def _redacted_url(resp) -> str:
     """The endpoint a response came from, with the query string stripped, or "".
 
@@ -199,8 +215,19 @@ class HTTP_Provider(ABC):
             # base_url is the Fireworks one, so it ALWAYS falls back. Interpolating
             # the configured field would name a host that was never contacted.
             endpoint = _redacted_url(resp) or self.base_url
-            return (f"\n  Check that model {self.model!r} is served by {endpoint} "
+            hint = (f"\n  Check that model {self.model!r} is served by {endpoint} "
                     "(Isabelle config Semantic_Embedding.embedding_model / embedding_base_url).")
+            # A 404 against a URL with no version segment anywhere in its path is
+            # the signature of a base_url still written in the pre-2026-07 style
+            # (version-less). Only a suggestion -- a root-hosted server that
+            # genuinely serves /embeddings gets one extra sentence on a 404, never
+            # a rejection.
+            if status == 404 and not any(
+                    _is_version_segment(s) for s in urlsplit(endpoint).path.split("/")):
+                hint += ("\n  The URL contains no API version segment; if the "
+                         "endpoint follows the OpenAI convention, base_url should "
+                         "end with `/v1`.")
+            return hint
         if status == 429:
             # The "will wait and retry" sentence is the point of this branch, not a
             # detail: without it a user watching a stalled proof concludes it has
@@ -525,7 +552,12 @@ def make_embedding_provider(driver: str, base_url: str, model: str,
 
 @register_embedding_driver("OpenAI_Embedding_Provider")
 class OpenAI_Embedding_Provider(Embedding_Provider):
-    """Generic provider for any OpenAI-compatible ``/v1/embeddings`` endpoint.
+    """Generic provider for any OpenAI-compatible embeddings endpoint.
+
+    ``base_url`` includes the API version segment, exactly as in the OpenAI SDK
+    (e.g. ``https://api.openai.com/v1``); the provider posts to
+    ``{base_url}/embeddings``. Batch endpoints are wire-protocol absolute paths
+    and join onto the URL *origin* instead -- see ``_embed_batch``.
 
     All model/endpoint specifics come from the YAML embedding config: the API
     model id (per-domain normalization), the dimension/scores/normalize/request
@@ -538,7 +570,24 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
     def __init__(self, base_url: str, model: str, api_key: str | None = None) -> None:
         from . import embedding_config as cfg
         super().__init__(base_url, model, api_key)
-        domain = urlsplit(base_url).netloc
+        domain = _endpoint_domain(base_url)
+        # base_url carries the API version segment (`.../v1`) since 2026-07. For a
+        # domain listed under the YAML `providers:` section -- every hosted endpoint
+        # we know of -- a version-less path can only be a pre-change value, so fail
+        # at construction rather than let every request 404. Unlisted domains
+        # (self-hosted server roots) are legitimately version-less and stay exempt.
+        # A detector, not a shim: the URL is never rewritten.
+        if (cfg.provider_listed(domain) and not _is_version_segment(
+                urlsplit(base_url).path.rstrip("/").rsplit("/", 1)[-1])):
+            path = settings_file_path()
+            where = path or ("etc/settings in the directory "
+                             "`isabelle getenv ISABELLE_HOME_USER` prints")
+            raise ValueError(
+                f"embedding base_url {base_url!r} has no API version segment. "
+                f"base_url now includes it, as in the OpenAI SDK: use "
+                f"{base_url.rstrip('/')}/v1 (or this endpoint's actual version). "
+                f"Update EMBEDDING_BASE_URL in {where}, or the Isabelle option "
+                f"Semantic_Embedding.embedding_base_url, then restart Isabelle.")
         self.model = cfg.api_model_name(domain, model)  # name sent to the API
         self._batch: dict = cfg.batch_config(domain) or {}
         self.supports_batch = bool(self._batch)
@@ -590,7 +639,7 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
         return counts.get("completed", 0), counts.get("total", 0)
 
     async def _embed(self, text: list[str]) -> EmbedResult:
-        url = self.base_url.rstrip("/") + "/v1/embeddings"
+        url = self.base_url.rstrip("/") + "/embeddings"
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -677,7 +726,15 @@ class OpenAI_Embedding_Provider(Embedding_Provider):
         """Embed via Batch API (async, 50% cost). Splits into sub-batches if needed."""
         from Isabelle_RPC_Host.rpc import Connection
         conn = Connection.current()
-        url_base = self.base_url.rstrip("/")
+        # Batch endpoints (`/v1/files`, the YAML `batch.endpoint` values) are
+        # wire-protocol absolute paths -- the same family as the body constants in
+        # _format_batch_line -- so they join onto the URL ORIGIN, not base_url.
+        # This also keeps every already-seeded embedding_config (whose endpoints
+        # read `/v1/batches` etc.) correct now that base_url carries `/v1`.
+        # Limitation: a batch-enabled endpoint behind a reverse-proxy path prefix
+        # is unsupported; no batch-enabled domain has one.
+        parts = urlsplit(self.base_url)
+        url_base = f"{parts.scheme}://{parts.netloc}"
         auth_headers = self._auth_headers()
         total_chars = sum(len(t) for t in text)
 
@@ -842,12 +899,16 @@ async def reranker_provider(name: Reranker_Provider.name,
 
 
 class OpenAI_Reranker_Provider(Reranker_Provider):
-    """Reranker using OpenAI-compatible /v1/rerank endpoint."""
+    """Reranker using an OpenAI-compatible rerank endpoint.
+
+    Same base_url convention as OpenAI_Embedding_Provider: base_url includes the
+    API version segment; the provider posts to ``{base_url}/rerank``.
+    """
     base_url: str
     api_key: str | None = None
 
     async def rerank(self, query: str, documents: list[str], top_n: int) -> RerankResult:
-        url = self.base_url.rstrip("/") + "/v1/rerank"
+        url = self.base_url.rstrip("/") + "/rerank"
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -896,7 +957,7 @@ class Qwen3_Reranker_8B(OpenAI_Reranker_Provider):
         # lets a fresh provider see the current process env, and
         # bind_connection_env then goes one step fresher via the connection.
         self.base_url = base_url or os.getenv("QWEN3_RERANKER_BASE_URL",
-                                              "https://api.fireworks.ai/inference")
+                                              "https://api.fireworks.ai/inference/v1")
         self.api_key = api_key or os.getenv("QWEN3_RERANKER_API_KEY")
         self.model = model or os.getenv("QWEN3_RERANKER_MODEL",
                                         "fireworks/qwen3-reranker-8b")

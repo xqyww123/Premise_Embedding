@@ -1697,7 +1697,7 @@ _svs_lock = threading.Lock()
 
 
 _DEFAULT_EMBEDDING_DRIVER = "OpenAI_Embedding_Provider"
-_DEFAULT_EMBEDDING_BASE_URL = "https://api.fireworks.ai/inference"
+_DEFAULT_EMBEDDING_BASE_URL = "https://api.fireworks.ai/inference/v1"
 _DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
 
 

@@ -108,6 +108,12 @@ def batch_config(domain: str) -> dict | None:
     return _provider_entry(domain).get("batch")
 
 
+def provider_listed(domain: str) -> bool:
+    """Whether this domain has a ``providers:`` entry in the embedding config."""
+    cfg = load_embedding_config()
+    return domain in (cfg.get("providers") or {})
+
+
 _DEFAULT_TEXT_TEMPLATE = "{text}"
 _DEFAULT_TASK_DESCRIPTION = "retrieve the most relevant Isabelle/HOL constructs"
 # Phrase filling a query template's {kinds} slot when the query has no (or an
