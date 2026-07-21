@@ -65,26 +65,6 @@ def settings_file_path() -> str:
     return os.path.join(home, "etc", "settings") if home else ""
 
 
-async def _resolve_env(connection, name: str) -> str | None:
-    """One env variable: Isabelle-side env -> this process's env -> None.
-
-    The RPC host is a long-lived daemon whose os.environ is frozen at server
-    start; the connected Isabelle re-sources etc/settings at every restart, so
-    its view is the fresh one (Connection.getenv implements the fallback chain).
-
-    Lives here rather than in semantics.py so provider classes below can use it
-    without a circular import (same reason as settings_file_path above).
-
-    getattr, not a plain method call: an already-running server that imported
-    this new code but still holds a pre-getenv Connection class must degrade to
-    the old os.getenv behaviour, not AttributeError on every semantic operation.
-    """
-    conn_getenv = getattr(connection, "getenv", None) if connection is not None else None
-    if conn_getenv is not None:
-        return await conn_getenv(name)   # falls back to os.environ internally
-    return os.getenv(name)
-
-
 def _is_version_segment(seg: str) -> bool:
     """``v1``, ``v1beta``, ``v4``, ... -- an API version path segment."""
     return len(seg) > 1 and seg[0] == "v" and seg[1].isdigit()
@@ -869,14 +849,6 @@ class Reranker_Provider(HTTP_Provider):
         """Rerank documents by relevance to query. Returns top_n results sorted by relevance."""
         ...
 
-    async def bind_connection_env(self, connection) -> None:
-        """Re-resolve env-derived fields through the connected Isabelle.
-
-        Called by reranker_provider right after construction when a connection
-        is live. Default is a no-op so providers with no env-derived config
-        need to do nothing."""
-        return None
-
 
 def register_reranker_provider(name: str):
     """Class decorator to register a Reranker_Provider subclass by name."""
@@ -887,29 +859,20 @@ def register_reranker_provider(name: str):
     return decorator
 
 
-async def reranker_provider(name: Reranker_Provider.name,
-                            connection=None) -> Reranker_Provider:
+def reranker_provider(name: Reranker_Provider.name) -> Reranker_Provider:
     """Instantiate a Reranker_Provider by name.
-    Checks PROVIDERS registry first, then dynamically loads from drivers/{name}.py.
-    With a live connection, the provider re-resolves its env-derived config
-    through the connected Isabelle (bind_connection_env)."""
+    Checks PROVIDERS registry first, then dynamically loads from drivers/{name}.py."""
     if name in Reranker_Provider.PROVIDERS:
-        provider = Reranker_Provider.PROVIDERS[name]()
-    else:
-        path = pathlib.Path(__file__).parent / "drivers" / f"{name}.py"
-        if not path.exists():
-            raise ImportError(f"Reranker driver {name!r} not found in PROVIDERS or at {path}")
-        spec = importlib.util.spec_from_file_location(name, path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Cannot load reranker driver {name!r} from {path}")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        provider = mod.Reranker_Provider()
-    if connection is not None and isinstance(provider, Reranker_Provider):
-        # isinstance guard: the dynamic path never enforced subclassing, so a
-        # duck-typed out-of-tree class is skipped rather than AttributeError'd.
-        await provider.bind_connection_env(connection)
-    return provider
+        return Reranker_Provider.PROVIDERS[name]()
+    path = pathlib.Path(__file__).parent / "drivers" / f"{name}.py"
+    if not path.exists():
+        raise ImportError(f"Reranker driver {name!r} not found in PROVIDERS or at {path}")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load reranker driver {name!r} from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.Reranker_Provider()
 
 
 class OpenAI_Reranker_Provider(Reranker_Provider):
@@ -950,39 +913,10 @@ class OpenAI_Reranker_Provider(Reranker_Provider):
 
 @register_reranker_provider("qwen3-reranker-8b")
 class Qwen3_Reranker_8B(OpenAI_Reranker_Provider):
+    base_url = os.getenv("QWEN3_RERANKER_BASE_URL", "https://api.fireworks.ai/inference/v1")
+    api_key: str | None = os.getenv("QWEN3_RERANKER_API_KEY")
+    model = os.getenv("QWEN3_RERANKER_MODEL", "fireworks/qwen3-reranker-8b")
     max_documents = 200
-
-    async def bind_connection_env(self, connection) -> None:
-        # A non-empty value overrides what the constructor read from this
-        # process's frozen env; when the variable is set nowhere, _resolve_env
-        # yields None and the constructor's default (e.g. the fireworks
-        # base_url) stays in charge.
-        #
-        # Deliberately on THIS class, not on the generic
-        # OpenAI_Reranker_Provider base: the QWEN3_* variables describe this
-        # provider's endpoint. On the base they would clobber every
-        # descendant -- an out-of-tree subclass with a hardcoded localhost
-        # base_url would be silently redirected to fireworks by residual
-        # QWEN3_* values (even stale host-env ones, via _resolve_env's
-        # fallback). Custom providers opt in by overriding this hook.
-        for attr, var in (("api_key", "QWEN3_RERANKER_API_KEY"),
-                          ("base_url", "QWEN3_RERANKER_BASE_URL"),
-                          ("model", "QWEN3_RERANKER_MODEL")):
-            val = await _resolve_env(connection, var)
-            if val:
-                setattr(self, attr, val)
-
-    def __init__(self, base_url: str | None = None, api_key: str | None = None,
-                 model: str | None = None) -> None:
-        # These used to be class attributes, i.e. frozen at module IMPORT time --
-        # even earlier than the server's env snapshot. Resolving at construction
-        # lets a fresh provider see the current process env, and
-        # bind_connection_env then goes one step fresher via the connection.
-        self.base_url = base_url or os.getenv("QWEN3_RERANKER_BASE_URL",
-                                              "https://api.fireworks.ai/inference/v1")
-        self.api_key = api_key or os.getenv("QWEN3_RERANKER_API_KEY")
-        self.model = model or os.getenv("QWEN3_RERANKER_MODEL",
-                                        "fireworks/qwen3-reranker-8b")
 
 
 type key = bytes

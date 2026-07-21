@@ -1105,25 +1105,6 @@ async def interpret_file(
                 seen_constants.clear()
                 return {}
 
-            # The spawned `claude` CLI inherits this long-lived host's os.environ,
-            # frozen at server start — so ANTHROPIC_*/proxy settings a user edits
-            # in etc/settings would never reach it. Resolve them through the
-            # connected Isabelle and layer them onto the subprocess env (the SDK
-            # merges options.env over the inherited environment). Default
-            # ~/.claude OAuth credentials are re-read per spawn and unaffected.
-            from .semantic_embedding import _resolve_env
-            cli_env = {"MAX_MCP_OUTPUT_TOKENS": "100000"}
-            for _var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-                         "ANTHROPIC_BASE_URL",
-                         # Consumed by the CLI for background/fast-path calls;
-                         # options.model pins only the main model.
-                         "ANTHROPIC_SMALL_FAST_MODEL",
-                         "HTTP_PROXY", "HTTPS_PROXY",
-                         "ALL_PROXY", "NO_PROXY"):
-                _val = await _resolve_env(connection, _var)
-                if _val:
-                    cli_env[_var] = _val
-
             options = ClaudeAgentOptions(
                 model=interpretation_model,
                 system_prompt=_SYSTEM_PROMPT,
@@ -1139,8 +1120,9 @@ async def interpret_file(
                 # tokenizes ~2x heavier per char than English, so a ~50KB batch
                 # crosses the 25,000-token default MCP-output cap and gets
                 # spilled to disk (forcing the agent to re-read it via Bash/jq).
-                # Raise the cap so the batch is returned inline.
-                env=cli_env,
+                # Raise the cap so the batch is returned inline.  Merged onto the
+                # inherited environment by the SDK, so other env vars are kept.
+                env={"MAX_MCP_OUTPUT_TOKENS": "100000"},
                 hooks={
                     "PreToolUse": [
                         HookMatcher(matcher="*", hooks=[_permission_control]),

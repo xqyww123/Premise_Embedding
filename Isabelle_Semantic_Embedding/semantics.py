@@ -22,7 +22,7 @@ from .semantic_embedding import (Vector_Store, Embedding_Provider, make_embeddin
                                  resolve_embedding_driver_class,
                                  sanitize_model, unsanitize_model,
                                  Reranker_Provider, reranker_provider, key,
-                                 settings_file_path, _http_error_detail, _resolve_env,
+                                 settings_file_path, _http_error_detail,
                                  _embed_tracing_gated)
 from ._vecarith import library_path as _vector_library_path
 
@@ -1148,7 +1148,7 @@ class Semantic_Vector_Store(Vector_Store):
         reranker_name = await _resolve_reranker_model(self.connection)
         if reranker_name is None:
             return None
-        return await reranker_provider(reranker_name, self.connection)
+        return reranker_provider(reranker_name)
 
     def is_thy_embedded(self, theory_key: universal_key) -> bool:
         """Check whether a theory's entities are all embedded in this vector store."""
@@ -1867,19 +1867,12 @@ def _missing_api_key_message() -> str:
 
 async def _resolve_one(connection: Connection | None, config_name: str,
                        env_name: str, default: str) -> str:
-    """One config item: ML config option > Isabelle env > this process's env > default.
-
-    The two env layers are Connection.getenv's fallback chain (via _resolve_env):
-    the RPC host is a long-lived daemon whose own os.environ is frozen at server
-    start, so the connected Isabelle -- which re-sources etc/settings at every
-    restart -- is the fresh view, and "add the line to etc/settings, then restart
-    Isabelle" actually works without the user having to find and bounce the host.
-    """
+    """One config item: ML config option > env > default."""
     if connection is not None:
         v = await connection.config_lookup(config_name)
         if v:
             return v
-    return (await _resolve_env(connection, env_name)) or default
+    return os.getenv(env_name) or default
 
 
 async def _resolve_embedding_config(
@@ -1890,10 +1883,10 @@ async def _resolve_embedding_config(
     chose their endpoint deliberately, so it is where the missing-key check lives.
 
     The api_key has no ML config option on purpose -- config options are set from
-    theory text, and secrets do not belong in .thy files -- so its cascade starts
-    at the Isabelle-side environment. The variables consulted, in order, are the
-    resolved driver's API_KEY_ENV_VARS (var-major: the alternate variable only
-    matters while the primary is unset everywhere, matching the hint copy).
+    theory text, and secrets do not belong in .thy files -- so it comes from the
+    environment only. The variables consulted, in order, are the resolved
+    driver's API_KEY_ENV_VARS (var-major: the alternate variable only matters
+    while the primary is unset, matching the hint copy).
     """
     driver = await _resolve_one(connection, "Semantic_Embedding.embedding_driver",
                                 "EMBEDDING_DRIVER", _DEFAULT_EMBEDDING_DRIVER)
@@ -1905,7 +1898,7 @@ async def _resolve_embedding_config(
     key_vars = cls.API_KEY_ENV_VARS if cls is not None else ("EMBEDDING_API_KEY",)
     api_key: str | None = None
     for var in key_vars:
-        api_key = await _resolve_env(connection, var)
+        api_key = os.getenv(var)
         if api_key:
             break
     # Default configuration means the Fireworks endpoint, which cannot work without
@@ -1930,13 +1923,12 @@ async def _resolve_embedding_config(
 
 
 async def _resolve_reranker_model(connection: Connection | None) -> str | None:
-    """Resolve reranker model name from config, Isabelle env, this process's env,
-    or None (disabled)."""
+    """Resolve reranker model name from config, env, or None (disabled)."""
     if connection is not None:
         name = await connection.config_lookup("Semantic_Embedding.reranker_model")
         if name:
             return name
-    return await _resolve_env(connection, "RERANKER_MODEL") or None
+    return os.getenv("RERANKER_MODEL") or None
 
 
 async def _conn_semantic_vector_store(self: Connection, embedding_model: str | None = None) -> Semantic_Vector_Store:
