@@ -151,7 +151,7 @@ To use a new embedding model or a new provider endpoint, you must supply the fol
 - `normalize` — whether to L2-normalize the vectors the endpoint returns (default `false`). Needed when the endpoint does not return unit vectors.
 - `max_request_size`  — the maximum number of texts sent in one embedding request batch (default 2048). Some endpoints enforce hard caps (e.g. Aliyun DashScope allows only 10)
 - `default_scores` — the fallback similarity scores `{score, local}` given to entities that have no embedding vector yet. `score` for ordinary entities, `local` for entities local to the current proof context. Default: `{0.0, 0.0}`.
-- `templates`, `task_description` — the text wrappers applied to queries and documents before embedding;
+- `templates`, `task_description` — templates, task_description — the model-specific prompts that instruction-aware embedding models expect around queries and documents; see the [model card]() for the convention.
 - `providers.<domain>.normalization` — maps the canonical model name (i.e., the name seen in HugginFace) to the id that the endpoint expects;
 - `providers.<domain>.batch` — its presence enables the OpenAI-style Batch API for that endpoint.
 

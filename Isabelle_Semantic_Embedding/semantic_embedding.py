@@ -1,6 +1,7 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 import asyncio
+import contextvars
 import importlib.util
 import json
 import os
@@ -22,6 +23,17 @@ from ._vecarith import encode_q15, gather_addrs, top_k_q15_gather, Q15_SCALE
 _EMBED_CACHE_TTL = 3 * 86400  # 3 days
 
 _MAX_ERROR_BODY = 500  # chars of provider response body kept in a warning
+
+# Internal transport for the Semantic_Store_verbose gate (Tools/semantic_store.ML):
+# while set, the embed machinery's per-batch tracing (_log lines, embed_records'
+# count line in semantics.py) is suppressed, so a whole-DB completion run cannot
+# overflow Isabelle's editor_tracing_messages cap (1000; overflow pops a BLOCKING
+# "Tracing paused" dialog).  Set only by complete_vector_store for its own dynamic
+# extent; _warn is never gated.  A ContextVar, not a plain global: the RPC host
+# runs concurrent handler tasks on one event loop, and the gate must not leak into
+# a concurrent _auto_embed.
+_embed_tracing_gated: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_embed_tracing_gated", default=False)
 
 
 def settings_file_path() -> str:
@@ -436,6 +448,8 @@ class Embedding_Provider(HTTP_Provider):
         raise ValueError(f"unknown embed role {role!r}")
 
     async def _log(self, msg: str) -> None:
+        if _embed_tracing_gated.get():
+            return
         from Isabelle_RPC_Host.rpc import Connection
         conn = Connection.current()
         if conn is not None:

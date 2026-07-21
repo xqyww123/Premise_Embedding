@@ -691,116 +691,49 @@ def _parse_kinds(spec: str) -> 'set | None':
     return out
 
 
-def _collect_embed_candidates(kinds: 'set | None' = None) -> 'list[tuple[bytes, object]]':
-    """Every interpreted record as (key, record), in one read txn.
-
-    WIP records are INCLUDED, exactly like persistent ones. Every other path in the
-    pipeline already treats them alike -- Semantic_DB[k] = rec and put_experience write
-    them with no WIP guard, _auto_embed embeds them with no WIP guard, and the migration
-    purge deletes their vectors with no WIP guard -- so this function skipping them made
-    it the one outlier, and an actively harmful one: the purge would delete a WIP
-    experience's vector that the re-embed then refused to rewrite (93 of 181 experiences
-    on the cluster). Symmetry here is what makes purge-then-re-embed correct BY
-    CONSTRUCTION.
-    Dropping WIP vectors is still available, but only as an EXPLICIT act
-    (clean_wip / clean_all_wip_in_created_dbs), never as an implicit side effect of
-    embedding. (The WIP guards in mark_interpreted / mark_thy_embedded stay: those record
-    that a theory is FINISHED, and a WIP theory will still change.)
-
-    Records are handed to ``Semantic_Vector_Store.embed_records``, which derives the
-    document text via ``document_text_of`` (the single authority, dispatched on kind).
-    EXPERIENCE records are now INCLUDED: their framing document text is produced by the
-    same lower-layer authority, so this offline tool re-embeds them under the identical
-    convention as the AoA write path (the f63b0bb experience-exclusion stopgap is gone).
-    Records are yielded from the singleton env -- never a second lmdb.open of
-    semantics.lmdb, and never a nested query() (see Semantic_DB.iter_entity_records).
-
-    ``kinds``: if given, restrict to these EntityKinds (e.g. {EXPERIENCE} for the §5
-    experience-vector migration); default None = all kinds."""
-    from Isabelle_Semantic_Embedding.semantics import Semantic_DB
-    out: list[tuple[bytes, object]] = []
-    for key, rec in Semantic_DB.iter_entity_records():
-        if rec.interpretation is None:
-            continue
-        if kinds is not None and rec.kind not in kinds:
-            continue
-        out.append((key, rec))
-    return out
-
-
 async def _embed_models(models: list[str], *, driver: str, base_url: str,
                         force: bool, yes: bool, kinds: 'set | None' = None) -> None:
     """Make vector_MODEL complete w.r.t. semantics.lmdb, for each model.
 
-    Drives the scan off the Semantic_DB singleton (never a second lmdb.open of
-    semantics.lmdb). Non-interactive without ``yes`` and with real work to do is a
-    hard error, never a silent skip or an input() hang. Text is derived per (key,
-    record) by embed_records -> document_text_of; this tool never assembles it."""
+    Config resolution + per-model store construction + the CLI's report/warn/confirm
+    hooks around the shared ``complete_vector_store`` routine (semantics.py), which
+    owns the scan/partition/batch logic and the progress strings.  Drives the scan
+    off the Semantic_DB singleton (never a second lmdb.open of semantics.lmdb).
+    Non-interactive without ``yes`` and with real work to do is a hard error, never
+    a silent skip or an input() hang. Text is derived per (key, record) by
+    embed_records -> document_text_of; this tool never assembles it."""
     from Isabelle_Semantic_Embedding.semantics import (
-        Semantic_Vector_Store, _resolve_embedding_config_env)
+        Semantic_Vector_Store, _resolve_embedding_config_env,
+        _collect_embed_candidates, complete_vector_store)
     from Isabelle_Semantic_Embedding.semantic_embedding import make_embedding_provider
-    from Isabelle_Semantic_Embedding.document_text import document_text_of
     env_driver, env_base_url, _ = _resolve_embedding_config_env()
     driver = driver or env_driver
     base_url = base_url or env_base_url
+
+    async def report(msg: str) -> None:
+        print(msg, flush=True)
+
+    async def warn(msg: str) -> None:
+        print(msg, file=sys.stderr, flush=True)
+
+    async def confirm(n: int, total: int, chars: int) -> bool:
+        if yes:
+            return True
+        if sys.stdin.isatty():
+            return input("Proceed? [y/N] ").strip().lower() == "y"
+        # sys.exit is a CLI-only concern and stays in this hook --
+        # complete_vector_store itself never exits the process.
+        print(f"Refusing to embed {n} entities non-interactively; pass --yes "
+              f"(or --yes-embed to `collect`).", file=sys.stderr)
+        sys.exit(1)
 
     candidates = _collect_embed_candidates(kinds)
     for model in models:
         provider = make_embedding_provider(driver, base_url, model)
         store = Semantic_Vector_Store(emb_provider=provider, connection=None)
-
-        if force:
-            todo = candidates
-        else:
-            present = store.contains([k for k, _ in candidates])
-            todo = [kr for kr, p in zip(candidates, present) if not p]
-
-        n = len(todo)
-        if n == 0:
-            print(f"{model}: already complete ({len(candidates)} entities).")
-            continue
-        # embed_records SKIPS any record document_text_of cannot render (no
-        # interpretation, or an unparseable experience expr). Say so out loud: a silent
-        # skip after a purge would leave the record with no vector in any store and no
-        # hint that it happened.
-        chars, unrenderable, renderable = 0, [], []
-        for k, rec in todo:
-            t = document_text_of(rec)
-            if t is None:
-                unrenderable.append(k)
-            else:
-                chars += len(t)
-                renderable.append((k, rec))
-        todo, n = renderable, len(renderable)   # keep todo and n in step for the batching
-        if unrenderable:
-            print(f"{model}: WARNING -- {len(unrenderable)} record(s) have no embeddable "
-                  f"document text and will be SKIPPED (they will have no vector): "
-                  + ", ".join(k.hex()[:16] for k in unrenderable[:5])
-                  + (" ..." if len(unrenderable) > 5 else ""), file=sys.stderr)
-        if n == 0:
-            print(f"{model}: nothing embeddable.")
-            continue
-        print(f"{model}: {n} of {len(candidates)} entities need vectors ({chars} chars).")
-
-        if not yes:
-            if sys.stdin.isatty():
-                if input("Proceed? [y/N] ").strip().lower() != "y":
-                    print("Aborted.")
-                    continue
-            else:
-                print(f"Refusing to embed {n} entities non-interactively; pass --yes "
-                      f"(or --yes-embed to `collect`).", file=sys.stderr)
-                sys.exit(1)
-
-        BATCH = 256
-        total_tokens = 0
-        for i in range(0, n, BATCH):
-            # force=True: `todo` is already the exact set to (re)write, so let
-            # embed_records skip its redundant contains() check. It derives each
-            # record's text via document_text_of and skips any with no embeddable text.
-            total_tokens += await store.embed_records(todo[i:i + BATCH], force=True)
-            print(f"  {model}: embedded {min(i + BATCH, n)}/{n}", flush=True)
-        print(f"{model}: done ({n} embedded, {total_tokens} tokens).")
+        await complete_vector_store(
+            store, candidates, force=force, label=model,
+            report=report, warn=warn, confirm=confirm)
 
 
 def cmd_embed(args: argparse.Namespace) -> None:

@@ -22,7 +22,8 @@ from .semantic_embedding import (Vector_Store, Embedding_Provider, make_embeddin
                                  resolve_embedding_driver_class,
                                  sanitize_model, unsanitize_model,
                                  Reranker_Provider, reranker_provider, key,
-                                 settings_file_path, _http_error_detail, _resolve_env)
+                                 settings_file_path, _http_error_detail, _resolve_env,
+                                 _embed_tracing_gated)
 from ._vecarith import library_path as _vector_library_path
 
 from .base import ToolCall_ret, mk_ret as _mk_ret
@@ -1607,7 +1608,7 @@ class Semantic_Vector_Store(Vector_Store):
         kv = [(k, t) for k, rec in items if (t := document_text_of(rec)) is not None]
         if not kv:
             return 0
-        if self.connection is not None:
+        if self.connection is not None and not _embed_tracing_gated.get():
             await self.connection.tracing(
                 f"[Semantic_Embedding] embedding {len(kv)} records ({sum(len(t) for _, t in kv)} chars)")
         return await self.embed(kv)
@@ -1691,6 +1692,124 @@ class Semantic_Vector_Store(Vector_Store):
             await self.embed_keys(keys, force=force)
             if not wip:
                 self.mark_thy_embedded(thy_key)
+
+
+def _collect_embed_candidates(kinds: 'set | None' = None) -> 'list[tuple[bytes, object]]':
+    """Every interpreted record as (key, record), in one read txn.
+
+    WIP records are INCLUDED, exactly like persistent ones. Every other path in the
+    pipeline already treats them alike -- Semantic_DB[k] = rec and put_experience write
+    them with no WIP guard, _auto_embed embeds them with no WIP guard, and the migration
+    purge deletes their vectors with no WIP guard -- so this function skipping them made
+    it the one outlier, and an actively harmful one: the purge would delete a WIP
+    experience's vector that the re-embed then refused to rewrite (93 of 181 experiences
+    on the cluster). Symmetry here is what makes purge-then-re-embed correct BY
+    CONSTRUCTION.
+    Dropping WIP vectors is still available, but only as an EXPLICIT act
+    (clean_wip / clean_all_wip_in_created_dbs), never as an implicit side effect of
+    embedding. (The WIP guards in mark_interpreted / mark_thy_embedded stay: those record
+    that a theory is FINISHED, and a WIP theory will still change.)
+
+    Records are handed to ``Semantic_Vector_Store.embed_records``, which derives the
+    document text via ``document_text_of`` (the single authority, dispatched on kind).
+    EXPERIENCE records are now INCLUDED: their framing document text is produced by the
+    same lower-layer authority, so this offline tool re-embeds them under the identical
+    convention as the AoA write path (the f63b0bb experience-exclusion stopgap is gone).
+    Records are yielded from the singleton env -- never a second lmdb.open of
+    semantics.lmdb, and never a nested query() (see Semantic_DB.iter_entity_records).
+
+    ``kinds``: if given, restrict to these EntityKinds (e.g. {EXPERIENCE} for the §5
+    experience-vector migration); default None = all kinds."""
+    out: list[tuple[bytes, object]] = []
+    for key, rec in Semantic_DB.iter_entity_records():
+        if rec.interpretation is None:
+            continue
+        if kinds is not None and rec.kind not in kinds:
+            continue
+        out.append((key, rec))
+    return out
+
+
+async def complete_vector_store(
+        store: 'Semantic_Vector_Store',
+        candidates: 'list[tuple[bytes, object]]',
+        *,
+        force: bool,
+        label: str,
+        report,
+        warn,
+        confirm=None,
+        verbose: bool = False,
+) -> 'tuple[int, int, int]':
+    """Make ``store`` complete w.r.t. ``candidates``: embed every candidate record
+    missing a vector (or all of them under ``force``), in batches of 256.
+
+    THE shared completion routine behind both frontends: the CLI
+    (`isabelle-semantics embed` / `collect --embed-models`, where report/warn print
+    to stdout/stderr and ``confirm`` prompts) and the
+    `Semantic_Embedding.embed_all_missing` RPC (run_semantic_interpretation's embed
+    phase, where report/warn go to Isabelle via writeln/warning and there is no
+    confirm).  The progress strings are the CLI's historical output, verbatim, so
+    both frontends show identical lines.
+
+    ``report``/``warn`` are async callables taking one string.  ``confirm``, when
+    given, is an async ``(n, total, chars) -> bool``; a False return aborts (reported
+    as "Aborted.").  Unless ``verbose``, the embed machinery's own tracing is
+    suppressed for this call's dynamic extent (_embed_tracing_gated) -- at whole-DB
+    scale those per-batch tracing lines would overflow editor_tracing_messages, and
+    this routine's report lines carry the progress instead.
+
+    Returns (n_embedded, n_unrenderable, total_tokens)."""
+    token = _embed_tracing_gated.set(not verbose)
+    try:
+        if force:
+            todo = candidates
+        else:
+            present = store.contains([k for k, _ in candidates])
+            todo = [kr for kr, p in zip(candidates, present) if not p]
+
+        if len(todo) == 0:
+            await report(f"{label}: already complete ({len(candidates)} entities).")
+            return (0, 0, 0)
+        # embed_records SKIPS any record document_text_of cannot render (no
+        # interpretation, or an unparseable experience expr). Say so out loud: a silent
+        # skip after a purge would leave the record with no vector in any store and no
+        # hint that it happened.
+        chars, unrenderable, renderable = 0, [], []
+        for k, rec in todo:
+            t = document_text_of(rec)
+            if t is None:
+                unrenderable.append(k)
+            else:
+                chars += len(t)
+                renderable.append((k, rec))
+        todo, n = renderable, len(renderable)   # keep todo and n in step for the batching
+        if unrenderable:
+            await warn(f"{label}: WARNING -- {len(unrenderable)} record(s) have no embeddable "
+                       f"document text and will be SKIPPED (they will have no vector): "
+                       + ", ".join(k.hex()[:16] for k in unrenderable[:5])
+                       + (" ..." if len(unrenderable) > 5 else ""))
+        if n == 0:
+            await report(f"{label}: nothing embeddable.")
+            return (0, len(unrenderable), 0)
+        await report(f"{label}: {n} of {len(candidates)} entities need vectors ({chars} chars).")
+
+        if confirm is not None and not await confirm(n, len(candidates), chars):
+            await report("Aborted.")
+            return (0, len(unrenderable), 0)
+
+        BATCH = 256
+        total_tokens = 0
+        for i in range(0, n, BATCH):
+            # force=True: `todo` is already the exact set to (re)write, so let
+            # embed_records skip its redundant contains() check. It derives each
+            # record's text via document_text_of and skips any with no embeddable text.
+            total_tokens += await store.embed_records(todo[i:i + BATCH], force=True)
+            await report(f"  {label}: embedded {min(i + BATCH, n)}/{n}")
+        await report(f"{label}: done ({n} embedded, {total_tokens} tokens).")
+        return (n, len(unrenderable), total_tokens)
+    finally:
+        _embed_tracing_gated.reset(token)
 
 
 _svs_lock = threading.Lock()
@@ -1877,6 +1996,40 @@ async def _clean_wip(arg: Any, connection: Connection) -> int:
 async def _contains(arg: Any, connection: Connection) -> list[bool]:
     keys = [bytes(k) for k in arg]
     return Semantic_DB.contains(keys)
+
+
+@isabelle_remote_procedure("Semantic_Embedding.embed_all_missing")
+async def _embed_all_missing(arg: Any, connection: Connection) -> None:
+    """Whole-DB vector completion for the connection's configured embedding model:
+    the embed phase of run_semantic_interpretation (Tools/interpret_command.ML).
+    Reporting goes through writeln, not tracing -- the same editor_tracing_messages
+    rationale as interpretation progress (Tools/semantic_store.ML)."""
+    # Function-local on purpose: semantic_interpretation imports from this module at
+    # module level, so a top-level import here would be a hard import cycle.
+    from .semantic_interpretation import USER_ERROR_MARKER
+    try:
+        store = await connection.semantic_vector_store()
+    except (RuntimeError, ValueError, ImportError) as e:
+        # All three are curated user-config messages (unconfigured provider,
+        # version-less base_url, unknown driver): mark them so ML renders the one
+        # actionable line without the traceback (Semantic_Store.extract_user_error).
+        raise RuntimeError(USER_ERROR_MARKER + str(e)) from e
+    candidates = _collect_embed_candidates()
+    verbose = bool(await connection.config_lookup("Semantic_Store_verbose"))
+
+    async def report(msg: str) -> None:
+        await connection.writeln("[Semantic_Embedding] " + msg)
+
+    async def warn(msg: str) -> None:
+        await connection.warning("[Semantic_Embedding] " + msg)
+
+    # label = the canonical model name (store.model_name), NOT emb_provider.model:
+    # the OpenAI driver overwrites .model with the per-domain API wire id, which
+    # would break line-for-line parity with the CLI's output.
+    await complete_vector_store(
+        store, candidates, force=False, label=store.model_name,
+        report=report, warn=warn, verbose=verbose)
+    return None
 
 
 @isabelle_remote_procedure("Semantic_Embedding.query_knn")

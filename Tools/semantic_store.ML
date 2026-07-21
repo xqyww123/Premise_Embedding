@@ -39,6 +39,13 @@ signature SEMANTIC_STORE = sig
      `Semantic_Store.is_interpreted` RPC per cone node. *)
   val plan_interpretation : bool -> theory list -> theory list
 
+  (* Whole-DB vector completion: embed every interpreted record that has no vector in
+     the store of the connection's configured embedding model (config option >
+     Isabelle env > host env > default; _resolve_embedding_config in semantics.py).
+     Missing-only (presence-based); progress is reported Python-side via writeln.
+     The context serves the per-command Config.lookup callback. *)
+  val embed_all_missing : Context.generic -> unit
+
   (* Remove all LMDB entries whose theory hashes are non-persistent
      (i.e., from non-loaded theories). Returns the number of entries deleted. *)
   val clean_wip : unit -> int
@@ -71,8 +78,9 @@ signature SEMANTIC_STORE = sig
   val reranker_model : string Config.T
 
   (* Config option: echo Semantic_Store's OPT-IN INTERNAL DIAGNOSTICS to the output
-     panel -- the Thm_Cache delta
-     timings.  Off by default; `declare [[Semantic_Store_verbose]]`.
+     panel -- the Thm_Cache delta timings, and (looked up over RPC) the Python embed
+     machinery's per-batch tracing during embed_all_missing's completion run.
+     Off by default; `declare [[Semantic_Store_verbose]]`.
      It does NOT gate interpretation progress or per-theory token usage: those are
      reported unconditionally via writeln, so that a run cannot fail silently. *)
   val Semantic_Store_verbose : bool Config.T
@@ -184,13 +192,18 @@ val _ = Config.register_rpc_option "Semantic_Embedding.reranker_model"
    false (default) — quiet, which is what callers embedding this in a larger run
    (notably the `aoa` method) want; enable with `declare [[Semantic_Store_verbose]]`
    when diagnosing the store itself.
-   SCOPE: only one `vtracing` site remains behind this flag (the
-   Thm_Cache delta timing).  Run-level
+   SCOPE: two consumers sit behind this flag — the Thm_Cache delta timing `vtracing`
+   below, and (looked up over RPC, hence the registration) the Python embed
+   machinery's per-batch tracing during embed_all_missing's completion run
+   (complete_vector_store in semantics.py; off = those lines are suppressed so a
+   whole-DB run cannot overflow editor_tracing_messages).  Run-level
    interpretation progress, the per-theory token/cost line and the closing summary
    are unconditional `writeln` — a run that spends money must say so whether or not
    anyone opted into diagnostics. *)
 val Semantic_Store_verbose = Attrib.setup_config_bool
   \<^binding>\<open>Semantic_Store_verbose\<close> (K false)
+val _ = Config.register_rpc_option "Semantic_Store_verbose"
+          (Config.bool_value Semantic_Store_verbose)
 
 fun vtracing_global thy msg =
   if Config.get_global thy Semantic_Store_verbose then tracing msg else ()
@@ -1636,6 +1649,17 @@ fun pack_search_domain ContextAll =
       packPair (packInt, packList (packPair (packBytes, packString))) (1, extras)
   | pack_search_domain (Restricted keys) =
       packPair (packInt, packList packBytes) (2, keys)
+
+fun embed_all_missing (context : Context.generic) : unit =
+  Remote_Procedure_Calling.call_command
+    {name = "Semantic_Embedding.embed_all_missing",
+     arg_schema = packUnit,
+     ret_schema = unpackUnit,
+     (* Config.lookup is a per-command callback, NOT global: without it the Python
+        handler's Semantic_Store_verbose lookup fails. *)
+     callback = [Config.make_config_lookup_callback
+                   (Context_Callbacks.static_context_unpacker context)],
+     timeout = NONE} ()
 
 fun query_knn (context : Context.generic) =
   let

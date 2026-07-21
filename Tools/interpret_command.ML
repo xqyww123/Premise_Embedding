@@ -1,7 +1,10 @@
 (*  Title:      Tools/interpret_command.ML
 
 Outer-syntax command driving Semantic_Store interpretation, with an interactive
-confirmation before any LLM work starts.
+confirmation before any LLM work starts.  After interpretation (and on the
+nothing-to-interpret path) it also completes the vector store:
+Semantic_Store.embed_all_missing embeds every interpreted record in the whole DB
+still missing a vector for the configured embedding model.
 
 INTERACTIVE USE ONLY.  The confirmation blocks on Active.dialog, whose only responder in
 the whole Isabelle tree is jEdit (Tools/jEdit/src/active.scala:100).  Under `isabelle
@@ -61,8 +64,24 @@ fun run (force : bool) names state =
 
     val work = Semantic_Store.plan_interpretation force roots
     val n = length work
+
+    (* Phase 2: whole-DB vector completion (missing-only) for the configured embedding
+       model.  Runs after a successful interpretation run AND on the nothing-to-
+       interpret path, so the command always leaves the vector store complete.
+       Interrupting is safe: vectors are committed per 256-batch and the scan is
+       presence-based, so a re-run resumes.  A failure fails the command — the
+       interpretation results are already durable in LMDB; a recognisable failure
+       (extract_user_error's marker) renders as one actionable line, anything else
+       keeps the traceback. *)
+    fun embed_phase () =
+      (writeln "[Semantic_Embedding] Completing missing vector embeddings...";
+       Semantic_Store.embed_all_missing (Context.Proof ctxt))
+      handle Remote_Procedure_Calling.Remote_Calling_Failure {message, ...} =>
+        (case Semantic_Store.extract_user_error message of
+          SOME human => error human
+        | NONE => error ("Vector embedding failed: " ^ message))
   in
-    if n = 0 then writeln "[Semantic_Store] Nothing to interpret."
+    if n = 0 then (writeln "[Semantic_Store] Nothing to interpret."; embed_phase ())
     else
       let
         (* Name the theories, not just the count: "11 theories" gives the user nothing to
@@ -84,6 +103,7 @@ fun run (force : bool) names state =
           (if n = 1 then " theory needs" else " theories need"), " interpretation:\n",
           listing, "\n",
           "This calls the LLM: it may take a long time and cost money.\n",
+          "Afterwards, missing vector embeddings are computed as well (embedding API; far cheaper).\n",
           "  ", mk "Yes", "   ", mk "No"])
         (* Blocks until the user clicks.  Not caught: if the buffer is edited, jEdit
            cancels this exec and the interrupt propagates -- Active.dialog's promise carries
@@ -95,7 +115,8 @@ fun run (force : bool) names state =
           "Yes" =>
             (* roots, NOT work: interpret_with_parallel re-derives the cone itself and needs
                the interpreted ancestors as relay nodes. *)
-            Semantic_Store.interpret_with_parallel force (map Context.Theory roots)
+            (Semantic_Store.interpret_with_parallel force (map Context.Theory roots);
+             embed_phase ())
         | _ => writeln "[Semantic_Store] Aborted.")
       end
   end
