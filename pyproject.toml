@@ -47,7 +47,7 @@ classifiers = [
 # published wheel naming it could never be installed.
 dependencies = [
     "msgpack",
-    "isabelle-rpc>=0.3.0",
+    "isabelle-rpc>=0.4.0",
     "rocksdict",
     # Floor, not a pin. liblmdb 0.9.35 (bundled in py-lmdb 2.x) carries no
     # corruption regression over 0.9.29 -- the arc trends safer. The ONE release to

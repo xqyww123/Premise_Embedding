@@ -368,7 +368,7 @@ requirements:
     # ROOT:1  session Semantic_Embedding = HOL + sessions Isabelle_RPC Performant_Isabelle_ML
     # Session dependencies pyproject.toml cannot express.  isabelle-rpc is ALSO a pyproject
     # dependency, and it comes from conda.qiyuan.me, not conda-forge.
-    - isabelle-rpc >=0.3.1
+    - isabelle-rpc >=0.4.0
     - isabelle-performant-ml >=0.1.0,<0.2.0
     #
     # The fourteen pyproject dependencies under their CONDA names.  TWO differ from PyPI,
