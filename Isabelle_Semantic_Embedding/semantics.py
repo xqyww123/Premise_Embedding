@@ -238,6 +238,14 @@ class _Semantic_DB:
                     os.makedirs(cache_dir, exist_ok=True)
                     _Semantic_DB._env = lmdb.open(os.path.join(cache_dir, "semantics.lmdb"),
                                                   map_size=SEMANTICS_MAP_SIZE)
+                    try:
+                        # Attached RPC hosts die by os._exit/SIGKILL by design, each
+                        # leaving stale reader-table slots (default 126); reap dead
+                        # readers at every open or the table eventually fills up
+                        # (MDB_READERS_FULL).  See RPC_EPHEMERAL_HOST_PLAN.md, H0.
+                        _Semantic_DB._env.reader_check()
+                    except lmdb.Error:
+                        pass
                     atexit.register(_Semantic_DB._close)
         return self._env  # type: ignore
 
@@ -1865,19 +1873,9 @@ def _missing_api_key_message() -> str:
         "embedding_provider.md")
 
 
-async def _resolve_one(connection: Connection | None, config_name: str,
-                       env_name: str, default: str) -> str:
-    """One config item: ML config option > env > default."""
-    if connection is not None:
-        v = await connection.config_lookup(config_name)
-        if v:
-            return v
-    return os.getenv(env_name) or default
-
-
 async def _resolve_embedding_config(
         connection: Connection | None) -> tuple[str, str, str, str | None]:
-    """Resolve (driver, base_url, model, api_key); items per _resolve_one's cascade.
+    """Resolve (driver, base_url, model, api_key), each by: ML config -> env -> default.
 
     Also the one place that can tell a user who has configured NOTHING from one who
     chose their endpoint deliberately, so it is where the missing-key check lives.
@@ -1888,12 +1886,11 @@ async def _resolve_embedding_config(
     driver's API_KEY_ENV_VARS (var-major: the alternate variable only matters
     while the primary is unset, matching the hint copy).
     """
-    driver = await _resolve_one(connection, "Semantic_Embedding.embedding_driver",
-                                "EMBEDDING_DRIVER", _DEFAULT_EMBEDDING_DRIVER)
-    base_url = await _resolve_one(connection, "Semantic_Embedding.embedding_base_url",
-                                  "EMBEDDING_BASE_URL", _DEFAULT_EMBEDDING_BASE_URL)
-    model = await _resolve_one(connection, "Semantic_Embedding.embedding_model",
-                               "EMBEDDING_MODEL", _DEFAULT_EMBEDDING_MODEL)
+    driver, base_url, model = _resolve_embedding_config_env()
+    if connection is not None:
+        driver = (await connection.config_lookup("Semantic_Embedding.embedding_driver")) or driver
+        base_url = (await connection.config_lookup("Semantic_Embedding.embedding_base_url")) or base_url
+        model = (await connection.config_lookup("Semantic_Embedding.embedding_model")) or model
     cls = resolve_embedding_driver_class(driver)
     key_vars = cls.API_KEY_ENV_VARS if cls is not None else ("EMBEDDING_API_KEY",)
     api_key: str | None = None

@@ -1,7 +1,7 @@
 """Unit tests for embedding/reranker config resolution.
 
-Covers the cascade ML config option > env > default (_resolve_one), the
-var-major API-key order (the alternate variable only matters while the
+Covers the cascade ML config option > env > default (_resolve_embedding_config),
+the var-major API-key order (the alternate variable only matters while the
 primary is unset, matching the hint copy), and make_embedding_provider's
 post-construction api_key assignment.
 
@@ -24,24 +24,26 @@ class FakeIsaConn:
         return self.config.get(name, "")
 
 
-async def test_resolve_one_config_beats_env():
+async def test_config_beats_env_beats_default():
+    # EMBEDDING_API_KEY keeps the missing-key guard quiet in the default cases.
+    os.environ["EMBEDDING_API_KEY"] = "k"
     os.environ["EMBEDDING_MODEL"] = "env-model"
     try:
         conn = cast(Any, FakeIsaConn(
             {"Semantic_Embedding.embedding_model": "config-model"}))
-        got = await SEM._resolve_one(conn, "Semantic_Embedding.embedding_model",
-                                     "EMBEDDING_MODEL", "default-model")
-        assert got == "config-model"
-        got2 = await SEM._resolve_one(cast(Any, FakeIsaConn()),   # config empty
-                                      "Semantic_Embedding.embedding_model",
-                                      "EMBEDDING_MODEL", "default-model")
-        assert got2 == "env-model"
-    finally:
+        _, _, model, _ = await SEM._resolve_embedding_config(conn)
+        assert model == "config-model"
+        _, _, model2, _ = await SEM._resolve_embedding_config(
+            cast(Any, FakeIsaConn()))                            # config empty
+        assert model2 == "env-model"
         del os.environ["EMBEDDING_MODEL"]
-    got3 = await SEM._resolve_one(cast(Any, FakeIsaConn()),
-                                  "Semantic_Embedding.embedding_model",
-                                  "EMBEDDING_MODEL", "default-model")
-    assert got3 == "default-model"
+        _, _, model3, key = await SEM._resolve_embedding_config(
+            cast(Any, FakeIsaConn()))
+        assert model3 == SEM._DEFAULT_EMBEDDING_MODEL
+        assert key == "k"
+    finally:
+        os.environ.pop("EMBEDDING_MODEL", None)
+        del os.environ["EMBEDDING_API_KEY"]
 
 
 async def test_key_cascade_var_major_order():
@@ -88,7 +90,7 @@ def test_make_embedding_provider_post_assignment():
 
 
 async def main():
-    await test_resolve_one_config_beats_env()
+    await test_config_beats_env_beats_default()
     await test_key_cascade_var_major_order()
     test_make_embedding_provider_post_assignment()
     print("ALL CONFIG RESOLUTION TESTS PASSED")
